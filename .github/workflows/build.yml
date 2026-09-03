@@ -29,19 +29,21 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # ---- Linux build deps (X11 + Wayland client libs for the windowing backend) ----
+      # ---- Linux build deps (X11 client libs for the windowing backend) ----
+      # Install each package individually so a single unavailable package can't abort the job;
+      # missing ones are logged and the build still runs (its log is captured below).
       - name: Install Linux system libraries
         if: matrix.os == 'ubuntu-latest'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev \
-            libwayland-dev libwayland-bin wayland-protocols \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxkbfile-dev \
-            libxrandr-dev libxinerama-dev libxcursor-dev libxxf86vm-dev \
-            libxext-dev libsm-dev libice-dev \
-            libxtst-dev libxi-dev libxfixes-dev libxrender-dev \
-            libvulkan-dev libgl1-mesa-dev libegl1-dev
+          sudo apt-get update -qq 2>&1 | tee /tmp/apt.log
+          for p in \
+            libx11-dev libxkbcommon-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxrandr-dev libxinerama-dev libxcursor-dev libxext-dev libsm-dev libice-dev \
+            libxtst-dev libxi-dev libxfixes-dev libxrender-dev libxxf86vm-dev \
+            libgl1-mesa-dev libegl1-dev ; do
+            sudo apt-get install -y "$p" 2>&1 | tail -1 | tee -a /tmp/apt.log || echo "APT_FAIL: $p" | tee -a /tmp/apt.log
+          done
 
       - name: Build (release)
         run: cargo build --release 2>&1 | tee /tmp/build.log
@@ -126,8 +128,11 @@ jobs:
           tok = os.environ['GITHUB_TOKEN']
           try:
               log = open('/tmp/build.log').read()[-6000:]
-          except Exception as e:
-              log = "(no build.log) " + str(e)
+          except Exception:
+              try:
+                  log = "(build.log missing) apt log:\n" + open('/tmp/apt.log').read()[-6000:]
+              except Exception as e:
+                  log = "(no logs) " + str(e)
           body = "```\n" + log + "\n```"
           data = json.dumps({"title": "CI Linux build log (debug)", "body": body}).encode()
           req = urllib.request.Request(
