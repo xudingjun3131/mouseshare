@@ -1,5 +1,6 @@
 //! egui window: configuration + the draggable multi-machine screen layout.
 
+use crate::clipboard;
 use crate::config::{save_config, Config};
 use crate::layout::Layout;
 use crate::network::Net;
@@ -11,6 +12,8 @@ pub struct MouseShareApp {
     pub shared_layout: Arc<Mutex<Layout>>,
     pub net: Arc<Mutex<Net>>,
     pub my_name: String,
+    /// Transient status line (e.g. "已复制连接地址").
+    pub copy_status: String,
 }
 
 impl MouseShareApp {
@@ -20,6 +23,7 @@ impl MouseShareApp {
             shared_layout,
             net,
             my_name,
+            copy_status: String::new(),
         }
     }
 }
@@ -49,6 +53,14 @@ impl eframe::App for MouseShareApp {
                         self.config.server_addr = format!("{}:{}", ip, self.config.port);
                     }
                 }
+                ui.horizontal(|ui| {
+                    ui.label("Address:");
+                    ui.monospace(&self.config.server_addr);
+                });
+                if ui.button("复制连接地址").clicked() {
+                    clipboard::set_clipboard(&self.config.server_addr);
+                    self.copy_status = "已复制连接地址到剪贴板".to_string();
+                }
             }
 
             ui.separator();
@@ -63,9 +75,59 @@ impl eframe::App for MouseShareApp {
             ui.label("Saved. Restart the app for role/network changes to take effect.");
 
             ui.separator();
+            ui.heading("屏幕 / 客户端");
+            ui.label("客户端数量无上限：连上的机器会自动出现在布局里。可在此复制或删除屏幕。");
+            {
+                let mut layout = self.shared_layout.lock().unwrap();
+                let mut dup_idx: Option<usize> = None;
+                let mut del_idx: Option<usize> = None;
+                for (i, s) in layout.screens.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}  {}×{}", s.name, s.w, s.h));
+                        if ui.button("复制").clicked() {
+                            dup_idx = Some(i);
+                        }
+                        if ui.button("删除").clicked() {
+                            del_idx = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = dup_idx {
+                    layout.duplicate_screen(i);
+                }
+                if let Some(i) = del_idx {
+                    if layout.screens.len() > 1 {
+                        layout.screens.remove(i);
+                    } else {
+                        self.copy_status = "至少保留一块屏幕".to_string();
+                    }
+                }
+            }
+            if ui.button("+ 右侧添加屏幕").clicked() {
+                let mut layout = self.shared_layout.lock().unwrap();
+                let max_x = layout
+                    .screens
+                    .iter()
+                    .map(|s| s.ox + s.w as i32)
+                    .max()
+                    .unwrap_or(0);
+                let n = layout.screens.len() + 1;
+                layout.screens.push(crate::layout::Screen {
+                    name: format!("machine-{}", n),
+                    ox: max_x + 40,
+                    oy: 0,
+                    w: 1920,
+                    h: 1080,
+                });
+            }
+
+            ui.separator();
             let peers = self.net.lock().unwrap().peer_count();
             ui.label(format!("Connected peers: {}", peers));
             ui.label(format!("Local name: {}", self.my_name));
+            if !self.copy_status.is_empty() {
+                ui.label(egui::RichText::new(&self.copy_status).color(Color32::from_rgb(120, 220, 140)));
+            }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -78,23 +140,6 @@ impl eframe::App for MouseShareApp {
                 layout.screens.push(crate::layout::Screen {
                     name: self.config.name.clone(),
                     ox: 0,
-                    oy: 0,
-                    w: 1920,
-                    h: 1080,
-                });
-            }
-
-            if ui.button("+ Add screen to the right").clicked() {
-                let max_x = layout
-                    .screens
-                    .iter()
-                    .map(|s| s.ox + s.w as i32)
-                    .max()
-                    .unwrap_or(0);
-                let n = layout.screens.len() + 1;
-                layout.screens.push(crate::layout::Screen {
-                    name: format!("machine-{}", n),
-                    ox: max_x + 40,
                     oy: 0,
                     w: 1920,
                     h: 1080,

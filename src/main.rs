@@ -61,6 +61,7 @@ fn main() -> anyhow::Result<()> {
     // ---- Incoming message handler ----
     {
         let net = net.clone();
+        let layout = layout.clone();
         let last_seen = Arc::new(Mutex::new(String::new()));
         let mode2 = mode.clone();
         std::thread::spawn(move || {
@@ -83,7 +84,15 @@ fn main() -> anyhow::Result<()> {
                         }
                         // Primary originated the input; never receives it back.
                     }
-                    Message::Hello { .. } => { /* registration happened at connect time */ }
+                    Message::Hello { name, width, height } => {
+                        // Auto-register every secondary as a screen so the client count is
+                        // unbounded — no manual layout editing required to add more machines.
+                        if mode2 == "primary" {
+                            if layout.lock().unwrap().ensure_screen(&name, width, height) {
+                                info!("auto-registered screen for peer {}", name);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }

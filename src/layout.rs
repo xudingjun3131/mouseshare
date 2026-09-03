@@ -62,4 +62,50 @@ impl Layout {
     pub fn index_of(&self, name: &str) -> Option<usize> {
         self.screens.iter().position(|s| s.name == name)
     }
+
+    /// Ensure a screen named `name` exists, adding it (placed to the right of the rightmost
+    /// existing screen) only if absent. Returns true when a new screen was created.
+    /// Used to auto-register every secondary that connects, so the client count is unbounded.
+    pub fn ensure_screen(&mut self, name: &str, w: u32, h: u32) -> bool {
+        if self.index_of(name).is_some() {
+            return false;
+        }
+        let max_x = self
+            .screens
+            .iter()
+            .map(|s| s.ox + s.w as i32)
+            .max()
+            .unwrap_or(0);
+        self.screens.push(Screen {
+            name: name.to_string(),
+            ox: if self.screens.is_empty() { 0 } else { max_x + 40 },
+            oy: 0,
+            w,
+            h,
+        });
+        true
+    }
+
+    /// Clone the screen at `idx` with a unique name and an offset to the right, so it can be
+    /// re-positioned without disturbing the original.
+    pub fn duplicate_screen(&mut self, idx: usize) {
+        if let Some(src) = self.screens.get(idx).cloned() {
+            let base = src.name.clone();
+            let mut n = 1;
+            let new_name = loop {
+                let cand = format!("{}-copy{}", base, n);
+                if self.index_of(&cand).is_none() {
+                    break cand;
+                }
+                n += 1;
+            };
+            self.screens.push(Screen {
+                name: new_name,
+                ox: src.ox + src.w as i32 + 40,
+                oy: src.oy,
+                w: src.w,
+                h: src.h,
+            });
+        }
+    }
 }
