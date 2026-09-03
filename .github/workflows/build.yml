@@ -35,18 +35,22 @@ jobs:
       - name: Install Linux system libraries
         if: matrix.os == 'ubuntu-latest'
         run: |
-          sudo apt-get update -qq 2>&1 | tee /tmp/apt.log
+          sudo apt-get update -qq 2>&1 | tee apt.log
           for p in \
             libx11-dev libxkbcommon-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxrandr-dev libxinerama-dev libxcursor-dev libxext-dev libsm-dev libice-dev \
             libxtst-dev libxi-dev libxfixes-dev libxrender-dev libxxf86vm-dev \
             libgl1-mesa-dev libegl1-dev ; do
-            sudo apt-get install -y "$p" 2>&1 | tail -1 | tee -a /tmp/apt.log || echo "APT_FAIL: $p" | tee -a /tmp/apt.log
+            sudo apt-get install -y "$p" 2>&1 | tail -1 | tee -a apt.log || echo "APT_FAIL: $p" | tee -a apt.log
           done
 
+      # bash everywhere (incl. Windows git-bash) so `pipefail` makes a real build error fatal.
       - name: Build (release)
-        run: cargo build --release 2>&1 | tee /tmp/build.log
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release 2>&1 | tee build.log
 
       # ---- Linux packaging: portable tarball + .deb ----
       - name: Package (Linux)
@@ -60,13 +64,36 @@ jobs:
           cp target/debian/*.deb mouseshare-linux.deb 2>/dev/null || true
 
       # ---- Windows packaging: Inno Setup installer + zip ----
+      # Inno Setup is fetched via Chocolatey (best-effort, retried up to 3x). We call ISCC via
+      # its explicit install path so we don't depend on the choco PATH shim being refreshed in
+      # this shell. The .zip is ALWAYS produced so a Windows artifact exists even if the
+      # installer download is momentarily unreachable.
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          choco install innosetup -y
-          iscc installer.iss
-          Compress-Archive -Path target/release/mouseshare.exe -DestinationPath mouseshare-windows.zip
+          Compress-Archive -Force -Path target/release/mouseshare.exe -DestinationPath mouseshare-windows.zip
+
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          $ok = $false
+          for ($i = 1; $i -le 3; $i++) {
+            Write-Host "::group::Attempt $i - install Inno Setup via choco"
+            choco install innosetup -y --no-progress 2>&1 | Out-String | Write-Host
+            Write-Host "::endgroup::"
+            if (Test-Path $iscc) { $ok = $true; break }
+            Start-Sleep -Seconds 15
+          }
+
+          if ($ok) {
+            & $iscc installer.iss
+            if (Test-Path MouseShare-Setup.exe) {
+              Write-Host "Built installer: MouseShare-Setup.exe"
+            } else {
+              Write-Warning "iscc ran but MouseShare-Setup.exe was not produced."
+            }
+          } else {
+            Write-Warning "Inno Setup install failed after 3 attempts; shipping .zip only."
+          }
 
       # ---- macOS packaging: .app bundle + .dmg ----
       - name: Package (macOS)
@@ -91,6 +118,7 @@ jobs:
           hdiutil create -volname MouseShare -srcfolder MouseShare.app -ov -format UDZO mouseshare-mac.dmg
 
       - name: Upload build artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mouseshare-${{ matrix.os }}
@@ -116,32 +144,41 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Debug: surface the raw build log in a GitHub Issue (readable without admin) so a
-      # Linux-only link/compile error can be diagnosed. Remove once Linux is green.
+      # Debug: surface the raw build log in GitHub Issue #1 (updates it if it exists, else
+      # creates it) so a build error can be diagnosed without admin access to job logs.
       - name: Upload build log on failure
         if: failure()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MATRIX_OS: ${{ matrix.os }}
         run: |
           python3 - <<'PY'
-          import os, json, urllib.request
+          import os, json, urllib.request, urllib.error
           tok = os.environ['GITHUB_TOKEN']
+          repo = os.environ['GITHUB_REPOSITORY']
+          os_name = os.environ.get('MATRIX_OS', '?')
+          run_id = os.environ.get('GITHUB_RUN_ID', '?')
           try:
-              log = open('/tmp/build.log').read()[-6000:]
-          except Exception:
-              try:
-                  log = "(build.log missing) apt log:\n" + open('/tmp/apt.log').read()[-6000:]
-              except Exception as e:
-                  log = "(no logs) " + str(e)
-          body = "```\n" + log + "\n```"
-          data = json.dumps({"title": "CI Linux build log (debug)", "body": body}).encode()
+              log = open('build.log').read()[-6000:]
+          except Exception as e:
+              log = "(build.log missing) " + str(e)
+          body = f"OS: {os_name}\nRun: {run_id}\n```\n{log}\n```"
+          patch = json.dumps({"body": body}).encode()
+          headers = {"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json",
+                     "User-Agent": "curl", "Content-Type": "application/json"}
           req = urllib.request.Request(
-              "https://api.github.com/repos/xudingjun3131/mouseshare/issues",
-              data=data,
-              headers={"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json",
-                        "User-Agent": "curl", "Content-Type": "application/json"})
+              f"https://api.github.com/repos/{repo}/issues/1", data=patch, method="PATCH", headers=headers)
           try:
-              print(urllib.request.urlopen(req, timeout=30).read().decode()[:300])
+              urllib.request.urlopen(req, timeout=30).read()
+              print("updated issue #1")
+          except urllib.error.HTTPError as e:
+              if e.code == 404:
+                  data = json.dumps({"title": "CI build log (debug)", "body": body}).encode()
+                  req2 = urllib.request.Request(
+                      f"https://api.github.com/repos/{repo}/issues", data=data, headers=headers)
+                  print(urllib.request.urlopen(req2, timeout=30).read().decode()[:300])
+              else:
+                  print("patch failed", e)
           except Exception as e:
               print("issue post failed", e)
           PY
