@@ -1,0 +1,110 @@
+name: Build installers
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # ---- Linux build deps (X11 + Wayland client libs for the windowing backend) ----
+      - name: Install Linux system libraries
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxkbcommon-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxrandr-dev libxinerama-dev libxcursor-dev libsm-dev libice-dev
+
+      - name: Build (release)
+        run: cargo build --release
+
+      # ---- Linux packaging: portable tarball + .deb ----
+      - name: Package (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd target/release
+          tar czf ../../mouseshare-linux.tar.gz mouseshare
+          cd ../..
+          cargo install cargo-deb --locked || true
+          cargo deb || true
+          cp target/debian/*.deb mouseshare-linux.deb 2>/dev/null || true
+
+      # ---- Windows packaging: Inno Setup installer + zip ----
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install innosetup -y
+          iscc installer.iss
+          Compress-Archive -Path target/release/mouseshare.exe -DestinationPath mouseshare-windows.zip
+
+      # ---- macOS packaging: .app bundle + .dmg ----
+      - name: Package (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          mkdir -p MouseShare.app/Contents/MacOS
+          cp target/release/mouseshare MouseShare.app/Contents/MacOS/
+          cat > MouseShare.app/Contents/Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>MouseShare</string>
+            <key>CFBundleDisplayName</key><string>MouseShare</string>
+            <key>CFBundleIdentifier</key><string>com.mouseshare.app</string>
+            <key>CFBundleVersion</key><string>0.1.0</string>
+            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleExecutable</key><string>mouseshare</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>10.13</string>
+          </dict></plist>
+          EOF
+          hdiutil create -volname MouseShare -srcfolder MouseShare.app -ov -format UDZO mouseshare-mac.dmg
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mouseshare-${{ matrix.os }}
+          if-no-files-found: ignore
+          path: |
+            mouseshare-linux.tar.gz
+            mouseshare-linux.deb
+            mouseshare-windows.zip
+            MouseShare-Setup.exe
+            mouseshare-mac.dmg
+
+      # Attaching to a GitHub Release when the trigger is a tag (e.g. v1.0.0).
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            mouseshare-linux.tar.gz
+            mouseshare-linux.deb
+            mouseshare-windows.zip
+            MouseShare-Setup.exe
+            mouseshare-mac.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

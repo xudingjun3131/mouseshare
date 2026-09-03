@@ -1,0 +1,7 @@
+/target
+MouseShare.app/
+*.dmg
+*.zip
+*.deb
+MouseShare-Setup.exe
+.DS_Store

@@ -1,0 +1,32 @@
+[package]
+name = "mouseshare"
+version = "0.1.0"
+edition = "2021"
+description = "Share mouse, keyboard and clipboard across computers over LAN, with a draggable screen-layout. Cross-platform (Windows/Linux/macOS)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xudingjun3131/mouseshare"
+default-run = "mouseshare"
+
+[dependencies]
+# Cross-platform global input capture + injection (listen + simulate).
+# The "serialize" feature lets us forward rdev::Key/Button over the wire.
+rdev = { version = "0.5", features = ["serialize"] }
+# Cross-platform clipboard access.
+arboard = "3"
+# Immediate-mode GUI for the draggable screen layout.
+eframe = "0.28"
+# Serialization for the network protocol.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# App config + errors + logging.
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+whoami = "1"
+directories = "5"
+# Detect the machine's LAN IP for convenience.
+local-ip-address = "0.6"
+
+[profile.release]
+opt-level = 2
+lto = true
