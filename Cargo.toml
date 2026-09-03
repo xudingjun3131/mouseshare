@@ -14,7 +14,9 @@ rdev = { version = "0.5", features = ["serialize"] }
 # Cross-platform clipboard access.
 arboard = "3"
 # Immediate-mode GUI for the draggable screen layout.
-eframe = "0.28"
+# On Linux we build X11-only: rdev captures input on X11 (no Wayland support), and dropping the
+# `wayland` backend avoids pulling in libEGL/libwayland-client link requirements.
+eframe = { version = "0.28", default-features = false, features = ["accesskit", "default_fonts", "glow", "x11"] }
 # Serialization for the network protocol.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

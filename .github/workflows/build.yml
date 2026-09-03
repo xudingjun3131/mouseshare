@@ -39,7 +39,7 @@ jobs:
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxkbfile-dev \
             libxrandr-dev libxinerama-dev libxcursor-dev libxxf86vm-dev \
             libxext-dev libsm-dev libice-dev \
-            libvulkan-dev libgl1-mesa-dev
+            libvulkan-dev libgl1-mesa-dev libegl1-dev
 
       - name: Build (release)
         run: cargo build --release
