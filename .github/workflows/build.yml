@@ -95,27 +95,39 @@ jobs:
             Write-Warning "Inno Setup install failed after 3 attempts; shipping .zip only."
           }
 
-      # ---- macOS packaging: .app bundle + .dmg ----
+      # ---- macOS packaging: .app bundle (with icon) + drag-to-install .dmg ----
       - name: Package (macOS)
         if: matrix.os == 'macos-latest'
         run: |
-          mkdir -p MouseShare.app/Contents/MacOS
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$VERSION" = "main" ]; then VERSION="0.0.0-dev"; fi
+
+          rm -rf MouseShare.app && mkdir -p MouseShare.app/Contents/MacOS MouseShare.app/Contents/Resources
           cp target/release/mouseshare MouseShare.app/Contents/MacOS/
-          cat > MouseShare.app/Contents/Info.plist <<'EOF'
+          cp resources/AppIcon.icns MouseShare.app/Contents/Resources/AppIcon.icns
+          cat > MouseShare.app/Contents/Info.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
             <key>CFBundleName</key><string>MouseShare</string>
             <key>CFBundleDisplayName</key><string>MouseShare</string>
             <key>CFBundleIdentifier</key><string>com.mouseshare.app</string>
-            <key>CFBundleVersion</key><string>0.1.0</string>
-            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleExecutable</key><string>mouseshare</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>LSMinimumSystemVersion</key><string>10.13</string>
           </dict></plist>
           EOF
-          hdiutil create -volname MouseShare -srcfolder MouseShare.app -ov -format UDZO mouseshare-mac.dmg
+          # Ad-hoc sign so the bundle is a valid signed app (user can right-click -> Open past Gatekeeper).
+          codesign --force --deep --sign - MouseShare.app 2>&1 | tail -3 || true
+
+          # Build a "drag to Applications" DMG: app + symlink to /Applications.
+          rm -rf dmgstage && mkdir -p dmgstage
+          cp -R MouseShare.app dmgstage/
+          ln -s /Applications dmgstage/Applications
+          hdiutil create -volname MouseShare -srcfolder dmgstage -ov -format UDZO mouseshare-mac.dmg
 
       - name: Upload build artifacts
         if: always()
