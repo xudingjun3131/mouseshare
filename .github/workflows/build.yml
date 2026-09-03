@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   build:
@@ -39,10 +40,11 @@ jobs:
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxkbfile-dev \
             libxrandr-dev libxinerama-dev libxcursor-dev libxxf86vm-dev \
             libxext-dev libsm-dev libice-dev \
+            libxtst-dev libxi-dev libxfixes-dev libxrender-dev \
             libvulkan-dev libgl1-mesa-dev libegl1-dev
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release 2>&1 | tee /tmp/build.log
 
       # ---- Linux packaging: portable tarball + .deb ----
       - name: Package (Linux)
@@ -111,3 +113,30 @@ jobs:
             mouseshare-mac.dmg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Debug: surface the raw build log in a GitHub Issue (readable without admin) so a
+      # Linux-only link/compile error can be diagnosed. Remove once Linux is green.
+      - name: Upload build log on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import os, json, urllib.request
+          tok = os.environ['GITHUB_TOKEN']
+          try:
+              log = open('/tmp/build.log').read()[-6000:]
+          except Exception as e:
+              log = "(no build.log) " + str(e)
+          body = "```\n" + log + "\n```"
+          data = json.dumps({"title": "CI Linux build log (debug)", "body": body}).encode()
+          req = urllib.request.Request(
+              "https://api.github.com/repos/xudingjun3131/mouseshare/issues",
+              data=data,
+              headers={"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json",
+                        "User-Agent": "curl", "Content-Type": "application/json"})
+          try:
+              print(urllib.request.urlopen(req, timeout=30).read().decode()[:300])
+          except Exception as e:
+              print("issue post failed", e)
+          PY
