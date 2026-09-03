@@ -7,6 +7,57 @@ use crate::network::Net;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Id, Rect, Sense};
 use std::sync::{Arc, Mutex};
 
+/// Install a CJK fallback font so Chinese/Japanese/Korean glyphs render instead of tofu boxes.
+///
+/// `default_fonts` (the only font feature we use on macOS/Windows) ships ProggyClean, which is
+/// ASCII-only. Without this, every non-Latin character in the UI shows as ▢▢▢.
+/// We try, in order:
+///   * macOS — Hiragino Sans GB, STHeiti Medium, PingFang, STHeiti Light, CJK Symbols Fallback.
+///   * Windows — Microsoft YaHei / SimSun / SimHei.
+///   * Linux — WenQuanYi Zen Hei, Noto Sans CJK (the most common installs).
+/// First match wins and is added to both `Proportional` and `Monospace` families' fallback chains.
+pub fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    let candidates: &[&str] = &[
+        // macOS
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/CJKSymbolsFallback.ttc",
+        // Windows
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyhbd.ttc",
+        "C:/Windows/Fonts/simsun.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/msyh.ttf",
+        // Linux (Debian/Ubuntu/Fedora/Arch paths)
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/TTF/NotoSansCJK-Regular.ttc",
+    ];
+
+    for path in candidates {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                log::info!("loaded CJK font from {}", path);
+                fonts.font_data.insert("cjk".into(), egui::FontData::from_owned(bytes));
+                for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                    fonts.families.entry(fam).or_default().push("cjk".into());
+                }
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+
+    ctx.set_fonts(fonts);
+}
+
 pub struct MouseShareApp {
     pub config: Config,
     pub shared_layout: Arc<Mutex<Layout>>,

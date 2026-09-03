@@ -167,7 +167,11 @@ fn main() -> anyhow::Result<()> {
     let result = eframe::run_native(
         "MouseShare",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            // Install a CJK fallback font BEFORE the GUI starts drawing, so the very first frame
+            // already shows Chinese correctly (otherwise first frame is tofu, then it gets
+            // replaced on the next frame).
+            app::setup_fonts(&cc.egui_ctx);
             Ok::<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>>(Box::new(gui_app))
         }),
     );
