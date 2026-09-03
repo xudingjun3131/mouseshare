@@ -11,41 +11,66 @@ use std::sync::{Arc, Mutex};
 ///
 /// `default_fonts` (the only font feature we use on macOS/Windows) ships ProggyClean, which is
 /// ASCII-only. Without this, every non-Latin character in the UI shows as ▢▢▢.
-/// We try, in order:
-///   * macOS — Hiragino Sans GB, STHeiti Medium, PingFang, STHeiti Light, CJK Symbols Fallback.
-///   * Windows — Microsoft YaHei / SimSun / SimHei.
-///   * Linux — WenQuanYi Zen Hei, Noto Sans CJK (the most common installs).
-/// First match wins and is added to both `Proportional` and `Monospace` families' fallback chains.
+///
+/// Strategy: prefer an **embedded** Noto Sans SC OTF (the only thing we can guarantee across
+/// every user's machine, including CI containers, Windows boxes without East Asian language
+/// packs, and Linux distros with no CJK package installed). If loading the embedded font fails
+/// for some reason, fall back to common system fonts.
 pub fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
+    // First try: the bundled OTF (always present, identical on every machine, no surprises).
+    let embedded: &[u8] = include_bytes!("../resources/NotoSansSC-Regular.otf");
+    if !embedded.is_empty() {
+        log::info!("using bundled Noto Sans SC ({} KB)", embedded.len() / 1024);
+        fonts
+            .font_data
+            .insert("cjk".into(), egui::FontData::from_owned(embedded.to_vec()));
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(fam).or_default().push("cjk".into());
+        }
+        ctx.set_fonts(fonts);
+        return;
+    }
+
+    // Fallback: scan well-known system locations for any CJK-capable font. Note that
+    // ab_glyph can only read single-file TTF/OTF — TTC collections (Hiragino Sans GB.ttc,
+    // msyh.ttc, …) do NOT parse their faces, so they are listed last.
     let candidates: &[&str] = &[
         // macOS
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
         "/System/Library/Fonts/CJKSymbolsFallback.ttc",
         // Windows
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/msyhbd.ttc",
-        "C:/Windows/Fonts/simsun.ttc",
-        "C:/Windows/Fonts/simhei.ttf",
         "C:/Windows/Fonts/msyh.ttf",
-        // Linux (Debian/Ubuntu/Fedora/Arch paths)
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-        "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
+        "C:/Windows/Fonts/msyhbd.ttf",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttf",
+        "C:/Windows/Fonts/simfang.ttf",
+        "C:/Windows/Fonts/simkai.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simsun.ttc",
+        // Linux
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttf",
+        "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttf",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/TTF/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     ];
 
     for path in candidates {
         match std::fs::read(path) {
             Ok(bytes) => {
-                log::info!("loaded CJK font from {}", path);
-                fonts.font_data.insert("cjk".into(), egui::FontData::from_owned(bytes));
+                log::info!("loaded CJK font from {} ({} KB)", path, bytes.len() / 1024);
+                fonts
+                    .font_data
+                    .insert("cjk".into(), egui::FontData::from_owned(bytes));
                 for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                     fonts.families.entry(fam).or_default().push("cjk".into());
                 }
