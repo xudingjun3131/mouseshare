@@ -7,9 +7,10 @@
 use crate::protocol::{InputEvent, Message};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// `(peer name, message)` delivered from any connection's reader thread to the app.
 pub type Incoming = Sender<(String, Message)>;
@@ -39,9 +40,19 @@ pub enum Net {
     Secondary {
         tx: Sender<Message>,
     },
+    /// No live connection — networking failed at startup (port already in use, or the primary
+    /// was unreachable). This variant exists so the app can still open its GUI and explain the
+    /// problem, instead of exiting silently (which, when launched from Finder, looks exactly
+    /// like "I clicked it and nothing happened").
+    Idle,
 }
 
 impl Net {
+    /// A do-nothing handle used when startup failed, so the GUI can still open.
+    pub fn idle() -> Arc<Mutex<Net>> {
+        Arc::new(Mutex::new(Net::Idle))
+    }
+
     pub fn send_input(&self, target: &str, ev: InputEvent) {
         match self {
             Net::Primary { peers } => {
@@ -49,7 +60,7 @@ impl Net {
                     let _ = tx.send(Message::Input(ev));
                 }
             }
-            Net::Secondary { .. } => { /* secondaries never originate input */ }
+            Net::Secondary { .. } | Net::Idle => { /* never originate input */ }
         }
     }
 
@@ -70,6 +81,7 @@ impl Net {
             Net::Secondary { tx } => {
                 let _ = tx.send(msg);
             }
+            Net::Idle => { /* not connected: nothing to broadcast */ }
         }
     }
 
@@ -77,6 +89,7 @@ impl Net {
         match self {
             Net::Primary { peers } => peers.lock().unwrap().len(),
             Net::Secondary { .. } => 1,
+            Net::Idle => 0,
         }
     }
 }
@@ -149,9 +162,36 @@ fn handle_primary_conn(stream: TcpStream, peers: Arc<Mutex<HashMap<String, Sende
     });
 }
 
+/// Resolve `host:port` (hostname or IP) and try each candidate with a short timeout.
+///
+/// A plain `TcpStream::connect` to an unreachable LAN address can block for a minute or more —
+/// during which no window is shown at all, which reads as "the app does nothing".
+fn connect_with_timeout(addr: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    let addrs: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("could not resolve address {}", addr),
+        ));
+    }
+    let mut last: Option<std::io::Error> = None;
+    for a in addrs {
+        match TcpStream::connect_timeout(&a, timeout) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            format!("could not connect to {}", addr),
+        )
+    }))
+}
+
 /// Connect as a secondary. Spawns reader/writer threads and returns the shared handle.
 pub fn connect_client(addr: &str, incoming: Incoming) -> anyhow::Result<(Arc<Mutex<Net>>, Sender<Message>)> {
-    let stream = TcpStream::connect(addr)?;
+    let stream = connect_with_timeout(addr, Duration::from_secs(3))?;
     log::info!("connected to primary at {}", addr);
     let read_stream = stream.try_clone()?;
     let (tx, rx) = channel::<Message>();

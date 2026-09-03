@@ -38,18 +38,46 @@ fn main() -> anyhow::Result<()> {
     // Incoming channel: (peer name, message).
     let (inc_tx, inc_rx) = channel::<(String, Message)>();
 
+    // Never let a networking failure kill the process silently: when launched from Finder that
+    // looks exactly like "I clicked the app and nothing happened, no dialog either". Record the
+    // error, fall back to an idle Net, and always open the GUI so the user can see and fix it.
+    let mut startup_error: Option<String> = None;
+
     let net: Arc<Mutex<Net>> = if mode == "primary" {
-        start_hub(port, inc_tx)?
+        match start_hub(port, inc_tx.clone()) {
+            Ok(n) => n,
+            Err(e) => {
+                let msg = format!(
+                    "无法监听端口 {}（{}）。端口很可能已被另一个正在运行的 MouseShare 占用——请检查 Dock 或活动监视器里是否已有 MouseShare，退出后重新启动。",
+                    port, e
+                );
+                log::error!("{}", msg);
+                startup_error = Some(msg);
+                Net::idle()
+            }
+        }
     } else {
-        let (net, tx) = connect_client(&server_addr, inc_tx)?;
-        let (w, h) = display_size().unwrap_or((1920, 1080));
-        tx.send(Message::Hello {
-            name: my_name.clone(),
-            width: w as u32,
-            height: h as u32,
-        })
-        .ok();
-        net
+        match connect_client(&server_addr, inc_tx.clone()) {
+            Ok((n, tx)) => {
+                let (w, h) = display_size().unwrap_or((1920, 1080));
+                tx.send(Message::Hello {
+                    name: my_name.clone(),
+                    width: w as u32,
+                    height: h as u32,
+                })
+                .ok();
+                n
+            }
+            Err(e) => {
+                let msg = format!(
+                    "无法连接到主机 {}（{}）。请确认主机上的 MouseShare 已启动、地址正确、防火墙未拦截；可在左侧修改地址后保存并重启。",
+                    server_addr, e
+                );
+                log::error!("{}", msg);
+                startup_error = Some(msg);
+                Net::idle()
+            }
+        }
     };
 
     // Shared state used by the capture thread.
@@ -134,7 +162,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ---- GUI on the main thread ----
-    let gui_app = app::MouseShareApp::new(config, layout, net, my_name);
+    let gui_app = app::MouseShareApp::new(config, layout, net, my_name, startup_error);
     let options = eframe::NativeOptions::default();
     let result = eframe::run_native(
         "MouseShare",

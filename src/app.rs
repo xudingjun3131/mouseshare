@@ -14,22 +14,53 @@ pub struct MouseShareApp {
     pub my_name: String,
     /// Transient status line (e.g. "已复制连接地址").
     pub copy_status: String,
+    /// Set when networking failed at startup (port busy / primary unreachable). Shown as a
+    /// banner instead of letting the app exit silently with no window at all.
+    pub startup_error: Option<String>,
 }
 
 impl MouseShareApp {
-    pub fn new(config: Config, shared_layout: Arc<Mutex<Layout>>, net: Arc<Mutex<Net>>, my_name: String) -> Self {
+    pub fn new(
+        config: Config,
+        shared_layout: Arc<Mutex<Layout>>,
+        net: Arc<Mutex<Net>>,
+        my_name: String,
+        startup_error: Option<String>,
+    ) -> Self {
         Self {
             config,
             shared_layout,
             net,
             my_name,
             copy_status: String::new(),
+            startup_error,
         }
     }
 }
 
 impl eframe::App for MouseShareApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Show startup failures prominently. Without this the app used to exit silently and the
+        // user saw nothing at all when launching from Finder.
+        if let Some(err) = &self.startup_error {
+            egui::TopBottomPanel::top("startup_error").show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("⚠ 启动异常：")
+                            .strong()
+                            .color(Color32::from_rgb(255, 120, 120)),
+                    );
+                    ui.label(egui::RichText::new(err).color(Color32::from_rgb(255, 190, 190)));
+                });
+                ui.label(
+                    egui::RichText::new("窗口已正常打开。可在左侧修改配置后点击 Save config，然后重启本应用。")
+                        .color(Color32::from_gray(210)),
+                );
+                ui.add_space(4.0);
+            });
+        }
+
         egui::SidePanel::left("config").show(ctx, |ui| {
             ui.heading("MouseShare");
             ui.label("Share mouse, keyboard & clipboard over LAN.");
