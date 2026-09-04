@@ -195,12 +195,18 @@ fn main() -> anyhow::Result<()> {
         });
     } else {
         info!("running as secondary; waiting for input from {}", server_addr);
-        // Secondaries also listen for the switch hotkey (ScrollLock) so the user can hand control
-        // back to the primary from the Windows side — the press is forwarded to the primary, which
-        // actually rotates ownership.
+        // Secondaries also listen for the switch hotkey (ScrollLock, or Ctrl+Alt+Space — most
+        // Mac keyboards have no ScrollLock key) so the user can hand control back to the primary
+        // from the Windows side — the press is forwarded to the primary, which rotates ownership.
         let net_hk = net.clone();
+        let hk = Arc::new(Mutex::new(HotkeyState::default()));
         input::start_capture(move |e: Event| {
-            if let EventType::KeyPress(Key::ScrollLock) = e.event_type {
+            let (k, down) = match e.event_type {
+                EventType::KeyPress(k) => (k, true),
+                EventType::KeyRelease(k) => (k, false),
+                _ => return,
+            };
+            if hotkey_fired(k, down, &mut hk.lock().unwrap()) {
                 net_hk.lock().unwrap().send_message(Message::Hotkey);
             }
         });
@@ -317,6 +323,32 @@ struct Ctrl {
     /// Consecutive outward pushes at a pinned edge (drives the automatic hand-off).
     pins: u32,
     last_pin: Option<std::time::Instant>,
+    /// Modifier/hotkey bookkeeping for the switch hotkey.
+    hk: HotkeyState,
+}
+
+/// State for the switch-hotkey detector: which modifiers are currently held.
+#[derive(Debug, Default)]
+struct HotkeyState {
+    ctrl: bool,
+    alt: bool,
+}
+
+/// Switch hotkey: **ScrollLock** (kept for compatibility) or **Ctrl+Alt+Space**.
+///
+/// Ctrl+Alt+Space is the primary choice because most Mac keyboards — every MacBook's built-in
+/// keyboard — have no ScrollLock key at all, which made the hotkey look unimplemented there.
+/// This is called for both key presses and releases so the modifier state stays in sync; it
+/// returns `true` only on the press that fires the switch.
+fn hotkey_fired(k: Key, down: bool, st: &mut HotkeyState) -> bool {
+    match k {
+        Key::ControlLeft | Key::ControlRight => st.ctrl = down,
+        Key::Alt | Key::AltGr => st.alt = down,
+        Key::ScrollLock => return down,
+        Key::Space => return down && st.ctrl && st.alt,
+        _ => {}
+    }
+    false
 }
 
 fn handle_capture(
@@ -375,14 +407,21 @@ fn handle_capture(
         ),
 
         EventType::KeyPress(k) => {
-            // The hotkey (default ScrollLock) rotates control to the next machine.
-            if k == Key::ScrollLock {
+            // The switch hotkey (ScrollLock, or Ctrl+Alt+Space — Mac keyboards have no
+            // ScrollLock key) rotates control to the next machine.
+            let fired = {
+                let mut c = ctrl.lock().unwrap();
+                hotkey_fired(k, true, &mut c.hk)
+            };
+            if fired {
                 cycle_control(net, layout, ctrl, primary_name);
                 return;
             }
             forward_if_remote(net, ctrl, InputEvent::KeyDown { key: k });
         }
         EventType::KeyRelease(k) => {
+            // Keep modifier state in sync on releases too (a no-op for non-modifier keys).
+            hotkey_fired(k, false, &mut ctrl.lock().unwrap().hk);
             // Ignore the hotkey's own release so a single tap cycles exactly once.
             if k == Key::ScrollLock {
                 return;

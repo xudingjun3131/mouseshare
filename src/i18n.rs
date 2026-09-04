@@ -169,7 +169,7 @@ pub const ZH: Tr = Tr {
     ctrl_local: "本机（推向副机一侧的屏幕边缘即可跨屏）",
     ctrl_remote: "当前在 {}（向主机方向推回边缘即返回）",
     ctrl_pushing: "贴边推进 {n}/{total}，继续向外推…",
-    hotkey_hint: "按 ScrollLock 在主机与各副机之间切换鼠标控制权。",
+    hotkey_hint: "切换鼠标控制权快捷键：Ctrl+Alt+空格 或 ScrollLock，在主机与各副机之间轮换（Mac、Windows 两端均可按）。",
     background_hint: "关闭窗口后 MouseShare 会最小化到后台继续共享；要彻底退出请点下方按钮。",
     exit_app: "退出程序",
 };
@@ -219,7 +219,7 @@ pub const EN: Tr = Tr {
     ctrl_local: "This machine (push into a secondary's edge to cross over)",
     ctrl_remote: "On {} (push back toward the primary's edge to return)",
     ctrl_pushing: "Edge push {n}/{total} — keep pushing…",
-    hotkey_hint: "Press ScrollLock to switch the mouse between the primary and each secondary.",
+    hotkey_hint: "Switch-hotkey: Ctrl+Alt+Space or ScrollLock rotates the mouse between the primary and each secondary (works on both sides).",
     background_hint: "Closing this window minimises MouseShare to the background and sharing keeps running. Use the button below to quit for real.",
     exit_app: "Quit MouseShare",
 };
