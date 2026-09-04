@@ -257,7 +257,7 @@ impl eframe::App for MouseShareApp {
                     .fill(Color32::from_rgb(255, 235, 236))
                     .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                     .rounding(Rounding::same(10.0))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(255, 200, 202)))
+                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(255, 200, 202)))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
@@ -560,7 +560,11 @@ fn draw_layout(
     t: Tr,
     theme: UiTheme,
 ) {
-    let avail = ui.available_size();
+    // Reserve the exact rectangle left in the central panel after the header.
+    // We must use its origin (not assume the panel top-left) or tiles will
+    // creep up and occlude the title/hint/legend when the window is short.
+    let canvas_rect = ui.available_rect_before_wrap();
+    let avail = canvas_rect.size();
     if avail.x < 40.0 || avail.y < 40.0 {
         return;
     }
@@ -572,8 +576,8 @@ fn draw_layout(
     let scale = ((avail.x - pad * 2.0) / vw)
         .min((avail.y - pad * 2.0) / vh)
         .max(0.05);
-    let offx = (avail.x - vw * scale) / 2.0 - minx as f32 * scale;
-    let offy = (avail.y - vh * scale) / 2.0 - miny as f32 * scale;
+    let offx = canvas_rect.min.x + (avail.x - vw * scale) / 2.0 - minx as f32 * scale;
+    let offy = canvas_rect.min.y + (avail.y - vh * scale) / 2.0 - miny as f32 * scale;
 
     for s in layout.screens.iter_mut() {
         let x = offx + s.ox as f32 * scale;
@@ -653,7 +657,7 @@ fn draw_layout(
 
     // Bottom-center hint on the canvas.
     ui.painter().text(
-        pos2(avail.x / 2.0, avail.y - 16.0),
+        pos2(canvas_rect.min.x + avail.x / 2.0, canvas_rect.max.y - 16.0),
         Align2::CENTER_CENTER,
         t.layout_tip,
         FontId::proportional(12.0),
