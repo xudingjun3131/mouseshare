@@ -147,6 +147,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          # allowUpdates lets a re-pushed tag repair an existing release (e.g. fill in assets
+          # that a previous run failed to build) instead of erroring with "Release already exists".
+          allowUpdates: true
           files: |
             mouseshare-linux.tar.gz
             mouseshare-linux.deb
