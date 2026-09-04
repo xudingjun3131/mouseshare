@@ -15,7 +15,7 @@ use crate::i18n::{tr, Lang, Tr};
 use crate::layout::Layout;
 use crate::network::{connect_client, Net};
 use crate::protocol::Message;
-use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Rect, Rounding, Sense};
+use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Rect, Sense};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -92,7 +92,7 @@ pub fn setup_fonts(ctx: &egui::Context) {
         log::info!("using bundled Noto Sans SC ({} KB)", embedded.len() / 1024);
         fonts
             .font_data
-            .insert("cjk".into(), egui::FontData::from_owned(embedded.to_vec()));
+            .insert("cjk".into(), std::sync::Arc::new(egui::FontData::from_owned(embedded.to_vec())));
         prefer_cjk(&mut fonts);
         ctx.set_fonts(fonts);
         return;
@@ -135,7 +135,7 @@ pub fn setup_fonts(ctx: &egui::Context) {
                 log::info!("loaded CJK font from {} ({} KB)", path, bytes.len() / 1024);
                 fonts
                     .font_data
-                    .insert("cjk".into(), egui::FontData::from_owned(bytes));
+                    .insert("cjk".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
                 prefer_cjk(&mut fonts);
                 break;
             }
@@ -152,7 +152,7 @@ pub fn setup_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = vec2(10.0, 10.0);
     style.spacing.button_padding = vec2(14.0, 7.0);
-    style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.spacing.menu_margin = egui::Margin::same(8);
     style.spacing.indent = 14.0;
     // Uniform control rounding across buttons / inputs / radios — the macOS look (squircle-ish).
     for w in [
@@ -162,7 +162,7 @@ pub fn setup_style(ctx: &egui::Context) {
         &mut style.visuals.widgets.open,
         &mut style.visuals.widgets.noninteractive,
     ] {
-        w.rounding = Rounding::same(8.0);
+        w.corner_radius = egui::CornerRadius::same(8);
     }
     style.visuals.window_stroke = egui::Stroke::NONE;
     ctx.set_style(style);
@@ -312,7 +312,7 @@ impl eframe::App for MouseShareApp {
                     let pill = egui::Button::new(
                         egui::RichText::new(self.lang.toggle_label()).size(12.5),
                     )
-                    .rounding(8.0)
+                    .corner_radius(8)
                     .fill(ui.visuals().widgets.inactive.bg_fill)
                     .stroke(ui.visuals().widgets.noninteractive.bg_stroke);
                     if ui.add(pill).clicked() {
@@ -340,8 +340,8 @@ impl eframe::App for MouseShareApp {
                 ui.add_space(10.0);
                 egui::Frame::none()
                     .fill(Color32::from_rgb(255, 235, 236))
-                    .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-                    .rounding(Rounding::same(10.0))
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .corner_radius(10)
                     .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(255, 200, 202)))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
@@ -565,7 +565,7 @@ impl MouseShareApp {
                 egui::RichText::new(t.save).strong().color(Color32::WHITE),
             )
             .min_size(vec2(ui.available_width(), 36.0))
-            .rounding(9.0)
+            .corner_radius(9)
             .fill(theme.accent);
             if ui.add(save).clicked() {
                 self.config.layout = self.shared_layout.lock().unwrap().clone();
@@ -737,8 +737,8 @@ fn card(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(8.0);
     egui::Frame::none()
         .fill(ui.visuals().extreme_bg_color)
-        .rounding(Rounding::same(12.0))
-        .inner_margin(egui::Margin::same(14.0))
+        .corner_radius(12)
+        .inner_margin(egui::Margin::same(14))
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
         .show(ui, body);
 }
@@ -891,7 +891,7 @@ fn draw_layout(
             12.0,
             Color32::from_white_alpha(28),
         );
-        ui.painter().rect_stroke(rect, 12.0, (1.5, stroke));
+        ui.painter().rect_stroke(rect, egui::CornerRadius::same(12), (1.5, stroke), egui::StrokeKind::Inside);
 
         if w > 56.0 && h > 40.0 {
             let title = if is_primary {
