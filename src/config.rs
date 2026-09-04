@@ -44,6 +44,7 @@ impl Default for Config {
                     w: 1920,
                     h: 1080,
                     is_local: true,
+                    scale: 1.0,
                 }],
             },
             primary_name: host,

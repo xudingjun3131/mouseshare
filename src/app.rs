@@ -457,6 +457,7 @@ impl eframe::App for MouseShareApp {
                         w: 1920,
                         h: 1080,
                         is_local: true,
+                        scale: 1.0,
                     });
                 }
                 // Live cursor position from the control plane, drawn on the canvas: while you
@@ -595,7 +596,14 @@ impl MouseShareApp {
             let mut del_idx: Option<usize> = None;
             for (i, s) in layout.screens.iter().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.monospace(format!("{}  {}×{}", s.name, s.w, s.h));
+                    let phys = s.physical_size();
+                    let size_label = if phys != (s.w, s.h) {
+                        // HiDPI panel: logical (layout) size @ scale, plus the real pixel size.
+                        format!("{}×{} @{:.2}x ({}×{})", s.w, s.h, s.scale, phys.0, phys.1)
+                    } else {
+                        format!("{}×{}", s.w, s.h)
+                    };
+                    ui.monospace(format!("{}  {}", s.name, size_label));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button(t.del).clicked() {
                             del_idx = Some(i);
@@ -633,6 +641,7 @@ impl MouseShareApp {
                     w: 1920,
                     h: 1080,
                     is_local: false,
+                    scale: 1.0,
                 });
             }
         });
@@ -912,7 +921,11 @@ fn draw_layout(
                 ui.painter().text(
                     pos2(rect.center().x, cy + 12.0),
                     Align2::CENTER_CENTER,
-                    &format!("{}×{}", s.w, s.h),
+                    &if s.physical_size() != (s.w, s.h) {
+                        format!("{}×{} @{}x", s.w, s.h, s.scale)
+                    } else {
+                        format!("{}×{}", s.w, s.h)
+                    },
                     FontId::proportional(12.0),
                     Color32::from_white_alpha(210),
                 );

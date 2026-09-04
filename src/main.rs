@@ -77,6 +77,28 @@ mod sys_cursor {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Windows: declare per-monitor DPI awareness BEFORE anything queries display metrics.
+    // Without it Windows DPI-virtualizes the process: `GetSystemMetrics` (and therefore
+    // rdev's `display_size`) reports the *scaled logical* resolution (e.g. 1755x1097 for a
+    // 2560x1600 panel), while absolute mouse injection via `MOUSEEVENTF_ABSOLUTE|VIRTUALDESK`
+    // is normalized against the *physical* virtual desktop — a coordinate-space mismatch
+    // that misreports the screen size AND skews cursor injection on any scaled display.
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetProcessDpiAwarenessContext(ctx: isize) -> i32;
+            fn SetProcessDPIAware() -> i32;
+        }
+        const PER_MONITOR_AWARE_V2: isize = -4;
+        unsafe {
+            // Win10 1703+: per-monitor v2; older Windows falls back to system DPI aware.
+            if SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) == 0 {
+                SetProcessDPIAware();
+            }
+        }
+    }
+
     // `--probe`: coordinate-space self-test. Warps the cursor to known points and compares
     // the positions reported by the event stream (rdev::listen) with direct Core Graphics
     // reads (CGEventGetLocation). Any mismatch between the two — or versus the layout
@@ -171,10 +193,18 @@ fn main() -> anyhow::Result<()> {
             .screens
             .iter()
             .map(|s| {
-                format!(
-                    "{}({}x{}@{},{} local={})",
-                    s.name, s.w, s.h, s.ox, s.oy, s.is_local
-                )
+                let phys = s.physical_size();
+                if phys != (s.w, s.h) {
+                    format!(
+                        "{}({}x{}@{},{} physical={}x{} local={})",
+                        s.name, s.w, s.h, s.ox, s.oy, phys.0, phys.1, s.is_local
+                    )
+                } else {
+                    format!(
+                        "{}({}x{}@{},{} local={})",
+                        s.name, s.w, s.h, s.ox, s.oy, s.is_local
+                    )
+                }
             })
             .collect::<Vec<_>>()
             .join(" | ");
@@ -1055,6 +1085,7 @@ fn detect_primary_layout(primary_name: &str) -> Layout {
                         w: disp.width,
                         h: disp.height,
                         is_local: true,
+                        scale: disp.scale_factor,
                     });
                 }
                 info!(
@@ -1075,6 +1106,22 @@ fn detect_primary_layout(primary_name: &str) -> Layout {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = primary_name;
+        // Real display size (physical pixels on Windows, which is DPI-aware at this point)
+        // instead of a hardcoded 1920x1080 guess, so a non-macOS primary starts with a
+        // bbox that actually matches its screen.
+        if let Ok((w, h)) = rdev::display_size() {
+            return Layout {
+                screens: vec![crate::layout::Screen {
+                    name: primary_name.to_string(),
+                    ox: 0,
+                    oy: 0,
+                    w: w as u32,
+                    h: h as u32,
+                    is_local: true,
+                    scale: 1.0,
+                }],
+            };
+        }
     }
     Layout {
         screens: vec![crate::layout::Screen {
@@ -1084,6 +1131,7 @@ fn detect_primary_layout(primary_name: &str) -> Layout {
             w: 1920,
             h: 1080,
             is_local: true,
+            scale: 1.0,
         }],
     }
 }

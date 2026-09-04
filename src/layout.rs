@@ -21,13 +21,32 @@ pub struct Screen {
     /// carrying a unique `name`.
     #[serde(default = "default_is_local")]
     pub is_local: bool,
+    /// UI scale factor of the source display (1.0 = no scaling). Coordinates stay in the OS
+    /// logical space that rdev reports (points on macOS, physical pixels once the Windows
+    /// process is DPI-aware); this field only annotates the real pixel size of the panel
+    /// (`w * scale`) so the GUI can display HiDPI screens correctly.
+    #[serde(default = "default_scale")]
+    pub scale: f32,
 }
 
 fn default_is_local() -> bool {
     true
 }
 
+fn default_scale() -> f32 {
+    1.0
+}
+
 impl Screen {
+    /// Physical pixel size (logical size × UI scale) — what the panel actually renders.
+    /// Equals `(w, h)` on non-HiDPI displays and on Windows after DPI awareness.
+    pub fn physical_size(&self) -> (u32, u32) {
+        (
+            (self.w as f32 * self.scale) as u32,
+            (self.h as f32 * self.scale) as u32,
+        )
+    }
+
     pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.ox as f64
             && x < (self.ox + self.w as i32) as f64
@@ -122,6 +141,7 @@ impl Layout {
             w,
             h,
             is_local,
+            scale: 1.0,
         });
         true
     }
@@ -146,6 +166,7 @@ impl Layout {
                 w: src.w,
                 h: src.h,
                 is_local: src.is_local,
+                scale: src.scale,
             });
         }
     }
