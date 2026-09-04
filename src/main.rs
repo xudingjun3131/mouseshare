@@ -19,11 +19,11 @@ mod protocol;
 
 use crate::config::{load_config, save_config, Config};
 use crate::i18n::Lang;
-use crate::layout::Layout;
+use crate::layout::{Layout, Screen};
 use crate::network::{connect_client, start_hub, Net};
 use crate::protocol::{InputEvent, Message};
 use log::info;
-use rdev::{display_size, Button as RdevButton, Event, EventType};
+use rdev::{display_size, Event, EventType, Key};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 
@@ -114,6 +114,10 @@ fn main() -> anyhow::Result<()> {
         let layout = layout.clone();
         let last_seen = Arc::new(Mutex::new(String::new()));
         let mode2 = mode.clone();
+        let ownership = ownership.clone();
+        let vcursor = vcursor.clone();
+        let last_real = last_real.clone();
+        let primary_name = primary_name.clone();
         std::thread::spawn(move || {
             for (from, msg) in inc_rx {
                 match msg {
@@ -151,6 +155,13 @@ fn main() -> anyhow::Result<()> {
                             *layout.lock().unwrap() = new_layout;
                         }
                     }
+                    Message::Hotkey => {
+                        // A secondary pressed the switch hotkey; only the primary actually rotates
+                        // control (it owns the cursor and the layout).
+                        if mode2 == "primary" {
+                            cycle_control(&net, &layout, &ownership, &vcursor, &last_real, &primary_name);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -168,7 +179,7 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // ---- Capture (primary only) ----
+    // ---- Capture ----
     if mode == "primary" {
         let net = net.clone();
         let layout = layout.clone();
@@ -189,6 +200,15 @@ fn main() -> anyhow::Result<()> {
         });
     } else {
         info!("running as secondary; waiting for input from {}", server_addr);
+        // Secondaries also listen for the switch hotkey (ScrollLock) so the user can hand control
+        // back to the primary from the Windows side — the press is forwarded to the primary, which
+        // actually rotates ownership.
+        let net_hk = net.clone();
+        input::start_capture(move |e: Event| {
+            if let EventType::KeyPress(Key::ScrollLock) = e.event_type {
+                net_hk.lock().unwrap().send_message(Message::Hotkey);
+            }
+        });
     }
 
     // ---- GUI on the main thread ----
@@ -257,195 +277,336 @@ fn handle_capture(
                 d
             };
 
-            // Advance the unbounded virtual cursor.
-            {
-                let mut vc = vcursor.lock().unwrap();
-                *vc = (vc.0 + d.0, vc.1 + d.1);
-            }
-
-            let (cx, cy, owning_idx) = {
-                let l = layout.lock().unwrap();
-                let vc = *vcursor.lock().unwrap();
-                let owning_idx = l.screen_at(vc.0, vc.1);
-                let (cx, cy) = if owning_idx.is_some() {
-                    (vc.0, vc.1)
-                } else {
-                    l.clamp(vc.0, vc.1)
-                };
-                (cx, cy, owning_idx)
-            };
-
-            if let Some(idx) = owning_idx {
-                let (name, ox, oy, is_local) = {
-                    let l = layout.lock().unwrap();
-                    let s = &l.screens[idx];
-                    (s.name.clone(), s.ox as f64, s.oy as f64, s.is_local)
-                };
-                *ownership.lock().unwrap() = name.clone();
-                if !is_local {
-                    // Remote screen: inject the absolute position *inside* that screen.
-                    net.lock()
-                        .unwrap()
-                        .send_input(&name, InputEvent::MouseMove { x: cx - ox, y: cy - oy });
-                }
-                // Local screen: the real cursor is already there — nothing to inject. This is what
-                // lets the primary's own multiple monitors work: every one is `is_local`, so the
-                // cursor roams between them natively without any forwarding.
-            } else {
-                // In a gap: keep forwarding to the current owner (clamped). Only matters when a
-                // screen was dragged away leaving a dead band — normally the secondary sits flush
-                // against the local bbox, so the cursor never lands here.
-                let cur = ownership.lock().unwrap().clone();
-                let l = layout.lock().unwrap();
-                if let Some(s) = l.screens.iter().find(|s| s.name == cur) {
-                    if !s.is_local {
-                        let (gx, gy) = l.clamp(cx, cy);
-                        net.lock().unwrap().send_input(
-                            &cur,
-                            InputEvent::MouseMove {
-                                x: gx - s.ox as f64,
-                                y: gy - s.oy as f64,
-                            },
-                        );
-                    }
-                }
-                let mut vc = vcursor.lock().unwrap();
-                *vc = l.clamp(cx, cy);
-            }
-
-            // Treadmill: keep the physical cursor producing motion once it hits an edge of the
-            // primary's own (local) bounding box while still pushing outward, so the virtual cursor
-            // can keep marching onto the neighbouring remote screen. We only warp on an edge that
-            // actually has a remote screen just beyond it, and we warp the real cursor to the
-            // *opposite* edge of the local bbox so it stays on the primary. Without this, the OS
-            // would clamp the real cursor at the display edge and the virtual cursor would stall.
             let l = layout.lock().unwrap();
-            if l.screens.len() > 1 {
-                // Is the real cursor currently on one of the primary's own (local) screens?
-                if let Some(local_idx) = l.screen_at(x, y).filter(|&i| l.screens[i].is_local) {
-                    let ls = &l.screens[local_idx];
-                    let bbox = l.local_bbox().unwrap_or((
-                        ls.ox as f64,
-                        ls.oy as f64,
-                        ls.ox as f64 + ls.w as f64,
-                        ls.oy as f64 + ls.h as f64,
-                    ));
-                    let (bb_left, bb_top, bb_right, bb_bottom) = bbox;
-                    let margin = 4.0;
-                    let near_right = x >= bb_right - margin;
-                    let near_left = x <= bb_left + margin;
-                    let near_bottom = y >= bb_bottom - margin;
-                    let near_top = y <= bb_top + margin;
-                    // Is there a remote screen just beyond each edge (overlapping on the crossing axis)?
-                    let remote_right = l.screens.iter().any(|s| {
-                        !s.is_local
-                            && (s.ox as f64) >= bb_right - 2.0
-                            && (s.ox as f64) <= bb_right + 120.0
-                            && overlap_y(s, bb_top, bb_bottom)
-                    });
-                    let remote_left = l.screens.iter().any(|s| {
-                        !s.is_local
-                            && ((s.ox + s.w as i32) as f64) <= bb_left + 2.0
-                            && ((s.ox + s.w as i32) as f64) >= bb_left - 120.0
-                            && overlap_y(s, bb_top, bb_bottom)
-                    });
-                    let remote_bottom = l.screens.iter().any(|s| {
-                        !s.is_local
-                            && (s.oy as f64) >= bb_bottom - 2.0
-                            && (s.oy as f64) <= bb_bottom + 120.0
-                            && overlap_x(s, bb_left, bb_right)
-                    });
-                    let remote_top = l.screens.iter().any(|s| {
-                        !s.is_local
-                            && ((s.oy + s.h as i32) as f64) <= bb_top + 2.0
-                            && ((s.oy + s.h as i32) as f64) >= bb_top - 120.0
-                            && overlap_x(s, bb_left, bb_right)
-                    });
-                    let pushing_out = (remote_right && near_right && d.0 > 0.0)
-                        || (remote_left && near_left && d.0 < 0.0)
-                        || (remote_bottom && near_bottom && d.1 > 0.0)
-                        || (remote_top && near_top && d.1 < 0.0);
-                    if pushing_out {
-                        let nx = if remote_right {
-                            bb_left + margin
-                        } else if remote_left {
-                            bb_right - margin
-                        } else {
-                            x
-                        };
-                        let ny = if remote_bottom {
-                            bb_top + margin
-                        } else if remote_top {
-                            bb_bottom - margin
-                        } else {
-                            y
-                        };
-                        input::warp_cursor(nx, ny);
-                        *last_real.lock().unwrap() = (nx, ny);
-                    }
+            // With a single screen there is nothing to hand control to — the real cursor just
+            // moves locally and nothing is forwarded.
+            if l.screens.len() <= 1 {
+                return;
+            }
+            let bbox = l.local_bbox().unwrap_or((0.0, 0.0, 1920.0, 1080.0));
+            let cur = ownership.lock().unwrap().clone();
+            let cur_is_local = l.screens.iter().find(|s| s.name == cur).map(|s| s.is_local).unwrap_or(true);
+
+            if cur_is_local {
+                // The real cursor is free on this primary. If it is over one of our own displays,
+                // just keep tracking it locally — never forward to a secondary (this is what lets a
+                // multi-monitor Mac roam between its own screens natively).
+                if let Some(idx) = l.screen_at(x, y).filter(|&i| l.screens[i].is_local) {
+                    *ownership.lock().unwrap() = l.screens[idx].name.clone();
+                    *vcursor.lock().unwrap() = (x, y);
+                    return;
                 }
+                // It's at/over an edge or a gap: try to hand control off to an adjacent secondary.
+                if let Some((side, rname)) = outward_handoff(&l, bbox, x, y, d) {
+                    let remote = match l.screens.iter().find(|s| s.name == rname) {
+                        Some(s) => s.clone(),
+                        None => return,
+                    };
+                    *ownership.lock().unwrap() = rname.clone();
+                    // Seed the secondary cursor at the shared edge, then apply this first delta.
+                    let mut v = vcursor.lock().unwrap();
+                    *v = entry_point(side, &remote, x, y);
+                    *v = (v.0 + d.0, v.1 + d.1);
+                    *v = clamp_to_remote(&remote, *v);
+                    let (fx, fy) = *v;
+                    drop(v);
+                    net.lock().unwrap().send_input(&rname, InputEvent::MouseMove { x: fx, y: fy });
+                    // Park the real cursor on the opposite edge of the local bbox so it keeps
+                    // producing outward motion; without this the OS would clamp it at the display
+                    // edge and the secondary cursor would stall.
+                    let park = park_point(side, bbox, x, y);
+                    drop(l);
+                    input::warp_cursor(park.0, park.1);
+                    *last_real.lock().unwrap() = park;
+                }
+                // else: over a gap with no secondary beyond it — do nothing.
+            } else {
+                // Controlling a secondary: forward deltas, keep the real cursor parked, and watch
+                // for the user pushing back inward (which returns control to this primary). The
+                // virtual cursor here lives in the *secondary's* local space, so it can never drift
+                // back onto the primary's screen and cause the two to move at once.
+                let remote = match l.screens.iter().find(|s| s.name == cur) {
+                    Some(s) => s.clone(),
+                    None => {
+                        *ownership.lock().unwrap() = primary_name.to_string();
+                        return;
+                    }
+                };
+                let side = side_of_remote(bbox, &remote);
+                if is_outward(side, d) {
+                    let mut v = vcursor.lock().unwrap();
+                    *v = (v.0 + d.0, v.1 + d.1);
+                    *v = clamp_to_remote(&remote, *v);
+                    let (fx, fy) = *v;
+                    drop(v);
+                    net.lock().unwrap().send_input(&cur, InputEvent::MouseMove { x: fx, y: fy });
+                    let park = park_point(side, bbox, x, y);
+                    drop(l);
+                    input::warp_cursor(park.0, park.1);
+                    *last_real.lock().unwrap() = park;
+                } else if is_inward(side, d) {
+                    // User moved back toward the primary — release control. The real cursor is
+                    // already on this machine, so we simply stop parking/forwarding.
+                    *ownership.lock().unwrap() = primary_name.to_string();
+                    *vcursor.lock().unwrap() = (x, y);
+                }
+                // else: delta ~0 (real cursor clamped at the edge) — stay parked, do nothing.
             }
         }
 
-        EventType::ButtonPress(b) => forward_button(net, ownership, primary_name, b, true),
-        EventType::ButtonRelease(b) => forward_button(net, ownership, primary_name, b, false),
+        EventType::ButtonPress(b) => {
+            let ev = InputEvent::MouseDown {
+                button: input::button_to_ms(b),
+            };
+            forward_if_remote(net, ownership, layout, ev);
+        }
+        EventType::ButtonRelease(b) => {
+            let ev = InputEvent::MouseUp {
+                button: input::button_to_ms(b),
+            };
+            forward_if_remote(net, ownership, layout, ev);
+        }
 
         EventType::Wheel { delta_x, delta_y } => {
-            let target = ownership.lock().unwrap().clone();
-            if target != primary_name {
-                net.lock()
-                    .unwrap()
-                    .send_input(&target, InputEvent::Wheel { dx: delta_x, dy: delta_y });
-            }
+            forward_if_remote(
+                net,
+                ownership,
+                layout,
+                InputEvent::Wheel { dx: delta_x, dy: delta_y },
+            );
         }
 
         EventType::KeyPress(k) => {
-            let target = ownership.lock().unwrap().clone();
-            if target != primary_name {
-                net.lock().unwrap().send_input(&target, InputEvent::KeyDown { key: k });
+            // The hotkey (default ScrollLock) rotates control to the next machine.
+            if k == Key::ScrollLock {
+                cycle_control(net, layout, ownership, vcursor, last_real, primary_name);
+                return;
             }
+            forward_if_remote(net, ownership, layout, InputEvent::KeyDown { key: k });
         }
         EventType::KeyRelease(k) => {
-            let target = ownership.lock().unwrap().clone();
-            if target != primary_name {
-                net.lock().unwrap().send_input(&target, InputEvent::KeyUp { key: k });
+            // Ignore the hotkey's own release so a single tap cycles exactly once.
+            if k == Key::ScrollLock {
+                return;
             }
+            forward_if_remote(net, ownership, layout, InputEvent::KeyUp { key: k });
         }
     }
 }
 
-fn forward_button(
+/// Forward an input event to the screen that currently has control, but only when that screen is
+/// a *remote* (secondary) one. When control is on a local screen, nothing is forwarded — the real
+/// cursor/keyboard is already acting on this machine.
+fn forward_if_remote(
     net: &Arc<Mutex<Net>>,
     ownership: &Arc<Mutex<String>>,
-    primary_name: &str,
-    b: RdevButton,
-    down: bool,
+    layout: &Arc<Mutex<Layout>>,
+    ev: InputEvent,
 ) {
-    let target = ownership.lock().unwrap().clone();
-    if target != primary_name {
-        let ev = if down {
-            InputEvent::MouseDown {
-                button: input::button_to_ms(b),
-            }
-        } else {
-            InputEvent::MouseUp {
-                button: input::button_to_ms(b),
-            }
+    let l = layout.lock().unwrap();
+    let cur = ownership.lock().unwrap().clone();
+    let is_remote = l.screens.iter().find(|s| s.name == cur).map(|s| !s.is_local).unwrap_or(false);
+    drop(l);
+    if is_remote {
+        net.lock().unwrap().send_input(&cur, ev);
+    }
+}
+
+/// The side of the local bounding box a remote screen is attached to (by the smallest gap).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Side {
+    Right,
+    Left,
+    Top,
+    Bottom,
+}
+
+/// Clamp a point to the local coordinate space of a remote screen (origin at its top-left).
+fn clamp_to_remote(s: &Screen, p: (f64, f64)) -> (f64, f64) {
+    (p.0.clamp(0.0, s.w as f64 - 1.0), p.1.clamp(0.0, s.h as f64 - 1.0))
+}
+
+/// Which side of the local bounding box a remote screen is attached to.
+fn side_of_remote(bbox: (f64, f64, f64, f64), s: &Screen) -> Side {
+    let (l, t, r, b) = bbox;
+    let ro = s.ox as f64;
+    let rr = (s.ox + s.w as i32) as f64;
+    let rt = s.oy as f64;
+    let rb = (s.oy + s.h as i32) as f64;
+    let g_right = (ro - r).abs();
+    let g_left = (l - rr).abs();
+    let g_bottom = (rt - b).abs();
+    let g_top = (t - rb).abs();
+    let mut best = Side::Right;
+    let mut bestv = g_right;
+    if g_left < bestv {
+        bestv = g_left;
+        best = Side::Left;
+    }
+    if g_bottom < bestv {
+        bestv = g_bottom;
+        best = Side::Bottom;
+    }
+    if g_top < bestv {
+        best = Side::Top;
+    }
+    best
+}
+
+/// Where the cursor appears on a remote screen (its local coords) when control is handed off —
+/// the shared edge, aligned with the real cursor on the crossing axis.
+fn entry_point(side: Side, s: &Screen, real_x: f64, real_y: f64) -> (f64, f64) {
+    let (ox, oy, w, h) = (s.ox as f64, s.oy as f64, s.w as f64, s.h as f64);
+    match side {
+        Side::Right => (0.0, (real_y - oy).clamp(0.0, h - 1.0)),
+        Side::Left => (w - 1.0, (real_y - oy).clamp(0.0, h - 1.0)),
+        Side::Top => ((real_x - ox).clamp(0.0, w - 1.0), 0.0),
+        Side::Bottom => ((real_x - ox).clamp(0.0, w - 1.0), h - 1.0),
+    }
+}
+
+/// Where to park the real (primary) cursor so it keeps generating outward motion while we drive
+/// the secondary: the edge of the local bbox *opposite* the shared edge.
+fn park_point(side: Side, bbox: (f64, f64, f64, f64), real_x: f64, real_y: f64) -> (f64, f64) {
+    let (l, t, r, b) = bbox;
+    let m = 4.0;
+    match side {
+        Side::Right => (l + m, real_y.clamp(t, b)),
+        Side::Left => (r - m, real_y.clamp(t, b)),
+        Side::Top => (real_x.clamp(l, r), b - m),
+        Side::Bottom => (real_x.clamp(l, r), t + m),
+    }
+}
+
+fn is_outward(side: Side, d: (f64, f64)) -> bool {
+    match side {
+        Side::Right => d.0 > 0.0,
+        Side::Left => d.0 < 0.0,
+        Side::Top => d.1 < 0.0,
+        Side::Bottom => d.1 > 0.0,
+    }
+}
+
+fn is_inward(side: Side, d: (f64, f64)) -> bool {
+    match side {
+        Side::Right => d.0 < 0.0,
+        Side::Left => d.0 > 0.0,
+        Side::Top => d.1 > 0.0,
+        Side::Bottom => d.1 < 0.0,
+    }
+}
+
+/// Find a secondary attached to the local bbox on the side the cursor is pushing toward (near the
+/// edge, moving outward, and overlapping on the crossing axis). Used for automatic edge hand-off.
+fn outward_handoff(
+    l: &Layout,
+    bbox: (f64, f64, f64, f64),
+    x: f64,
+    y: f64,
+    d: (f64, f64),
+) -> Option<(Side, String)> {
+    let (bl, bt, br, bb) = bbox;
+    let m = 6.0;
+    let near_right = x >= br - m;
+    let near_left = x <= bl + m;
+    let near_bottom = y >= bb - m;
+    let near_top = y <= bt + m;
+    for s in &l.screens {
+        if s.is_local {
+            continue;
+        }
+        let side = side_of_remote(bbox, s);
+        let adjacent = match side {
+            Side::Right => (s.ox as f64 - br).abs() < 160.0,
+            Side::Left => (bl - (s.ox + s.w as i32) as f64).abs() < 160.0,
+            Side::Bottom => (s.oy as f64 - bb).abs() < 160.0,
+            Side::Top => (bt - (s.oy + s.h as i32) as f64).abs() < 160.0,
         };
-        net.lock().unwrap().send_input(&target, ev);
+        if !adjacent {
+            continue;
+        }
+        let ok = match side {
+            Side::Right => near_right && is_outward(Side::Right, d) && overlap_y(s, bt, bb),
+            Side::Left => near_left && is_outward(Side::Left, d) && overlap_y(s, bt, bb),
+            Side::Bottom => near_bottom && is_outward(Side::Bottom, d) && overlap_x(s, bl, br),
+            Side::Top => near_top && is_outward(Side::Top, d) && overlap_x(s, bl, br),
+        };
+        if ok {
+            return Some((side, s.name.clone()));
+        }
+    }
+    None
+}
+
+/// Rotate control to the next machine: the primary (as one machine) then each secondary, cycling.
+/// Called when the hotkey is pressed locally or relayed from a secondary.
+fn cycle_control(
+    net: &Arc<Mutex<Net>>,
+    layout: &Arc<Mutex<Layout>>,
+    ownership: &Arc<Mutex<String>>,
+    vcursor: &Arc<Mutex<(f64, f64)>>,
+    last_real: &Arc<Mutex<(f64, f64)>>,
+    primary_name: &str,
+) {
+    let l = layout.lock().unwrap();
+    let mut remotes: Vec<String> = Vec::new();
+    for s in &l.screens {
+        if !s.is_local && !remotes.iter().any(|n| n == &s.name) {
+            remotes.push(s.name.clone());
+        }
+    }
+    if remotes.is_empty() {
+        return; // nothing else to switch to
+    }
+    let cur = ownership.lock().unwrap().clone();
+    let cur_is_local = l.screens.iter().find(|s| s.name == cur).map(|s| s.is_local).unwrap_or(true);
+    let cur_machine: String = if cur_is_local {
+        "__local__".to_string()
+    } else {
+        cur.clone()
+    };
+    let mut order = vec!["__local__".to_string()];
+    order.extend(remotes);
+    let idx = order.iter().position(|m| m == &cur_machine).unwrap_or(0);
+    let next = order[(idx + 1) % order.len()].clone();
+    drop(l);
+
+    if next == "__local__" {
+        *ownership.lock().unwrap() = primary_name.to_string();
+        *vcursor.lock().unwrap() = *last_real.lock().unwrap();
+    } else {
+        let l2 = layout.lock().unwrap();
+        let remote = match l2.screens.iter().find(|s| s.name == next) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let bbox = l2.local_bbox().unwrap_or((0.0, 0.0, 1920.0, 1080.0));
+        let side = side_of_remote(bbox, &remote);
+        let lr = *last_real.lock().unwrap();
+        *ownership.lock().unwrap() = next.clone();
+        let mut v = vcursor.lock().unwrap();
+        *v = entry_point(side, &remote, lr.0, lr.1);
+        drop(v);
+        // Park the real cursor on the opposite edge and seed the secondary cursor at the entry.
+        let park = park_point(side, bbox, lr.0, lr.1);
+        drop(l2);
+        input::warp_cursor(park.0, park.1);
+        *last_real.lock().unwrap() = park;
+        let v = *vcursor.lock().unwrap();
+        net.lock().unwrap().send_input(&next, InputEvent::MouseMove { x: v.0, y: v.1 });
     }
 }
 
 /// Do two screen vertical ranges overlap? Used to decide whether a remote screen sits just
-/// beyond the local bbox's left/right edge (so the treadmill may engage on that edge).
-fn overlap_y(s: &crate::layout::Screen, top: f64, bottom: f64) -> bool {
+/// beyond the local bbox's left/right edge (so the hand-off may engage on that edge).
+fn overlap_y(s: &Screen, top: f64, bottom: f64) -> bool {
     let st = s.oy as f64;
     let sb = s.oy as f64 + s.h as f64;
     st < bottom && sb > top
 }
 
 /// Do two screen horizontal ranges overlap? Used for the top/bottom edges.
-fn overlap_x(s: &crate::layout::Screen, left: f64, right: f64) -> bool {
+fn overlap_x(s: &Screen, left: f64, right: f64) -> bool {
     let sl = s.ox as f64;
     let sr = s.ox as f64 + s.w as f64;
     sl < right && sr > left

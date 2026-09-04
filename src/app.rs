@@ -643,6 +643,12 @@ impl MouseShareApp {
                     }
                 }
             }
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(t.hotkey_hint)
+                    .size(12.0)
+                    .color(ui.visuals().weak_text_color()),
+            );
         });
     }
 }

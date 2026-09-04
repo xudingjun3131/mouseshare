@@ -115,6 +115,7 @@ pub struct Tr {
     pub conn_primary: &'static str,
     pub conn_connected: &'static str,
     pub conn_idle: &'static str,
+    pub hotkey_hint: &'static str,
 }
 
 pub const ZH: Tr = Tr {
@@ -158,6 +159,7 @@ pub const ZH: Tr = Tr {
     conn_primary: "主机（正在服务）",
     conn_connected: "已连接主机",
     conn_idle: "未连接",
+    hotkey_hint: "按 ScrollLock 在主机与各副机之间切换鼠标控制权。",
 };
 
 pub const EN: Tr = Tr {
@@ -201,6 +203,7 @@ pub const EN: Tr = Tr {
     conn_primary: "Primary (serving)",
     conn_connected: "Connected to host",
     conn_idle: "Not connected",
+    hotkey_hint: "Press ScrollLock to switch the mouse between the primary and each secondary.",
 };
 
 /// Look up the string table for a language.

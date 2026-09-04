@@ -86,8 +86,15 @@ impl Net {
         }
     }
 
-    pub fn peer_count(&self) -> usize {
-        match self {
+    /// Send an arbitrary message to the primary (used by secondaries, e.g. the hotkey). The
+    /// primary never calls this (it originates input itself); a `Primary`/`Idle` handle ignores it.
+    pub fn send_message(&self, msg: Message) {
+        if let Net::Secondary { tx } = self {
+            let _ = tx.send(msg);
+        }
+    }
+
+    pub fn peer_count(&self) -> usize {        match self {
             Net::Primary { peers } => peers.lock().unwrap().len(),
             Net::Secondary { .. } => 1,
             Net::Idle => 0,

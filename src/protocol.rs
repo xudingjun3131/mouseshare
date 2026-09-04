@@ -49,6 +49,10 @@ pub enum Message {
     LeaveScreen,
     /// Keep-alive.
     Ping,
+    /// Hotkey (default ScrollLock) pressed on either machine: the primary rotates control to the
+    /// next machine in the layout (primary as one machine, then each secondary). A secondary sends
+    /// this to the primary; the primary also handles its own local ScrollLock press.
+    Hotkey,
 }
 
 impl MsButton {
