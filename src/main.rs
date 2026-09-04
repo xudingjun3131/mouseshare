@@ -39,6 +39,42 @@ use std::sync::{Arc, Mutex};
 
 /// Throttle counter for diagnostic cursor-position samples (one per 100 motion events).
 static MOTION_SAMPLES: AtomicU64 = AtomicU64::new(0);
+/// Throttle counter for diagnostic samples taken while a secondary has control.
+static REMOTE_SAMPLES: AtomicU64 = AtomicU64::new(0);
+
+/// macOS cursor visibility, used to hide the real cursor while a secondary has control.
+/// This is the perceptual core of the hand-off: when control moves to the secondary, the
+/// local cursor *vanishes* and the secondary's cursor appears — the same cue Synergy gives.
+/// Without it, the parked cursor sitting visibly in the middle of the screen reads as
+/// "crossing failed", the user reaches for the mouse, and control instantly bounces back.
+#[cfg(target_os = "macos")]
+mod sys_cursor {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HIDDEN: AtomicBool = AtomicBool::new(false);
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGDisplayHideCursor(display: u32) -> i32;
+        fn CGDisplayShowCursor(display: u32) -> i32;
+        fn CGMainDisplayID() -> u32;
+    }
+    pub fn hide() {
+        if !HIDDEN.swap(true, Ordering::Relaxed) {
+            unsafe { CGDisplayHideCursor(CGMainDisplayID()) };
+        }
+    }
+    pub fn show() {
+        if HIDDEN.swap(false, Ordering::Relaxed) {
+            unsafe { CGDisplayShowCursor(CGMainDisplayID()) };
+        }
+    }
+}
+/// Non-macOS: nothing to do — the parking cursor is only a cosmetic concern there and the
+/// primary currently always runs on macOS in practice.
+#[cfg(not(target_os = "macos"))]
+mod sys_cursor {
+    pub fn hide() {}
+    pub fn show() {}
+}
 
 fn main() -> anyhow::Result<()> {
     // `--probe`: coordinate-space self-test. Warps the cursor to known points and compares
@@ -261,9 +297,17 @@ fn main() -> anyhow::Result<()> {
                     }
                     last_pos = Some((x, y));
 
-                    // Only meaningful while control is local.
-                    let is_local_ctrl = { ctrl.lock().unwrap().remote.is_none() };
-                    if !is_local_ctrl {
+                    // Only meaningful while control is local (and outside the just-returned
+                    // grace window — the returned cursor parks inside the shared-edge pin
+                    // zone, so the poller would otherwise re-cross immediately).
+                    let blocked = {
+                        let c = ctrl.lock().unwrap();
+                        c.remote.is_some()
+                            || c.cooldown_until
+                                .map(|t| std::time::Instant::now() < t)
+                                .unwrap_or(false)
+                    };
+                    if blocked {
                         rest_since = None;
                         continue;
                     }
@@ -414,6 +458,10 @@ const POLL_INTERVAL_MS: u64 = 50;
 /// motion events (or only zero-delta echoes) — both are invisible to the event path, but a
 /// direct OS position sample still shows the cursor sitting in the pin zone.
 const EDGE_REST_MS: u128 = 400;
+/// After control returns to the primary, automatic hand-offs are suppressed for this long.
+/// The returned cursor parks just inside the shared edge, so without this a stray push or
+/// a glide along that edge re-crosses immediately and control ping-pongs between machines.
+const RETURN_COOLDOWN_MS: u64 = 700;
 
 /// Which side of the local bounding box a secondary is attached to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +493,10 @@ struct Ctrl {
     /// Consecutive outward pushes at a pinned edge (drives the automatic hand-off).
     pins: u32,
     last_pin: Option<std::time::Instant>,
+    /// Suppress automatic hand-offs until this instant — set right after control returns,
+    /// because the returned cursor is parked just inside the shared edge and any stray push
+    /// along that edge would otherwise re-cross immediately (a hand-off/return ping-pong).
+    cooldown_until: Option<std::time::Instant>,
     /// Modifier/hotkey bookkeeping for the switch hotkey.
     hk: HotkeyState,
 }
@@ -589,6 +641,13 @@ fn local_move(
         }
         return;
     };
+    // Just-returned grace window: the cursor is parked a few pixels inside the shared edge,
+    // so ignore any push into that edge until the user has had a beat to move away from it.
+    if let Some(t) = c.cooldown_until {
+        if std::time::Instant::now() < t {
+            return;
+        }
+    }
     // Gliding ALONG the edge (e.g. moving down a list that hugs the border) is not a push:
     // the along-axis delta is large while the crossing axis stays clamped.
     let along = match side {
@@ -637,10 +696,20 @@ fn remote_move(
     let Some(s) = l.screens.iter().find(|s| s.name == r.name) else {
         // The secondary vanished from the layout — take control back.
         c.remote = None;
+        crate::sys_cursor::show();
         return;
     };
     let (w, h) = (s.w as f64, s.h as f64);
     drop(l);
+    // Throttled diagnostic sample while a secondary has control: shows whether the user's
+    // deltas are actually driving the secondary's virtual cursor (and how far it travels),
+    // which is the missing half of the picture in any "crossing doesn't work" report.
+    if REMOTE_SAMPLES.fetch_add(1, Ordering::Relaxed) % 100 == 0 {
+        diag::log(&format!(
+            "remote sample: {} vcursor=({:.0},{:.0}) screen={:.0}x{:.0} delta=({:.0},{:.0}) real=({:.0},{:.0})",
+            r.name, r.vx, r.vy, w, h, d.0, d.1, x, y
+        ));
+    }
     let mut vx = r.vx + d.0;
     let mut vy = r.vy + d.1;
     let back = match r.side {
@@ -663,6 +732,9 @@ fn remote_move(
         };
         c.remote = None;
         c.pins = 0;
+        c.cooldown_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(RETURN_COOLDOWN_MS));
+        crate::sys_cursor::show();
         input::warp_cursor(target.0, target.1);
         c.last_real = target;
         info!("control returned to {}", primary_name);
@@ -711,6 +783,9 @@ fn hand_off(
     c.remote = Some(RemoteCtrl { name: name.to_string(), side, vx, vy });
     c.pins = 0;
     c.last_pin = None;
+    // Hide the local cursor: control now lives on the secondary, and a cursor parked
+    // visibly in the middle of the screen reads as "crossing failed".
+    crate::sys_cursor::hide();
     net.lock().unwrap().send_input(name, InputEvent::MouseMove { x: vx, y: vy });
     let anchor = park_anchor(bbox);
     input::warp_cursor(anchor.0, anchor.1);
@@ -840,6 +915,9 @@ fn cycle_control(
         // the anchor on this machine — just resume local control.
         c.remote = None;
         c.pins = 0;
+        c.cooldown_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(RETURN_COOLDOWN_MS));
+        crate::sys_cursor::show();
         info!("control returned to {} (hotkey)", primary_name);
         return;
     }
