@@ -24,6 +24,10 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64
 PrivilegesRequired=lowest
+; Show the MouseShare logo on the installer wizard, the title bar and the
+; generated Start-Menu / desktop shortcuts (the .exe itself is embedded with the
+; same icon via build.rs + winresource).
+SetupIconFile=resources\AppIcon.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

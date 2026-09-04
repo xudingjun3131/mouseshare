@@ -29,6 +29,12 @@ directories = "5"
 # Detect the machine's LAN IP for convenience.
 local-ip-address = "0.6"
 
+[build-dependencies]
+# Embeds the Windows application icon (.ico) into the .exe at build time so the
+# binary shows the MouseShare logo in Explorer instead of a generic executable icon.
+# Only used on Windows (see build.rs); harmless no-op on macOS/Linux.
+winresource = "0.1"
+
 [profile.release]
 opt-level = 2
 lto = true
