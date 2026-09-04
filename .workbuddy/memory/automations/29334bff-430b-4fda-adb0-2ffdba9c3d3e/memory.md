@@ -26,3 +26,11 @@
 - 等待后 CI 三平台（ubuntu/windows/macos）全部 completed+success
 - Release v0.3.7 资产齐全（deb / linux.tar.gz / mac.dmg / Setup.exe / windows.zip）
 - 结论：发版成功，无需进一步修复
+
+### 2026-09-04 09:45（第三次执行，崩溃修复）
+- 用户报 v0.3.7 启动后崩溃（macOS 26），崩溃栈：rdev::macos::listen::raw_callback → HIToolbox TSMGetInputSourceProperty → dispatch_assert_queue_fail（EXC_BREAKPOINT）
+- 根因：rdev 0.5.3 在事件 tap 线程调 TIS 键盘布局 API，macOS 13+ 要求主线程 → 断言杀进程（rdev issue #146）
+- mouseshare 不依赖事件的 name 字符字段，所以 vendored rdev 0.5.3 到 vendor/rdev 并让 string_from_code 直接返回 None，Cargo.toml 加 [patch.crates-io] rdev = { path = "vendor/rdev" }
+- 顺带修 IP：primary 模式启动时 local_ip_address::local_ip() 自动写入 server_addr，替代写死的 192.168.1.100
+- 提交 ad89da6，打 tag v0.3.8，CI 三平台全绿，Release v0.3.8 资产齐全
+- 结论：崩溃修复 + IP 自动探测完成，发版成功
