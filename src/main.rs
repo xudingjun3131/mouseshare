@@ -8,6 +8,11 @@
 //!   desktop; crossing an edge hands control (and the cursor) to the neighbour.
 //! * Clipboard changes are broadcast and loop-suppressed.
 
+// On Windows, build a GUI-subsystem executable (no black console window). The window then
+// shows in the taskbar with the embedded logo icon instead of spawning a `cmd` console.
+// Ignored on macOS/Linux (no such subsystem there).
+#![cfg_attr(target_os = "windows", windows_subsystem = "Windows")]
+
 mod app;
 mod clipboard;
 mod config;
