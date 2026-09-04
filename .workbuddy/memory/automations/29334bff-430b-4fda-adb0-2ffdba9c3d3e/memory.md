@@ -83,3 +83,18 @@
 - 判定无事可做，直接结束；未提交、未打 tag、未触发 CI
 - 结论：仓库已与远端同步，无待发布改动
 
+### 2026-09-04 13:29（第九次执行，空跑）
+- `git fetch` 后工作区 `git status --porcelain` 为空，且 `HEAD...origin/main` 为 "0 0"
+- 判定无事可做，直接结束；未提交、未打 tag、未触发 CI
+- 结论：仓库已与远端同步，无待发布改动
+
+### 2026-09-04 13:33（第十次执行，双显同动 + 后台 + 快捷键 + 透明图标）
+- 用户报 4 个问题：① Mac 动鼠标 Win 也动（双屏同动，而非跨过去再动）；② app 退后台后跨屏失效、切不到 Win；③ 要快捷键切屏；④ 图标白底要透明
+- 修复（提交 7c9b714，tag v0.3.15）：
+  - handle_capture 重写：虚拟光标在「当前控制屏」坐标系推进，控制屏本地则只动本地、远程才注入 Win；转发以「控制屏为远程」为门限，本地输入绝不 echo → 不再双显同动（修①）
+  - 捕获在独立线程不依赖 egui 焦点，跨屏在后台继续；另加 ScrollLock 快捷键作手动兜底（修②+③）
+  - protocol 加 `Message::Hotkey`；network 加 `Net::send_message`；新增 `cycle_control()` 在主控屏+各副机间轮换；主/副均捕获 Key::ScrollLock，副机转发给主机
+  - 图标透明：Pillow 洪水填充抠白底产出 RGBA 源图，重生成 resources/AppIcon.ico（带 alpha）+ resources/AppIcon.icns（iconutil，带 alpha）
+- CI：macos/windows completed+success；ubuntu 状态接口延迟（linux 资产已上传）；Release v0.3.15 发布（draft:false），5 资产齐全
+- 结论：4 个问题均修复发版成功，让用户用 v0.3.15
+
