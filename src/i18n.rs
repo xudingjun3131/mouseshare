@@ -123,6 +123,7 @@ pub struct Tr {
     pub diag_hint: &'static str,
     pub background_hint: &'static str,
     pub exit_app: &'static str,
+    pub tray_show: &'static str,
 }
 
 pub const ZH: Tr = Tr {
@@ -174,6 +175,7 @@ pub const ZH: Tr = Tr {
     diag_hint: "跨屏诊断日志（如跨屏异常，请把此文件内容发给开发者）：",
     background_hint: "关闭窗口后 MouseShare 会最小化到后台继续共享；要彻底退出请点下方按钮。",
     exit_app: "退出程序",
+    tray_show: "显示主窗口",
 };
 
 pub const EN: Tr = Tr {
@@ -225,6 +227,7 @@ pub const EN: Tr = Tr {
     diag_hint: "Crossing diagnostics log (paste this file when crossing misbehaves):",
     background_hint: "Closing this window minimises MouseShare to the background and sharing keeps running. Use the button below to quit for real.",
     exit_app: "Quit MouseShare",
+    tray_show: "Show MouseShare",
 };
 
 /// Look up the string table for a language.

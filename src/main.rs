@@ -19,12 +19,16 @@
 mod app;
 mod clipboard;
 mod config;
+#[cfg(target_os = "macos")]
+mod delta;
 mod diag;
 mod i18n;
 mod input;
 mod layout;
 mod network;
 mod protocol;
+#[cfg(target_os = "windows")]
+mod tray;
 
 use crate::config::{load_config, save_config, Config};
 use crate::i18n::Lang;
@@ -111,6 +115,11 @@ fn main() -> anyhow::Result<()> {
 
     let mut config: Config = load_config();
     let my_name = config.name.clone();
+
+    // Windows: tray icon (notification area) with show/quit menu. The sharing process runs
+    // in the background, so the tray is the only always-visible handle on it.
+    #[cfg(target_os = "windows")]
+    tray::init(crate::i18n::Lang::from_code(&config.lang));
 
     // For the primary, the address shown to secondaries must be this machine's real LAN IP,
     // not the `192.168.1.100` placeholder shipped in Config::default(). Auto-detect it on
@@ -298,6 +307,20 @@ fn main() -> anyhow::Result<()> {
             input::start_capture(move |event: Event| {
                 handle_capture(event, &net, &layout, &ctrl, &primary_name);
             });
+        }
+        // ---- Delta tap (primary, macOS only) ----
+        // Raw hardware mouse-motion deltas. While a secondary has control, event-stream
+        // positions are clamped by the OS at display edges and starve the remote cursor;
+        // deltas bypass clamping entirely (see src/delta.rs).
+        #[cfg(target_os = "macos")]
+        {
+            let net = net.clone();
+            let layout = layout.clone();
+            let ctrl = ctrl.clone();
+            let primary_name = primary_name.clone();
+            delta::start(Box::new(move |dx, dy| {
+                remote_delta(&net, &layout, &ctrl, &primary_name, dx, dy);
+            }));
         }
         // ---- Edge-rest poller (primary only) ----
         // A second, event-independent crossing trigger. Samples the cursor position straight
@@ -618,7 +641,19 @@ fn handle_capture(
             let Some(bbox) = l.local_bbox() else { return };
             match c.remote.clone() {
                 None => local_move(&mut c, l, net, bbox, x, y, d),
-                Some(r) => remote_move(&mut c, l, net, bbox, primary_name, r, x, y, d),
+                Some(r) => {
+                    // macOS: remote-control motion comes exclusively from the delta tap
+                    // (src/delta.rs). Event-stream *positions* are useless here — the OS
+                    // clamps them at the display edge the cursor happens to be pinned to,
+                    // which starved the remote cursor of deltas (the long-standing "crossing
+                    // doesn't work" bug). Buttons/wheel/keys still flow through this stream.
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = (&net, &primary_name, r, &l);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    remote_move(&mut c, l, net, bbox, primary_name, r, x, y, d);
+                }
             }
         }
 
@@ -745,9 +780,10 @@ fn local_move(
     }
 }
 
-/// A secondary has control: forward the motion delta as an absolute position inside its
-/// screen, keep the real cursor parked near the anchor (so nothing visibly moves here), and
-/// return control when the user crosses back over the shared edge.
+/// A secondary has control (event-stream path, non-macOS primaries): forward the motion
+/// delta as an absolute position inside its screen, keep the real cursor parked near the
+/// anchor (so nothing visibly moves here), and return control when the user crosses back
+/// over the shared edge. On macOS this path is bypassed entirely — see `remote_delta`.
 fn remote_move(
     c: &mut Ctrl,
     l: std::sync::MutexGuard<'_, Layout>,
@@ -759,6 +795,27 @@ fn remote_move(
     y: f64,
     d: (f64, f64),
 ) {
+    remote_step(c, &l, net, primary_name, r, d);
+    // Re-centre the parked cursor when it drifts, so it never visibly roams the primary.
+    let anchor = park_anchor(bbox);
+    if (x - anchor.0).abs() > PARK_SLACK || (y - anchor.1).abs() > PARK_SLACK {
+        input::warp_cursor(anchor.0, anchor.1);
+        c.last_real = anchor;
+    }
+}
+
+/// The shared remote-control step: apply one motion delta `d` to the secondary's virtual
+/// cursor, send it, and hand control back when the virtual cursor exits the screen across
+/// the shared edge. Used by the event-stream path (`remote_move`, non-macOS) and by the
+/// delta tap (`remote_delta`, macOS).
+fn remote_step(
+    c: &mut Ctrl,
+    l: &Layout,
+    net: &Arc<Mutex<Net>>,
+    primary_name: &str,
+    r: RemoteCtrl,
+    d: (f64, f64),
+) {
     let Some(s) = l.screens.iter().find(|s| s.name == r.name) else {
         // The secondary vanished from the layout — take control back.
         c.remote = None;
@@ -766,14 +823,13 @@ fn remote_move(
         return;
     };
     let (w, h) = (s.w as f64, s.h as f64);
-    drop(l);
     // Throttled diagnostic sample while a secondary has control: shows whether the user's
     // deltas are actually driving the secondary's virtual cursor (and how far it travels),
     // which is the missing half of the picture in any "crossing doesn't work" report.
     if REMOTE_SAMPLES.fetch_add(1, Ordering::Relaxed) % 100 == 0 {
         diag::log(&format!(
-            "remote sample: {} vcursor=({:.0},{:.0}) screen={:.0}x{:.0} delta=({:.0},{:.0}) real=({:.0},{:.0})",
-            r.name, r.vx, r.vy, w, h, d.0, d.1, x, y
+            "remote sample: {} vcursor=({:.0},{:.0}) screen={:.0}x{:.0} delta=({:.0},{:.0})",
+            r.name, r.vx, r.vy, w, h, d.0, d.1
         ));
     }
     let mut vx = r.vx + d.0;
@@ -786,8 +842,9 @@ fn remote_move(
     };
     if back {
         // Crossed back over the shared edge: control returns to the primary. Place the real
-        // cursor just inside the local bbox where the virtual cursor exited.
-        let (bl, bt, br, bb) = bbox;
+        // cursor just inside the local bbox where the virtual cursor exited. Show the cursor
+        // BEFORE warping — a warp issued while the cursor is hidden does not stick on macOS.
+        let (bl, bt, br, bb) = l.local_bbox().unwrap_or((0.0, 0.0, 1920.0, 1080.0));
         let fy = (vy / h).clamp(0.0, 1.0);
         let fx = (vx / w).clamp(0.0, 1.0);
         let target = match r.side {
@@ -805,8 +862,8 @@ fn remote_move(
         c.last_real = target;
         info!("control returned to {}", primary_name);
         diag::log(&format!(
-            "RETURN <- {} exit=({:.0},{:.0}) target=({:.0},{:.0}) bbox={:?}",
-            r.name, vx, vy, target.0, target.1, bbox
+            "RETURN <- {} exit=({:.0},{:.0}) target=({:.0},{:.0})",
+            r.name, vx, vy, target.0, target.1
         ));
         return;
     }
@@ -814,17 +871,34 @@ fn remote_move(
     vy = vy.clamp(0.0, h - 1.0);
     net.lock().unwrap().send_input(&r.name, InputEvent::MouseMove { x: vx, y: vy });
     c.remote = Some(RemoteCtrl { name: r.name.clone(), side: r.side, vx, vy });
-    // Re-centre the parked cursor when it drifts, so it never visibly roams the primary.
-    let anchor = park_anchor(bbox);
-    if (x - anchor.0).abs() > PARK_SLACK || (y - anchor.1).abs() > PARK_SLACK {
-        input::warp_cursor(anchor.0, anchor.1);
-        c.last_real = anchor;
-    }
+}
+
+/// Remote-control motion on macOS (delta tap thread): the hardware deltas bypass cursor
+/// clamping entirely, so the remote cursor keeps moving even while the (hidden) local
+/// cursor is pinned against a display edge.
+#[cfg(target_os = "macos")]
+fn remote_delta(
+    net: &Arc<Mutex<Net>>,
+    layout: &Arc<Mutex<Layout>>,
+    ctrl: &Arc<Mutex<Ctrl>>,
+    primary_name: &str,
+    dx: f64,
+    dy: f64,
+) {
+    let mut c = ctrl.lock().unwrap();
+    let Some(r) = c.remote.clone() else { return };
+    let l = layout.lock().unwrap();
+    remote_step(&mut c, &l, net, primary_name, r, (dx, dy));
 }
 
 /// Hand control to the secondary `name` attached on `side`. Seeds its virtual cursor at the
-/// shared edge (proportionally aligned with where the real cursor left the primary) and parks
-/// the real cursor at the centre of the local bbox.
+/// shared edge (proportionally aligned with where the real cursor left the primary).
+///
+/// NOTE: no park warp here. Warping the (now hidden) cursor to the middle of the local bbox
+/// does not stick on macOS while the pointer keeps receiving hardware motion, and it is no
+/// longer needed: during remote control the local cursor is hidden and its *positions* are
+/// ignored — motion is sourced from the delta tap (src/delta.rs). The cursor simply stays
+/// where it was (near the shared edge) until RETURN places it explicitly.
 fn hand_off(
     c: &mut Ctrl,
     l: &Layout,
@@ -853,13 +927,10 @@ fn hand_off(
     // visibly in the middle of the screen reads as "crossing failed".
     crate::sys_cursor::hide();
     net.lock().unwrap().send_input(name, InputEvent::MouseMove { x: vx, y: vy });
-    let anchor = park_anchor(bbox);
-    input::warp_cursor(anchor.0, anchor.1);
-    c.last_real = anchor;
     info!("control handed to {} ({:?})", name, side);
     diag::log(&format!(
-        "HAND-OFF -> {} side={:?} entry=({:.0},{:.0}) park=({:.0},{:.0}) bbox={:?}",
-        name, side, vx, vy, anchor.0, anchor.1, bbox
+        "HAND-OFF -> {} side={:?} entry=({:.0},{:.0}) cursor_left_at=({:.0},{:.0}) bbox={:?}",
+        name, side, vx, vy, from_x, from_y, bbox
     ));
 }
 

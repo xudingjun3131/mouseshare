@@ -270,11 +270,15 @@ impl eframe::App for MouseShareApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let t = tr(self.lang);
 
+        // Hand the context to the tray module (Windows) so its menu can restore this window.
+        #[cfg(target_os = "windows")]
+        crate::tray::register_ctx(ctx);
+
         // Keep running when the window is closed: sharing (input capture/injection, clipboard,
         // network) lives on background threads that don't need the window. Cancel the close and
-        // minimise instead of exiting — the "Quit" button in the status card exits for real.
-        // Without this the process died with the window and the user had to keep the window
-        // open for sharing to work at all.
+        // minimise instead of exiting — the tray menu (Windows) or the "Quit" button exits for
+        // real. Without this the process died with the window and the user had to keep the
+        // window open for sharing to work at all.
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));

@@ -34,11 +34,15 @@ local-ip-address = "0.6"
 # heavy `windows` 0.62 meta-crate (and X11 libs) for no reason, adding ~20 min to every release.
 [target.'cfg(target_os = "macos")'.dependencies]
 display-info = "0.5.9"
-# Read the cursor position directly from Core Graphics (CGEventGetLocation). The edge-rest
-# poller samples this instead of relying on the event stream, which can go quiet while the
-# OS pins the cursor against a display edge. Same version as rdev's core-graphics dep, so
-# no extra compilation.
+# Core Graphics: cursor position sampling (CGEventGetLocation) for the edge-rest poller and
+# the delta event tap for remote-control motion. Same version as rdev's core-graphics dep,
+# so no extra compilation.
 core-graphics = "0.23"
+
+# Windows tray icon (notification area) with a show/quit menu. Windows-only: macOS uses the
+# Dock instead, and on Linux tray support varies by desktop environment.
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = "0.24"
 
 [build-dependencies]
 # Embeds the Windows application icon (.ico) into the .exe at build time so the
