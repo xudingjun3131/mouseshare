@@ -41,3 +41,10 @@
 - 修复 src/app.rs setup_fonts：抽 prefer_cjk 闭包，把 "cjk" 用 insert(0,...) 提到 Proportional/Monospace 族队首，中英文共用 Noto Sans SC（含拉丁字形），默认字体退居兜底
 - 提交 83e5075，打 tag v0.3.9，CI 三平台全绿，Release v0.3.9 资产齐全
 - 结论：中英文样式统一，发版成功
+
+### 2026-09-04 10:50（第五次执行，英文布局修复）
+- 用户截图反馈英文版右侧蓝色屏幕块过大贴边、顶部 hint 和底部 tip 被截断，中文版正常
+- 根因：CentralPanel header 依赖 `ui.available_rect_before_wrap()` 推导 canvas 区域；英文 hint 在 `ui.horizontal` 中过长溢出，cursor 状态异常，canvas 区域被错误放大
+- 修复 src/app.rs：header 包进 `ui.vertical` 取实际高度，用 `ui.max_rect()` 减去 header 得到精确 canvas_rect 传给 draw_layout；hint/tip 改用 `Label::wrap()` 强制换行避免溢出
+- 提交 8bb9fb8，打 tag v0.3.10，CI 三平台全绿，Release v0.3.10 资产齐全
+- 结论：英文版布局修复，发版成功

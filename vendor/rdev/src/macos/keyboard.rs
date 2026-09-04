@@ -1,11 +1,10 @@
 #![allow(clippy::upper_case_acronyms)]
 use crate::macos::keycodes::code_from_key;
 use crate::rdev::{EventType, Key, KeyboardState};
-use core_foundation::base::{CFRelease, OSStatus};
+use core_foundation::base::OSStatus;
 use core_foundation::string::UniChar;
-use core_foundation_sys::data::{CFDataGetBytePtr, CFDataRef};
+use core_foundation_sys::data::CFDataRef;
 use core_graphics::event::CGEventFlags;
-use std::convert::TryInto;
 use std::ffi::c_void;
 use std::os::raw::c_uint;
 

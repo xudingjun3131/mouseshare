@@ -4,6 +4,7 @@
 //! map of `peer name -> writer`. Clipboard messages are relayed to every other peer; input
 //! messages are routed to a specific target peer.
 
+use crate::layout::Layout;
 use crate::protocol::{InputEvent, Message};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -92,10 +93,28 @@ impl Net {
             Net::Idle => 0,
         }
     }
+
+    /// Push the full layout to every connected secondary. Cheap (one small JSON frame per
+    /// peer) and idempotent — the primary calls this periodically so new peers and any screen
+    /// repositioning show up on every machine's canvas.
+    pub fn broadcast_layout(&self, layout: &Layout) {
+        if let Net::Primary { peers } = self {
+            let msg = Message::Layout {
+                layout: layout.clone(),
+            };
+            for (_, tx) in peers.lock().unwrap().iter() {
+                let _ = tx.send(msg.clone());
+            }
+        }
+    }
 }
 
 /// Start the primary hub. Spawns a listener thread that accepts secondaries.
-pub fn start_hub(port: u16, incoming: Incoming) -> anyhow::Result<Arc<Mutex<Net>>> {
+pub fn start_hub(
+    port: u16,
+    incoming: Incoming,
+    layout: Arc<Mutex<Layout>>,
+) -> anyhow::Result<Arc<Mutex<Net>>> {
     let listener = TcpListener::bind(("0.0.0.0", port))?;
     log::info!("primary hub listening on :{}", port);
     let peers: Arc<Mutex<HashMap<String, Sender<Message>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -103,7 +122,7 @@ pub fn start_hub(port: u16, incoming: Incoming) -> anyhow::Result<Arc<Mutex<Net>
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
-                Ok(s) => handle_primary_conn(s, peers.clone(), incoming.clone()),
+                Ok(s) => handle_primary_conn(s, peers.clone(), incoming.clone(), layout.clone()),
                 Err(e) => log::warn!("accept error: {}", e),
             }
         }
@@ -111,7 +130,12 @@ pub fn start_hub(port: u16, incoming: Incoming) -> anyhow::Result<Arc<Mutex<Net>
     Ok(net)
 }
 
-fn handle_primary_conn(stream: TcpStream, peers: Arc<Mutex<HashMap<String, Sender<Message>>>>, incoming: Incoming) {
+fn handle_primary_conn(
+    stream: TcpStream,
+    peers: Arc<Mutex<HashMap<String, Sender<Message>>>>,
+    incoming: Incoming,
+    layout: Arc<Mutex<Layout>>,
+) {
     let read_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -122,8 +146,8 @@ fn handle_primary_conn(stream: TcpStream, peers: Arc<Mutex<HashMap<String, Sende
     // The first frame must be Hello so we learn the peer's name.
     let mut rs = read_stream;
     let hello = read_msg(&mut rs).ok();
-    let name = match hello {
-        Some(Message::Hello { name, .. }) => name,
+    let (name, width, height) = match hello {
+        Some(Message::Hello { name, width, height }) => (name, width, height),
         _ => {
             log::warn!("peer did not send Hello; dropping");
             return;
@@ -131,8 +155,16 @@ fn handle_primary_conn(stream: TcpStream, peers: Arc<Mutex<HashMap<String, Sende
     };
     log::info!("secondary connected: {}", name);
 
+    // Register the peer's screen (idempotent) so the layout we push already includes it.
+    layout.lock().unwrap().ensure_screen(&name, width, height);
+
     let (tx, rx) = channel::<Message>();
     peers.lock().unwrap().insert(name.clone(), tx.clone());
+
+    // Send the current layout to the new peer immediately, so the secondary's canvas shows the
+    // primary's screen (and every other machine) the instant it connects.
+    let snapshot = layout.lock().unwrap().clone();
+    let _ = tx.send(Message::Layout { layout: snapshot });
 
     // Writer thread: drains the per-peer channel into the socket.
     std::thread::spawn(move || {
@@ -190,7 +222,15 @@ fn connect_with_timeout(addr: &str, timeout: Duration) -> std::io::Result<TcpStr
 }
 
 /// Connect as a secondary. Spawns reader/writer threads and returns the shared handle.
-pub fn connect_client(addr: &str, incoming: Incoming) -> anyhow::Result<(Arc<Mutex<Net>>, Sender<Message>)> {
+///
+/// `net` is the same `Arc<Mutex<Net>>` the GUI holds; when the link drops the reader thread
+/// flips it back to `Net::Idle` so the status panel can show "disconnected" and the user can
+/// hit "Connect" again without restarting the app.
+pub fn connect_client(
+    addr: &str,
+    incoming: Incoming,
+    net: Arc<Mutex<Net>>,
+) -> anyhow::Result<(Arc<Mutex<Net>>, Sender<Message>)> {
     let stream = connect_with_timeout(addr, Duration::from_secs(3))?;
     log::info!("connected to primary at {}", addr);
     let read_stream = stream.try_clone()?;
@@ -205,6 +245,7 @@ pub fn connect_client(addr: &str, incoming: Incoming) -> anyhow::Result<(Arc<Mut
         }
     });
 
+    let net_for_reader = net.clone();
     std::thread::spawn(move || {
         let mut rs = read_stream;
         let server = "server".to_string();
@@ -219,8 +260,11 @@ pub fn connect_client(addr: &str, incoming: Incoming) -> anyhow::Result<(Arc<Mut
             }
         }
         log::info!("lost connection to primary");
+        *net_for_reader.lock().unwrap() = Net::Idle;
     });
 
-    let net = Arc::new(Mutex::new(Net::Secondary { tx: tx.clone() }));
-    Ok((net, tx))
+    // Mark the *same* handle the caller passed in as Secondary, and return that exact Arc so the
+    // reader thread's Idle-on-disconnect above flips the handle the GUI is actually reading.
+    *net.lock().unwrap() = Net::Secondary { tx: tx.clone() };
+    Ok((net.clone(), tx))
 }

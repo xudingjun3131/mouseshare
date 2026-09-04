@@ -59,8 +59,12 @@ fn main() -> anyhow::Result<()> {
     // error, fall back to an idle Net, and always open the GUI so the user can see and fix it.
     let mut startup_error: Option<String> = None;
 
+    // Shared layout state (used by the hub to push screens to secondaries, by the incoming
+    // handler to register peers, and by the capture thread for cursor hand-off).
+    let layout: Arc<Mutex<Layout>> = Arc::new(Mutex::new(config.layout.clone()));
+
     let net: Arc<Mutex<Net>> = if mode == "primary" {
-        match start_hub(port, inc_tx.clone()) {
+        match start_hub(port, inc_tx.clone(), layout.clone()) {
             Ok(n) => n,
             Err(e) => {
                 // Error text follows the UI language chosen in the config.
@@ -71,8 +75,9 @@ fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        match connect_client(&server_addr, inc_tx.clone()) {
-            Ok((n, tx)) => {
+        let n = Net::idle();
+        match connect_client(&server_addr, inc_tx.clone(), n.clone()) {
+            Ok((net_inner, tx)) => {
                 let (w, h) = display_size().unwrap_or((1920, 1080));
                 tx.send(Message::Hello {
                     name: my_name.clone(),
@@ -80,19 +85,18 @@ fn main() -> anyhow::Result<()> {
                     height: h as u32,
                 })
                 .ok();
-                n
+                net_inner
             }
             Err(e) => {
                 let msg = Lang::from_code(&config.lang).connect_fail(&server_addr, e);
                 log::error!("{}", msg);
                 startup_error = Some(msg);
-                Net::idle()
+                n
             }
         }
     };
 
     // Shared state used by the capture thread.
-    let layout: Arc<Mutex<Layout>> = Arc::new(Mutex::new(config.layout.clone()));
     let ownership: Arc<Mutex<String>> = Arc::new(Mutex::new(primary_name.clone()));
     let vcursor: Arc<Mutex<(f64, f64)>> = Arc::new(Mutex::new((0.0, 0.0)));
     let last_real: Arc<Mutex<(f64, f64)>> = Arc::new(Mutex::new((-1.0, -1.0))); // sentinel: uninitialised
@@ -130,6 +134,14 @@ fn main() -> anyhow::Result<()> {
                             if layout.lock().unwrap().ensure_screen(&name, width, height) {
                                 info!("auto-registered screen for peer {}", name);
                             }
+                        }
+                    }
+                    Message::Layout { layout: new_layout } => {
+                        // The primary pushes its full layout to secondaries so every machine
+                        // draws the same map. Secondaries adopt it verbatim; the primary never
+                        // receives this message.
+                        if mode2 == "secondary" {
+                            *layout.lock().unwrap() = new_layout;
                         }
                     }
                     _ => {}
@@ -173,7 +185,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ---- GUI on the main thread ----
-    let gui_app = app::MouseShareApp::new(config, layout, net, my_name, startup_error);
+    let gui_app = app::MouseShareApp::new(config, layout, net, my_name, startup_error, inc_tx.clone());
 
     // Window icon: the bundled mouse logo. Without this a bare (non-.app) binary shows the
     // generic executable icon in the Dock / title bar; the .app bundle still gets AppIcon.icns

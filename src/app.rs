@@ -13,8 +13,10 @@ use crate::clipboard;
 use crate::config::{save_config, Config};
 use crate::i18n::{tr, Lang, Tr};
 use crate::layout::Layout;
-use crate::network::Net;
+use crate::network::{connect_client, Net};
+use crate::protocol::Message;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Rect, Rounding, Sense};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -178,6 +180,10 @@ pub struct MouseShareApp {
     /// Set when networking failed at startup (port busy / primary unreachable). Shown as a
     /// banner instead of letting the app exit silently with no window at all.
     pub startup_error: Option<String>,
+    /// Incoming channel used to (re)establish a secondary connection from the GUI.
+    pub inc_tx: Sender<(String, Message)>,
+    /// Throttle timestamp for the primary's periodic layout push to secondaries.
+    pub last_layout_push: Option<Instant>,
 }
 
 impl MouseShareApp {
@@ -187,6 +193,7 @@ impl MouseShareApp {
         net: Arc<Mutex<Net>>,
         my_name: String,
         startup_error: Option<String>,
+        inc_tx: Sender<(String, Message)>,
     ) -> Self {
         let lang = Lang::from_code(&config.lang);
         Self {
@@ -197,11 +204,60 @@ impl MouseShareApp {
             lang,
             toast: None,
             startup_error,
+            inc_tx,
+            last_layout_push: None,
         }
     }
 
     fn show_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((Instant::now(), msg.into()));
+    }
+
+    /// (Re)connect to the primary from the running app. Used by the "Connect" button on the
+    /// secondary and the "Retry" button on the startup-error banner. Tearing down to `Idle`
+    /// first lets the old reader/writer threads stop, then we open a fresh connection and send
+    /// Hello. No app restart required.
+    fn reconnect(&mut self) {
+        let t = tr(self.lang);
+        let addr = self.config.server_addr.trim().to_string();
+        if addr.is_empty() {
+            self.startup_error = Some(self.lang.connect_fail(&addr, "address is empty"));
+            return;
+        }
+        {
+            let mut net = self.net.lock().unwrap();
+            *net = Net::Idle;
+        }
+        let n = Arc::new(Mutex::new(Net::Idle));
+        match connect_client(&addr, self.inc_tx.clone(), n.clone()) {
+            Ok((net_inner, tx)) => {
+                let (w, h) = self.screen_size();
+                tx.send(Message::Hello {
+                    name: self.my_name.clone(),
+                    width: w,
+                    height: h,
+                })
+                .ok();
+                self.net = net_inner;
+                self.startup_error = None;
+                self.show_toast(t.connected);
+            }
+            Err(e) => {
+                let msg = self.lang.connect_fail(&addr, &e.to_string());
+                self.startup_error = Some(msg.clone());
+                self.show_toast(msg);
+            }
+        }
+    }
+
+    /// This machine's real screen size, taken from its own layout entry (falls back to 1080p).
+    fn screen_size(&self) -> (u32, u32) {
+        let l = self.shared_layout.lock().unwrap();
+        l.screens
+            .iter()
+            .find(|s| s.name == self.my_name)
+            .map(|s| (s.w, s.h))
+            .unwrap_or((1920, 1080))
     }
 }
 
@@ -260,8 +316,11 @@ impl eframe::App for MouseShareApp {
         });
 
         // ---- Startup failure banner (network error at boot) ----
+        let mut retry_clicked = false;
         if self.startup_error.is_some() {
             let err = self.startup_error.clone().unwrap();
+            let is_secondary = self.config.mode == "secondary";
+            let retry_label = t.retry_connect;
             egui::TopBottomPanel::top("startup_error").show(ctx, |ui| {
                 ui.add_space(10.0);
                 egui::Frame::none()
@@ -285,9 +344,18 @@ impl eframe::App for MouseShareApp {
                                 .size(12.0)
                                 .color(Color32::from_rgb(150, 90, 95)),
                         );
+                        if is_secondary {
+                            ui.add_space(6.0);
+                            if ui.button(retry_label).clicked() {
+                                retry_clicked = true;
+                            }
+                        }
                     });
                 ui.add_space(10.0);
             });
+        }
+        if retry_clicked {
+            self.reconnect();
         }
 
         // ---- Left sidebar: grouped setting cards ----
@@ -385,6 +453,22 @@ impl eframe::App for MouseShareApp {
                     canvas_rect,
                 );
             });
+
+        // Primary: push the current layout to every secondary every couple of seconds so all
+        // machines draw the same map (including the primary's own screen and any repositioning
+        // done in this window). Secondaries adopt it; the primary never receives a Layout.
+        if self.config.mode == "primary" {
+            let now = Instant::now();
+            let due = match self.last_layout_push {
+                Some(t0) => now.duration_since(t0) >= Duration::from_secs(2),
+                None => true,
+            };
+            if due {
+                let snap = self.shared_layout.lock().unwrap().clone();
+                self.net.lock().unwrap().broadcast_layout(&snap);
+                self.last_layout_push = Some(now);
+            }
+        }
     }
 }
 
@@ -413,6 +497,10 @@ impl MouseShareApp {
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Monospace),
                 );
+                ui.add_space(8.0);
+                if ui.button(t.connect_host).clicked() {
+                    self.reconnect();
+                }
             } else {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -534,6 +622,26 @@ impl MouseShareApp {
                 ui.label(egui::RichText::new(t.local_name).weak());
                 ui.monospace(&self.my_name);
             });
+            ui.add_space(8.0);
+            // Connection state (primary = serving; secondary = linked to host; idle = not connected).
+            let conn_label = match &*self.net.lock().unwrap() {
+                Net::Primary { .. } => t.conn_primary,
+                Net::Secondary { .. } => t.conn_connected,
+                Net::Idle => t.conn_idle,
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(t.conn_status).weak());
+                ui.label(egui::RichText::new(conn_label).strong().size(15.0));
+            });
+            if self.config.mode == "secondary" {
+                let is_idle = matches!(&*self.net.lock().unwrap(), Net::Idle);
+                if is_idle {
+                    ui.add_space(8.0);
+                    if ui.button(t.reconnect_host).clicked() {
+                        self.reconnect();
+                    }
+                }
+            }
         });
     }
 }

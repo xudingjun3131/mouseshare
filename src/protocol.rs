@@ -2,6 +2,7 @@
 //!
 //! Frames are: `[u32 LE length][JSON(Message)]` sent over a TCP stream.
 
+use crate::layout::Layout;
 use rdev::{Button as RdevButton, Key};
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,11 @@ pub enum Message {
     Input(InputEvent),
     /// Clipboard contents (broadcast, loop-suppressed on the receiving side).
     Clipboard { text: String },
+    /// The full screen layout, pushed by the primary to every secondary so all machines draw
+    /// the same map (including the primary's own screen and every peer's position). Without
+    /// this a secondary only ever sees its own local `config.layout` and never learns about the
+    /// primary's display.
+    Layout { layout: Layout },
     /// Hint: the cursor just entered a secondary screen.
     EnterScreen,
     /// Hint: the cursor just left a secondary screen.

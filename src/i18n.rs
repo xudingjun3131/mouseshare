@@ -61,11 +61,11 @@ impl Lang {
     pub fn connect_fail(self, addr: &str, err: impl std::fmt::Display) -> String {
         match self {
             Lang::Zh => format!(
-                "无法连接到主机 {}（{}）。请确认主机上的 MouseShare 已启动、地址正确、防火墙未拦截；可在左侧修改地址后保存并重启。",
+                "无法连接到主机 {}（{}）。请确认主机上的 MouseShare 已启动、地址正确、防火墙未拦截；修改地址后点「连接主机」即可重连。",
                 addr, err
             ),
             Lang::En => format!(
-                "Cannot connect to primary {} ({}). Make sure MouseShare is running on the primary, the address is correct, and no firewall is blocking it. Fix the address on the left, save, then restart.",
+                "Cannot connect to primary {} ({}). Make sure MouseShare is running on the primary, the address is correct, and no firewall is blocking it. Fix the address, then click \"Connect to host\".",
                 addr, err
             ),
         }
@@ -107,6 +107,14 @@ pub struct Tr {
     pub legend_client: &'static str,
     pub err_title: &'static str,
     pub err_hint: &'static str,
+    pub connect_host: &'static str,
+    pub retry_connect: &'static str,
+    pub reconnect_host: &'static str,
+    pub connected: &'static str,
+    pub conn_status: &'static str,
+    pub conn_primary: &'static str,
+    pub conn_connected: &'static str,
+    pub conn_idle: &'static str,
 }
 
 pub const ZH: Tr = Tr {
@@ -142,6 +150,14 @@ pub const ZH: Tr = Tr {
     legend_client: "客户端",
     err_title: "⚠ 启动异常：",
     err_hint: "窗口已正常打开。可在左侧修改配置并保存，然后重启本应用。",
+    connect_host: "连接主机",
+    retry_connect: "重新连接主机",
+    reconnect_host: "重新连接主机",
+    connected: "✓ 已连接到主机",
+    conn_status: "连接状态: ",
+    conn_primary: "主机（正在服务）",
+    conn_connected: "已连接主机",
+    conn_idle: "未连接",
 };
 
 pub const EN: Tr = Tr {
@@ -176,7 +192,15 @@ pub const EN: Tr = Tr {
     legend_me: "This machine",
     legend_client: "Client",
     err_title: "⚠ Startup error: ",
-    err_hint: "The window is open. Edit the config on the left, save, then restart the app.",
+    err_hint: "The window is open. Fix the address on the left, then click \"Connect to host\" to reconnect, or restart the app.",
+    connect_host: "Connect to host",
+    retry_connect: "Retry connect",
+    reconnect_host: "Reconnect to host",
+    connected: "✓ Connected to host",
+    conn_status: "Status: ",
+    conn_primary: "Primary (serving)",
+    conn_connected: "Connected to host",
+    conn_idle: "Not connected",
 };
 
 /// Look up the string table for a language.
