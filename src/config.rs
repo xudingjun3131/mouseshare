@@ -19,6 +19,13 @@ pub struct Config {
     pub layout: Layout,
     /// Name of the machine that acts as primary (must equal that machine's `name`).
     pub primary_name: String,
+    /// UI language: "zh" (default) or "en".
+    #[serde(default = "default_lang")]
+    pub lang: String,
+}
+
+fn default_lang() -> String {
+    "zh".to_string()
 }
 
 impl Default for Config {
@@ -39,6 +46,7 @@ impl Default for Config {
                 }],
             },
             primary_name: host,
+            lang: default_lang(),
         }
     }
 }

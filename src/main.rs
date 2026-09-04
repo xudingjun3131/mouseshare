@@ -11,6 +11,7 @@
 mod app;
 mod clipboard;
 mod config;
+mod i18n;
 mod input;
 mod layout;
 mod network;
@@ -163,7 +164,12 @@ fn main() -> anyhow::Result<()> {
 
     // ---- GUI on the main thread ----
     let gui_app = app::MouseShareApp::new(config, layout, net, my_name, startup_error);
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1120.0, 720.0])
+            .with_min_inner_size([860.0, 560.0]),
+        ..Default::default()
+    };
     let result = eframe::run_native(
         "MouseShare",
         options,
@@ -172,6 +178,7 @@ fn main() -> anyhow::Result<()> {
             // already shows Chinese correctly (otherwise first frame is tofu, then it gets
             // replaced on the next frame).
             app::setup_fonts(&cc.egui_ctx);
+            app::setup_style(&cc.egui_ctx);
             Ok::<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>>(Box::new(gui_app))
         }),
     );

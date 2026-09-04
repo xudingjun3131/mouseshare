@@ -1,11 +1,27 @@
 //! egui window: configuration + the draggable multi-machine screen layout.
+//!
+//! UI conventions:
+//! * All user-facing text comes from `crate::i18n` (Chinese / English, toggled in the title bar
+//!   and persisted in `Config.lang`).
+//! * The left side panel holds grouped setting cards; the central panel is a dark canvas where
+//!   the virtual desktop is laid out.
 
 use crate::clipboard;
 use crate::config::{save_config, Config};
+use crate::i18n::{tr, Lang, Tr};
 use crate::layout::Layout;
 use crate::network::Net;
-use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Id, Rect, Sense};
+use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Rect, Sense};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+// ---- Central-canvas palette (fixed dark, independent of the egui theme) ----
+const CANVAS_BG: Color32 = Color32::from_rgb(26, 28, 36);
+const COL_PRIMARY: Color32 = Color32::from_rgb(64, 118, 255);
+const COL_ME: Color32 = Color32::from_rgb(46, 184, 114);
+const COL_OTHER: Color32 = Color32::from_rgb(88, 96, 116);
+const CANVAS_TEXT: Color32 = Color32::from_gray(235);
+const CANVAS_MUTED: Color32 = Color32::from_gray(165);
 
 /// Install a CJK fallback font so Chinese/Japanese/Korean glyphs render instead of tofu boxes.
 ///
@@ -83,13 +99,25 @@ pub fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// Global look & feel: roomier spacing, chunkier buttons. Colors follow the system theme;
+/// only the layout canvas is fixed-dark (see `CANVAS_BG`).
+pub fn setup_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = vec2(8.0, 8.0);
+    style.spacing.button_padding = vec2(12.0, 5.0);
+    style.spacing.menu_margin = egui::Margin::same(8.0);
+    ctx.set_style(style);
+}
+
 pub struct MouseShareApp {
     pub config: Config,
     pub shared_layout: Arc<Mutex<Layout>>,
     pub net: Arc<Mutex<Net>>,
     pub my_name: String,
-    /// Transient status line (e.g. "已复制连接地址").
-    pub copy_status: String,
+    /// Selected UI language (mirrors `config.lang`, kept separate for cheap access).
+    pub lang: Lang,
+    /// Transient toast message with the moment it was shown (auto-hides after 3 s).
+    pub toast: Option<(Instant, String)>,
     /// Set when networking failed at startup (port busy / primary unreachable). Shown as a
     /// banner instead of letting the app exit silently with no window at all.
     pub startup_error: Option<String>,
@@ -103,100 +131,264 @@ impl MouseShareApp {
         my_name: String,
         startup_error: Option<String>,
     ) -> Self {
+        let lang = Lang::from_code(&config.lang);
         Self {
             config,
             shared_layout,
             net,
             my_name,
-            copy_status: String::new(),
+            lang,
+            toast: None,
             startup_error,
         }
+    }
+
+    fn show_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((Instant::now(), msg.into()));
     }
 }
 
 impl eframe::App for MouseShareApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Show startup failures prominently. Without this the app used to exit silently and the
-        // user saw nothing at all when launching from Finder.
-        if let Some(err) = &self.startup_error {
-            egui::TopBottomPanel::top("startup_error").show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new("⚠ 启动异常：")
-                            .strong()
-                            .color(Color32::from_rgb(255, 120, 120)),
-                    );
-                    ui.label(egui::RichText::new(err).color(Color32::from_rgb(255, 190, 190)));
+        let t = tr(self.lang);
+
+        // Expire the transient toast.
+        if let Some((at, _)) = &self.toast {
+            if at.elapsed() > Duration::from_secs(3) {
+                self.toast = None;
+            }
+        }
+
+        // ---- Title bar: brand + language toggle ----
+        egui::TopBottomPanel::top("titlebar").show(ctx, |ui| {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("MouseShare").heading().strong());
+                ui.label(egui::RichText::new(t.tagline).weak().small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button(egui::RichText::new(self.lang.toggle_label()).strong())
+                        .clicked()
+                    {
+                        self.lang = self.lang.toggled();
+                        self.config.lang = self.lang.code().to_string();
+                        save_config(&self.config); // persist immediately
+                    }
                 });
-                ui.label(
-                    egui::RichText::new("窗口已正常打开。可在左侧修改配置后点击 Save config，然后重启本应用。")
-                        .color(Color32::from_gray(210)),
-                );
-                ui.add_space(4.0);
+            });
+            ui.add_space(8.0);
+        });
+
+        // ---- Startup failure banner (network error at boot) ----
+        if self.startup_error.is_some() {
+            let err = self.startup_error.clone().unwrap();
+            egui::TopBottomPanel::top("startup_error").show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(70, 32, 36))
+                    .inner_margin(egui::Margin::same(10.0))
+                    .rounding(egui::Rounding::same(6.0))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(t.err_title)
+                                    .strong()
+                                    .color(Color32::from_rgb(255, 150, 150)),
+                            );
+                            ui.label(
+                                egui::RichText::new(err).color(Color32::from_rgb(255, 205, 205)),
+                            );
+                        });
+                        ui.label(
+                            egui::RichText::new(t.err_hint).small().color(CANVAS_MUTED),
+                        );
+                    });
             });
         }
 
-        egui::SidePanel::left("config").show(ctx, |ui| {
-            ui.heading("MouseShare");
-            ui.label("Share mouse, keyboard & clipboard over LAN.");
-            ui.separator();
+        // ---- Left panel: grouped setting cards ----
+        egui::SidePanel::left("config")
+            .default_width(340.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.basic_card(ui, t);
+                        self.screens_card(ui, t);
+                        self.status_card(ui, t);
+                    });
+            });
 
-            ui.label("This machine's name (unique):");
-            ui.text_edit_singleline(&mut self.config.name);
+        // ---- Central panel: dark canvas with the virtual desktop ----
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(CANVAS_BG))
+            .show(ctx, |ui| {
+                ui.style_mut().visuals.override_text_color = Some(CANVAS_TEXT);
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label(egui::RichText::new(t.layout_title).heading().strong());
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label(
+                        egui::RichText::new(t.layout_hint)
+                            .small()
+                            .color(CANVAS_MUTED),
+                    );
+                });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    legend_chip(ui, COL_PRIMARY, t.legend_primary);
+                    legend_chip(ui, COL_ME, t.legend_me);
+                    legend_chip(ui, COL_OTHER, t.legend_client);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new(t.layout_tip)
+                                .small()
+                                .color(CANVAS_MUTED),
+                        );
+                    });
+                });
+                ui.add_space(4.0);
 
-            ui.label("Role:");
-            ui.radio_value(&mut self.config.mode, "primary".to_string(), "Primary (server, has the real mouse/keyboard)");
-            ui.radio_value(&mut self.config.mode, "secondary".to_string(), "Secondary (receives input)");
+                let mut layout = self.shared_layout.lock().unwrap();
+                if layout.screens.is_empty() {
+                    layout.screens.push(crate::layout::Screen {
+                        name: self.config.name.clone(),
+                        ox: 0,
+                        oy: 0,
+                        w: 1920,
+                        h: 1080,
+                    });
+                }
+                draw_layout(ui, &mut layout, &self.config.primary_name, &self.config.name, t);
+            });
+    }
+}
 
-            if self.config.mode == "secondary" {
-                ui.label("Primary address (host:port):");
-                ui.text_edit_singleline(&mut self.config.server_addr);
-            } else {
-                ui.label("Listen port:");
-                ui.add(egui::DragValue::new(&mut self.config.port).speed(1));
-                if ui.button("Detect my LAN IP").clicked() {
-                    if let Ok(ip) = local_ip_address::local_ip() {
-                        self.config.server_addr = format!("{}:{}", ip, self.config.port);
+impl MouseShareApp {
+    fn basic_card(&mut self, ui: &mut egui::Ui, t: Tr) {
+        ui.add_space(4.0);
+        egui::Frame::none()
+            .fill(ui.visuals().extreme_bg_color)
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(12.0))
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(t.section_basic).strong().heading());
+
+                ui.label(egui::RichText::new(t.machine_name).weak());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.config.name)
+                        .desired_width(f32::INFINITY),
+                );
+
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(t.role).weak());
+                ui.radio_value(
+                    &mut self.config.mode,
+                    "primary".to_string(),
+                    t.role_primary,
+                );
+                ui.radio_value(
+                    &mut self.config.mode,
+                    "secondary".to_string(),
+                    t.role_secondary,
+                );
+
+                if self.config.mode == "secondary" {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(t.server_addr).weak());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.config.server_addr)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                } else {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(t.listen_port).weak());
+                        ui.add(egui::DragValue::new(&mut self.config.port).speed(1));
+                    });
+                    if ui.button(t.detect_ip).clicked() {
+                        if let Ok(ip) = local_ip_address::local_ip() {
+                            self.config.server_addr =
+                                format!("{}:{}", ip, self.config.port);
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(t.address).weak());
+                        ui.monospace(&self.config.server_addr);
+                    });
+                    if ui.button(t.copy_addr).clicked() {
+                        clipboard::set_clipboard(&self.config.server_addr);
+                        self.show_toast(t.copied);
                     }
                 }
-                ui.horizontal(|ui| {
-                    ui.label("Address:");
-                    ui.monospace(&self.config.server_addr);
-                });
-                if ui.button("复制连接地址").clicked() {
-                    clipboard::set_clipboard(&self.config.server_addr);
-                    self.copy_status = "已复制连接地址到剪贴板".to_string();
+
+                ui.separator();
+                ui.label(egui::RichText::new(t.primary_name).weak());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.config.primary_name)
+                        .desired_width(f32::INFINITY),
+                );
+
+                ui.add_space(6.0);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::Button::new(egui::RichText::new(t.save).strong()),
+                    )
+                    .clicked()
+                {
+                    self.config.layout = self.shared_layout.lock().unwrap().clone();
+                    save_config(&self.config);
+                    self.show_toast(t.saved_hint);
                 }
-            }
 
-            ui.separator();
-            ui.label("Primary machine name (must match that machine's name):");
-            ui.text_edit_singleline(&mut self.config.primary_name);
+                if let Some((_, msg)) = &self.toast {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(msg.clone())
+                            .color(Color32::from_rgb(70, 180, 110)),
+                    );
+                }
+            });
+        ui.add_space(4.0);
+    }
 
-            ui.separator();
-            if ui.button("Save config").clicked() {
-                self.config.layout = self.shared_layout.lock().unwrap().clone();
-                save_config(&self.config);
-            }
-            ui.label("Saved. Restart the app for role/network changes to take effect.");
+    fn screens_card(&mut self, ui: &mut egui::Ui, t: Tr) {
+        egui::Frame::none()
+            .fill(ui.visuals().extreme_bg_color)
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(12.0))
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(t.section_screens).strong().heading());
+                ui.label(egui::RichText::new(t.screens_hint).weak().small());
 
-            ui.separator();
-            ui.heading("屏幕 / 客户端");
-            ui.label("客户端数量无上限：连上的机器会自动出现在布局里。可在此复制或删除屏幕。");
-            {
                 let mut layout = self.shared_layout.lock().unwrap();
                 let mut dup_idx: Option<usize> = None;
                 let mut del_idx: Option<usize> = None;
                 for (i, s) in layout.screens.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        ui.label(format!("{}  {}×{}", s.name, s.w, s.h));
-                        if ui.button("复制").clicked() {
-                            dup_idx = Some(i);
-                        }
-                        if ui.button("删除").clicked() {
-                            del_idx = Some(i);
-                        }
+                        ui.monospace(format!("{}  {}×{}", s.name, s.w, s.h));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button(t.del).clicked() {
+                                    del_idx = Some(i);
+                                }
+                                if ui.small_button(t.dup).clicked() {
+                                    dup_idx = Some(i);
+                                }
+                            },
+                        );
                     });
                 }
                 if let Some(i) = dup_idx {
@@ -206,70 +398,90 @@ impl eframe::App for MouseShareApp {
                     if layout.screens.len() > 1 {
                         layout.screens.remove(i);
                     } else {
-                        self.copy_status = "至少保留一块屏幕".to_string();
+                        // Direct field write (not a method call): the layout guard still
+                        // borrows self.shared_layout below, so &mut self is unavailable.
+                        self.toast = Some((Instant::now(), t.keep_one.to_string()));
                     }
                 }
-            }
-            if ui.button("+ 右侧添加屏幕").clicked() {
-                let mut layout = self.shared_layout.lock().unwrap();
-                let max_x = layout
-                    .screens
-                    .iter()
-                    .map(|s| s.ox + s.w as i32)
-                    .max()
-                    .unwrap_or(0);
-                let n = layout.screens.len() + 1;
-                layout.screens.push(crate::layout::Screen {
-                    name: format!("machine-{}", n),
-                    ox: max_x + 40,
-                    oy: 0,
-                    w: 1920,
-                    h: 1080,
+
+                if ui.button(t.add_screen).clicked() {
+                    let max_x = layout
+                        .screens
+                        .iter()
+                        .map(|s| s.ox + s.w as i32)
+                        .max()
+                        .unwrap_or(0);
+                    let n = layout.screens.len() + 1;
+                    layout.screens.push(crate::layout::Screen {
+                        name: format!("machine-{}", n),
+                        ox: max_x + 40,
+                        oy: 0,
+                        w: 1920,
+                        h: 1080,
+                    });
+                }
+            });
+        ui.add_space(4.0);
+    }
+
+    fn status_card(&mut self, ui: &mut egui::Ui, t: Tr) {
+        egui::Frame::none()
+            .fill(ui.visuals().extreme_bg_color)
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(12.0))
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(t.section_status).strong().heading());
+                let peers = self.net.lock().unwrap().peer_count();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(t.peers).weak());
+                    ui.label(
+                        egui::RichText::new(format!("{}", peers))
+                            .strong()
+                            .heading(),
+                    );
                 });
-            }
-
-            ui.separator();
-            let peers = self.net.lock().unwrap().peer_count();
-            ui.label(format!("Connected peers: {}", peers));
-            ui.label(format!("Local name: {}", self.my_name));
-            if !self.copy_status.is_empty() {
-                ui.label(egui::RichText::new(&self.copy_status).color(Color32::from_rgb(120, 220, 140)));
-            }
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Screen layout — drag a screen to reposition it");
-            ui.label("Place screens the way they sit on your desk. The primary (highlighted) is where your real cursor lives; cross an edge to hand control to a neighbour.");
-            ui.separator();
-
-            let mut layout = self.shared_layout.lock().unwrap();
-            if layout.screens.is_empty() {
-                layout.screens.push(crate::layout::Screen {
-                    name: self.config.name.clone(),
-                    ox: 0,
-                    oy: 0,
-                    w: 1920,
-                    h: 1080,
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(t.local_name).weak());
+                    ui.monospace(&self.my_name);
                 });
-            }
-
-            ui.separator();
-            draw_layout(ui, &mut layout, &self.config.primary_name, &self.config.name);
-        });
+                if let Some((_, msg)) = &self.toast {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(msg.clone())
+                            .color(Color32::from_rgb(70, 180, 110)),
+                    );
+                }
+            });
+        ui.add_space(4.0);
     }
 }
 
-fn draw_layout(ui: &mut egui::Ui, layout: &mut Layout, primary_name: &str, my_name: &str) {
+fn legend_chip(ui: &mut egui::Ui, color: Color32, text: &str) {
+    ui.label(egui::RichText::new("●").color(color));
+    ui.label(egui::RichText::new(text).small().color(CANVAS_MUTED));
+}
+
+fn draw_layout(
+    ui: &mut egui::Ui,
+    layout: &mut Layout,
+    primary_name: &str,
+    my_name: &str,
+    t: Tr,
+) {
     let avail = ui.available_size();
-    if avail.x < 10.0 || avail.y < 10.0 {
+    if avail.x < 40.0 || avail.y < 40.0 {
         return;
     }
 
     let (minx, miny, maxx, maxy) = bounds(layout);
     let vw = (maxx - minx).max(1) as f32;
     let vh = (maxy - miny).max(1) as f32;
-    let pad = 60.0;
-    let scale = ((avail.x - pad * 2.0) / vw).min((avail.y - pad * 2.0) / vh).max(0.05);
+    let pad = 48.0;
+    let scale = ((avail.x - pad * 2.0) / vw)
+        .min((avail.y - pad * 2.0) / vh)
+        .max(0.05);
     let offx = (avail.x - vw * scale) / 2.0 - minx as f32 * scale;
     let offy = (avail.y - vh * scale) / 2.0 - miny as f32 * scale;
 
@@ -288,36 +500,69 @@ fn draw_layout(ui: &mut egui::Ui, layout: &mut Layout, primary_name: &str, my_na
             s.ox += (d.x / scale) as i32;
             s.oy += (d.y / scale) as i32;
         }
+        let resp = if resp.hovered() {
+            resp.on_hover_cursor(CursorIcon::Grab)
+        } else {
+            resp
+        };
 
         let fill = if is_primary {
-            Color32::from_rgb(70, 120, 255)
+            COL_PRIMARY
         } else if is_me {
-            Color32::from_rgb(80, 180, 120)
+            COL_ME
         } else {
-            Color32::from_rgb(110, 110, 120)
+            COL_OTHER
         };
-        ui.painter().rect_filled(rect, 6.0, fill);
-        ui.painter().rect_stroke(rect, 6.0, (2.0, Color32::WHITE));
+        let stroke = if resp.hovered() || resp.dragged() {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 220)
+        } else {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 120)
+        };
 
-        let title = if is_primary { format!("★ {}", s.name) } else { s.name.clone() };
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            &title,
-            FontId::proportional(16.0),
-            Color32::WHITE,
+        // Soft drop shadow, then the card itself.
+        ui.painter().rect_filled(
+            rect.translate(vec2(0.0, 5.0)),
+            10.0,
+            Color32::from_black_alpha(110),
         );
-        ui.painter().text(
-            pos2(rect.center().x, rect.center().y + 22.0),
-            Align2::CENTER_CENTER,
-            &format!("{}×{}", s.w, s.h),
-            FontId::proportional(12.0),
-            Color32::from_gray(220),
-        );
+        ui.painter().rect_filled(rect, 10.0, fill);
+        ui.painter().rect_stroke(rect, 10.0, (1.5, stroke));
+
+        if w > 56.0 && h > 40.0 {
+            let title = if is_primary {
+                format!("★ {}", s.name)
+            } else {
+                s.name.clone()
+            };
+            let cy = rect.center().y;
+            let title_y = if h > 76.0 { cy - 12.0 } else { cy };
+            ui.painter().text(
+                pos2(rect.center().x, title_y),
+                Align2::CENTER_CENTER,
+                &title,
+                FontId::proportional(16.0),
+                Color32::WHITE,
+            );
+            if h > 76.0 {
+                ui.painter().text(
+                    pos2(rect.center().x, cy + 12.0),
+                    Align2::CENTER_CENTER,
+                    &format!("{}×{}", s.w, s.h),
+                    FontId::proportional(12.0),
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+                );
+            }
+        }
     }
 
-    // Draw a little hint about edges.
-    ui.label("Tip: align screen edges so the cursor can cross directly from one to the next.");
+    // Bottom-center hint on the canvas.
+    ui.painter().text(
+        pos2(avail.x / 2.0, avail.y - 14.0),
+        Align2::CENTER_CENTER,
+        t.layout_tip,
+        FontId::proportional(12.0),
+        CANVAS_MUTED,
+    );
 }
 
 fn bounds(layout: &Layout) -> (i32, i32, i32, i32) {
