@@ -267,10 +267,10 @@ fn main() -> anyhow::Result<()> {
 //   second cursor can never move on another machine while this one moves (the old
 //   "both move at once" bug is impossible by construction). We only watch for the cursor
 //   being *pinned* against an outer edge of the local bounding box that has a secondary
-//   attached just beyond it. The OS clamps the cursor at a display edge, so while pinned it
-//   generates no further motion events — every event we see AT the edge means the user
-//   pushed outward again. We pull the cursor back inside (bounce) and count the push; after
-//   `PIN_THRESHOLD` pushes within the window we hand control to that secondary.
+//   attached just beyond it. The OS clamps the cursor at a display edge, so a continuous
+//   outward push arrives as an event *at* the edge with an outward delta — that single
+//   pinned push (`PIN_THRESHOLD = 1`) hands control to the secondary right away: crossing
+//   is permanently on, no repeated push-jamming required.
 //
 // * **Remote** — a secondary has control. Every motion delta is forwarded to it as an
 //   absolute position inside its own screen, and the real cursor is re-centred on this
@@ -278,16 +278,17 @@ fn main() -> anyhow::Result<()> {
 //   shared edge inside the secondary's screen returns control to this machine.
 
 /// Within this distance of the bbox edge the cursor counts as pinned against it.
-const EDGE_PIN: f64 = 2.0;
+const EDGE_PIN: f64 = 3.0;
 /// A remote counts as attached just beyond an edge when its gap is within this distance.
-/// Generous on purpose: hand-dragging a tile in the canvas cannot reliably hit a 4px window,
-/// and a silent miss disables crossing entirely. A moderate gap is harmless — the hand-off
-/// only needs to know which neighbour lies beyond the edge.
-const EDGE_ATTACH: f64 = 60.0;
+/// Generous on purpose: tiles dragged in the canvas only line up roughly (small up/down/
+/// left/right offsets), and crossing must stay permanently on regardless. The hand-off only
+/// needs to know which neighbour lies beyond the edge — the exact gap is irrelevant.
+const EDGE_ATTACH: f64 = 240.0;
 /// After a pin, pull the cursor this far back inside so the next push produces fresh events.
 const BOUNCE_IN: f64 = 12.0;
 /// Outward pushes needed (within `PIN_WINDOW_MS`) before control is handed off.
-const PIN_THRESHOLD: u32 = 2;
+/// 1 = cross on the first push into a shared edge — crossing is always on.
+const PIN_THRESHOLD: u32 = 1;
 /// Pushes inside this time window accumulate toward the hand-off.
 const PIN_WINDOW_MS: u128 = 900;
 /// Max drift of the parked real cursor from the anchor before it is re-centred.
