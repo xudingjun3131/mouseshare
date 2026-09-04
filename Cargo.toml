@@ -32,3 +32,14 @@ local-ip-address = "0.6"
 [profile.release]
 opt-level = 2
 lto = true
+
+# Local copy of rdev 0.5.3 with a macOS crash fix.
+#
+# rdev's event-tap callback runs on a background thread but calls the Text Input Source
+# APIs (TISGetInputSourceProperty) there. On macOS 13+ those APIs must run on the main
+# thread for UI apps, so the call tripped `dispatch_assert_queue_fail` and killed the app
+# with EXC_BREAKPOINT/SIGTRAP (rdev issue #146). MouseShare only forwards the `Key` enum
+# and never uses the generated character name, so the vendored copy simply skips that
+# lookup. Keep this in sync with the crates.io version if you bump `rdev` below.
+[patch.crates-io]
+rdev = { path = "vendor/rdev" }

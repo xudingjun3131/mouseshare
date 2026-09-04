@@ -17,7 +17,7 @@ mod layout;
 mod network;
 mod protocol;
 
-use crate::config::{load_config, Config};
+use crate::config::{load_config, save_config, Config};
 use crate::i18n::Lang;
 use crate::layout::Layout;
 use crate::network::{connect_client, start_hub, Net};
@@ -30,8 +30,22 @@ use std::sync::{Arc, Mutex};
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let config: Config = load_config();
+    let mut config: Config = load_config();
     let my_name = config.name.clone();
+
+    // For the primary, the address shown to secondaries must be this machine's real LAN IP,
+    // not the `192.168.1.100` placeholder shipped in Config::default(). Auto-detect it on
+    // startup so the GUI always displays a connectable address. (The "检测IP" button still
+    // works as a manual refresh.)
+    if config.mode == "primary" {
+        if let Ok(ip) = local_ip_address::local_ip() {
+            config.server_addr = format!("{}:{}", ip, config.port);
+            save_config(&config);
+        } else {
+            log::warn!("could not detect local IP; keeping configured server_addr");
+        }
+    }
+
     let mode = config.mode.clone();
     let server_addr = config.server_addr.clone();
     let port = config.port;
