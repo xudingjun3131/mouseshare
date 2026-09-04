@@ -308,42 +308,62 @@ impl eframe::App for MouseShareApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme.canvas_bg))
             .show(ctx, |ui| {
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(20.0);
-                    ui.label(
-                        egui::RichText::new(t.layout_title)
-                            .size(15.0)
-                            .strong()
-                            .color(theme.canvas_text),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.add_space(20.0);
-                    ui.label(
-                        egui::RichText::new(t.layout_hint)
-                            .size(12.5)
-                            .color(theme.canvas_muted),
-                    );
-                });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(20.0);
-                    legend_chip(ui, COL_PRIMARY, t.legend_primary, theme);
-                    ui.add_space(14.0);
-                    legend_chip(ui, COL_ME, t.legend_me, theme);
-                    ui.add_space(14.0);
-                    legend_chip(ui, COL_CLIENT, t.legend_client, theme);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Paint the header into its own measured block so the canvas rectangle below is
+                // exact and does not depend on the fragile cursor state after long hints/legends.
+                let header = ui.vertical(|ui| {
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
                         ui.add_space(20.0);
                         ui.label(
-                            egui::RichText::new(t.layout_tip)
-                                .size(12.0)
-                                .color(theme.canvas_muted),
+                            egui::RichText::new(t.layout_title)
+                                .size(15.0)
+                                .strong()
+                                .color(theme.canvas_text),
                         );
                     });
-                });
-                ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        // Force wrapping in English, where the hint is long enough to overflow a
+                        // single line and would otherwise corrupt the following cursor/placement.
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(t.layout_hint)
+                                    .size(12.5)
+                                    .color(theme.canvas_muted),
+                            )
+                            .wrap(),
+                        );
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        legend_chip(ui, COL_PRIMARY, t.legend_primary, theme);
+                        ui.add_space(14.0);
+                        legend_chip(ui, COL_ME, t.legend_me, theme);
+                        ui.add_space(14.0);
+                        legend_chip(ui, COL_CLIENT, t.legend_client, theme);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(20.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(t.layout_tip)
+                                        .size(12.0)
+                                        .color(theme.canvas_muted),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    });
+                    ui.add_space(8.0);
+                })
+                .response
+                .rect;
+
+                let panel_rect = ui.max_rect();
+                let canvas_rect = Rect::from_min_max(
+                    pos2(panel_rect.min.x, header.max.y),
+                    panel_rect.max,
+                );
 
                 let mut layout = self.shared_layout.lock().unwrap();
                 if layout.screens.is_empty() {
@@ -355,7 +375,15 @@ impl eframe::App for MouseShareApp {
                         h: 1080,
                     });
                 }
-                draw_layout(ui, &mut layout, &self.config.primary_name, &self.config.name, t, theme);
+                draw_layout(
+                    ui,
+                    &mut layout,
+                    &self.config.primary_name,
+                    &self.config.name,
+                    t,
+                    theme,
+                    canvas_rect,
+                );
             });
     }
 }
@@ -570,11 +598,11 @@ fn draw_layout(
     my_name: &str,
     t: Tr,
     theme: UiTheme,
+    canvas_rect: Rect,
 ) {
-    // Reserve the exact rectangle left in the central panel after the header.
-    // We must use its origin (not assume the panel top-left) or tiles will
-    // creep up and occlude the title/hint/legend when the window is short.
-    let canvas_rect = ui.available_rect_before_wrap();
+    // The caller has already reserved the exact rectangle left in the central panel after the
+    // header. We just draw into it, using its origin so tiles never creep up and occlude the
+    // title/hint/legend.
     let avail = canvas_rect.size();
     if avail.x < 40.0 || avail.y < 40.0 {
         return;

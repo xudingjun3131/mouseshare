@@ -34,3 +34,10 @@
 - 顺带修 IP：primary 模式启动时 local_ip_address::local_ip() 自动写入 server_addr，替代写死的 192.168.1.100
 - 提交 ad89da6，打 tag v0.3.8，CI 三平台全绿，Release v0.3.8 资产齐全
 - 结论：崩溃修复 + IP 自动探测完成，发版成功
+
+### 2026-09-04 10:05（第四次执行，字体统一）
+- 用户反馈英文界面与中文界面「样式不一样」
+- 根因：i18n 整段切换（Zh/En 两套静态文案）；setup_fonts 把 cjk(Noto Sans SC) 追加到字体族末尾做 fallback → 中文模式回退 Noto、英文模式走 egui 默认 sans，整窗字体观感随语言切换变化
+- 修复 src/app.rs setup_fonts：抽 prefer_cjk 闭包，把 "cjk" 用 insert(0,...) 提到 Proportional/Monospace 族队首，中英文共用 Noto Sans SC（含拉丁字形），默认字体退居兜底
+- 提交 83e5075，打 tag v0.3.9，CI 三平台全绿，Release v0.3.9 资产齐全
+- 结论：中英文样式统一，发版成功
