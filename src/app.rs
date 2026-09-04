@@ -57,10 +57,15 @@ impl UiTheme {
     }
 }
 
-/// Install a CJK fallback font so Chinese/Japanese/Korean glyphs render instead of tofu boxes.
+/// Install a CJK-capable font and make it the **primary** typeface for every language.
 ///
-/// `default_fonts` (the only font feature we use on macOS/Windows) ships ProggyClean, which is
-/// ASCII-only. Without this, every non-Latin character in the UI shows as ▢▢▢.
+/// egui's default font (ProggyClean/Ubuntu) is ASCII-only. Without a CJK font, every non-Latin
+/// character shows as ▢▢▢. But if we only add the CJK font as a *fallback* (at the end of the
+/// family list), the two UI languages end up looking different: English renders in egui's default
+/// sans while Chinese falls through to Noto Sans SC. Pushing the CJK font to the **front** of each
+/// family makes Latin and CJK glyphs share ONE typeface, so the Chinese and English layouts look
+/// identical. Noto Sans SC ships full Latin glyphs, so English is unaffected apart from the
+/// consistent look. egui's default font stays behind it as a safety net for any rare missing glyph.
 ///
 /// Strategy: prefer an **embedded** Noto Sans SC OTF (the only thing we can guarantee across
 /// every user's machine, including CI containers, Windows boxes without East Asian language
@@ -69,6 +74,16 @@ impl UiTheme {
 pub fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
+    // Put the CJK font first in every family so both languages share one typeface.
+    let prefer_cjk = |fonts: &mut egui::FontDefinitions| {
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let list = fonts.families.entry(fam).or_default();
+            if !list.iter().any(|f| f == "cjk") {
+                list.insert(0, "cjk".into());
+            }
+        }
+    };
+
     // First try: the bundled OTF (always present, identical on every machine, no surprises).
     let embedded: &[u8] = include_bytes!("../resources/NotoSansSC-Regular.otf");
     if !embedded.is_empty() {
@@ -76,9 +91,7 @@ pub fn setup_fonts(ctx: &egui::Context) {
         fonts
             .font_data
             .insert("cjk".into(), egui::FontData::from_owned(embedded.to_vec()));
-        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(fam).or_default().push("cjk".into());
-        }
+        prefer_cjk(&mut fonts);
         ctx.set_fonts(fonts);
         return;
     }
@@ -121,9 +134,7 @@ pub fn setup_fonts(ctx: &egui::Context) {
                 fonts
                     .font_data
                     .insert("cjk".into(), egui::FontData::from_owned(bytes));
-                for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                    fonts.families.entry(fam).or_default().push("cjk".into());
-                }
+                prefer_cjk(&mut fonts);
                 break;
             }
             Err(_) => continue,
