@@ -12,6 +12,9 @@
 // shows in the taskbar with the embedded logo icon instead of spawning a `cmd` console.
 // Ignored on macOS/Linux (no such subsystem there).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+// NOTE: when control is local the primary's cursor must be allowed to leave a local screen at the
+// edge that has a secondary beyond it (see `handle_capture` / `outward_handoff`). The OS pins the
+// real cursor onto a display, so the hand-off check runs *before* local tracking.
 
 mod app;
 mod clipboard;
@@ -293,15 +296,11 @@ fn handle_capture(
             let cur_is_local = l.screens.iter().find(|s| s.name == cur).map(|s| s.is_local).unwrap_or(true);
 
             if cur_is_local {
-                // The real cursor is free on this primary. If it is over one of our own displays,
-                // just keep tracking it locally — never forward to a secondary (this is what lets a
-                // multi-monitor Mac roam between its own screens natively).
-                if let Some(idx) = l.screen_at(x, y).filter(|&i| l.screens[i].is_local) {
-                    *ownership.lock().unwrap() = l.screens[idx].name.clone();
-                    *vcursor.lock().unwrap() = (x, y);
-                    return;
-                }
-                // It's at/over an edge or a gap: try to hand control off to an adjacent secondary.
+                // Automatic edge hand-off: if the real cursor is pushing outward at the edge of the
+                // local bounding box that has a remote screen just beyond it, hand control to that
+                // secondary. This is checked *before* the local-tracking branch below: the OS keeps
+                // the real cursor pinned onto one of our own displays at all times, so once we are at
+                // an edge it would otherwise never leave a local screen and crossing would be impossible.
                 if let Some((side, rname)) = outward_handoff(&l, bbox, x, y, d) {
                     let remote = match l.screens.iter().find(|s| s.name == rname) {
                         Some(s) => s.clone(),
@@ -323,8 +322,15 @@ fn handle_capture(
                     drop(l);
                     input::warp_cursor(park.0, park.1);
                     *last_real.lock().unwrap() = park;
+                    return;
                 }
-                // else: over a gap with no secondary beyond it — do nothing.
+                // Not at a handing-off edge: just track the real cursor on whichever local display
+                // it's over. Never forward to a secondary — this is what lets a multi-monitor Mac
+                // roam between its own screens natively.
+                if let Some(idx) = l.screen_at(x, y).filter(|&i| l.screens[i].is_local) {
+                    *ownership.lock().unwrap() = l.screens[idx].name.clone();
+                    *vcursor.lock().unwrap() = (x, y);
+                }
             } else {
                 // Controlling a secondary: forward deltas, keep the real cursor parked, and watch
                 // for the user pushing back inward (which returns control to this primary). The
