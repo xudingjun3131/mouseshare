@@ -459,6 +459,11 @@ impl eframe::App for MouseShareApp {
                         is_local: true,
                     });
                 }
+                // Live cursor position from the control plane, drawn on the canvas: while you
+                // move the mouse this dot must track it. A dot that doesn't move or sits in
+                // the wrong place means the reported coordinates don't match the layout —
+                // visible at a glance instead of guesswork.
+                let cur = self.ctrl.lock().unwrap().last_real;
                 let layout_changed = draw_layout(
                     ui,
                     &mut layout,
@@ -466,6 +471,7 @@ impl eframe::App for MouseShareApp {
                     t,
                     theme,
                     canvas_rect,
+                    cur,
                 );
                 drop(layout);
                 // Persist drag repositioning immediately (primary only — it owns the layout and
@@ -694,6 +700,20 @@ impl MouseShareApp {
                     .size(12.0)
                     .color(ui.visuals().weak_text_color()),
             );
+            if self.config.mode == "primary" {
+                // Point primary users at the diagnostic log: if crossing misbehaves, this file
+                // contains the exact decisions (pins, hand-offs, samples) needed to diagnose it.
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {}",
+                        t.diag_hint,
+                        crate::diag::log_path().display()
+                    ))
+                    .size(11.0)
+                    .color(ui.visuals().weak_text_color()),
+                );
+            }
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(t.background_hint)
@@ -774,6 +794,7 @@ fn draw_layout(
     t: Tr,
     theme: UiTheme,
     canvas_rect: Rect,
+    cur: (f64, f64),
 ) -> bool {
     let mut changed = false;
     // The caller has already reserved the exact rectangle left in the central panel after the
@@ -897,6 +918,23 @@ fn draw_layout(
                 );
             }
         }
+    }
+
+    // Live cursor dot: the control plane's idea of where the real cursor is. While you move
+    // the mouse on this machine the dot must track it 1:1 — if it doesn't (or sits elsewhere)
+    // the reported coordinates don't match the layout, which is the #1 crossing killer and
+    // now visible at a glance.
+    let cx = offx + cur.0 as f32 * scale;
+    let cy = offy + cur.1 as f32 * scale;
+    let in_view = cx >= canvas_rect.min.x - 8.0
+        && cx <= canvas_rect.max.x + 8.0
+        && cy >= canvas_rect.min.y - 8.0
+        && cy <= canvas_rect.max.y + 8.0;
+    if in_view {
+        let p = pos2(cx, cy);
+        ui.painter()
+            .circle_filled(p, 7.0, Color32::from_rgba_unmultiplied(255, 170, 0, 90));
+        ui.painter().circle_filled(p, 3.5, Color32::from_rgb(255, 170, 0));
     }
 
     // Bottom-center hint on the canvas.

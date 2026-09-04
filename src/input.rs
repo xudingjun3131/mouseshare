@@ -13,6 +13,9 @@ where
         if let Err(e) = rdev::listen(cb) {
             log::error!("input capture failed: {:?}", e);
             log::error!("On macOS: grant Accessibility permission to the Terminal/app. On Linux: run under X11.");
+            crate::diag::log(&format!("CAPTURE FAILED: {:?} (check Accessibility permission)", e));
+        } else {
+            crate::diag::log("capture thread started (event tap active)");
         }
     });
 }
@@ -37,6 +40,29 @@ pub fn apply_input(ev: &InputEvent) {
 /// continue onto a neighbouring screen.
 pub fn warp_cursor(x: f64, y: f64) {
     let _ = simulate(&EventType::MouseMove { x, y });
+}
+
+/// Read the cursor position directly from the OS, *not* from the event stream.
+///
+/// While the OS pins the cursor against a display edge it may deliver no motion events at
+/// all (or only zero-delta echoes), which makes a purely event-driven edge-crossing
+/// unreliable. The edge-rest poller samples this instead: same Core Graphics global space
+/// (`CGEventGetLocation`, origin = top-left of the main display, y down) that rdev reports
+/// for motion events, so the coordinates are interchangeable.
+#[cfg(target_os = "macos")]
+pub fn cursor_position() -> Option<(f64, f64)> {
+    use core_graphics::event::CGEvent;
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    let src = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+    let ev = CGEvent::new(src).ok()?;
+    let p = ev.location();
+    Some((p.x, p.y))
+}
+
+/// Non-macOS: no direct sampler wired up yet; the event stream is the only source.
+#[cfg(not(target_os = "macos"))]
+pub fn cursor_position() -> Option<(f64, f64)> {
+    None
 }
 
 pub fn button_to_ms(b: RdevButton) -> MsButton {

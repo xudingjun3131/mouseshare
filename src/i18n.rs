@@ -120,6 +120,7 @@ pub struct Tr {
     pub ctrl_remote: &'static str,
     pub ctrl_pushing: &'static str,
     pub hotkey_hint: &'static str,
+    pub diag_hint: &'static str,
     pub background_hint: &'static str,
     pub exit_app: &'static str,
 }
@@ -151,7 +152,7 @@ pub const ZH: Tr = Tr {
     local_name: "本机名称: ",
     layout_title: "屏幕布局 — 拖动屏幕调整位置",
     layout_hint: "按桌面上的实际摆放排布各块屏幕。主机（高亮）是真实光标所在，光标越过边缘即把控制权交给相邻机器。",
-    layout_tip: "提示：把副机色块大致拖到主机屏幕边上即可（允许上下左右小误差），鼠标贴住该边缘一推即跨屏。",
+    layout_tip: "提示：副机色块拖到主机屏幕边上（允许小误差）即可跨屏；把鼠标贴住该边缘保持不动约半秒、或向边缘一推即跨。橙色圆点 = 实时鼠标位置。",
     legend_primary: "主机",
     legend_me: "本机",
     legend_client: "客户端",
@@ -170,6 +171,7 @@ pub const ZH: Tr = Tr {
     ctrl_remote: "当前在 {}（向主机方向推回边缘即返回）",
     ctrl_pushing: "贴边推进 {n}/{total}，继续向外推…",
     hotkey_hint: "切换鼠标控制权快捷键：Ctrl+Alt+空格 或 ScrollLock，在主机与各副机之间轮换（Mac、Windows 两端均可按）。",
+    diag_hint: "跨屏诊断日志（如跨屏异常，请把此文件内容发给开发者）：",
     background_hint: "关闭窗口后 MouseShare 会最小化到后台继续共享；要彻底退出请点下方按钮。",
     exit_app: "退出程序",
 };
@@ -201,7 +203,7 @@ pub const EN: Tr = Tr {
     local_name: "Local name: ",
     layout_title: "Screen layout — drag a screen to reposition it",
     layout_hint: "Place screens the way they sit on your desk. The primary (highlighted) is where your real cursor lives; cross an edge to hand control to a neighbour.",
-    layout_tip: "Tip: drag a secondary roughly against the primary's screen edge (small offsets are fine) — pushing the mouse into that edge crosses over immediately.",
+    layout_tip: "Tip: drag a secondary roughly against the primary's edge (small offsets fine); rest or push the mouse into that edge to cross. Orange dot = live cursor.",
     legend_primary: "Primary",
     legend_me: "This machine",
     legend_client: "Client",
@@ -220,6 +222,7 @@ pub const EN: Tr = Tr {
     ctrl_remote: "On {} (push back toward the primary's edge to return)",
     ctrl_pushing: "Edge push {n}/{total} — keep pushing…",
     hotkey_hint: "Switch-hotkey: Ctrl+Alt+Space or ScrollLock rotates the mouse between the primary and each secondary (works on both sides).",
+    diag_hint: "Crossing diagnostics log (paste this file when crossing misbehaves):",
     background_hint: "Closing this window minimises MouseShare to the background and sharing keeps running. Use the button below to quit for real.",
     exit_app: "Quit MouseShare",
 };

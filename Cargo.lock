@@ -2368,6 +2368,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "core-graphics 0.23.2",
  "directories",
  "display-info",
  "eframe",

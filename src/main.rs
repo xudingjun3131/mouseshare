@@ -19,6 +19,7 @@
 mod app;
 mod clipboard;
 mod config;
+mod diag;
 mod i18n;
 mod input;
 mod layout;
@@ -32,10 +33,22 @@ use crate::network::{connect_client, start_hub, Net};
 use crate::protocol::{InputEvent, Message};
 use log::info;
 use rdev::{display_size, Event, EventType, Key};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 
+/// Throttle counter for diagnostic cursor-position samples (one per 100 motion events).
+static MOTION_SAMPLES: AtomicU64 = AtomicU64::new(0);
+
 fn main() -> anyhow::Result<()> {
+    // `--probe`: coordinate-space self-test. Warps the cursor to known points and compares
+    // the positions reported by the event stream (rdev::listen) with direct Core Graphics
+    // reads (CGEventGetLocation). Any mismatch between the two — or versus the layout
+    // coordinates — is the #1 crossing killer, so this makes it measurable in one command.
+    if std::env::args().any(|a| a == "--probe") {
+        return probe();
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let mut config: Config = load_config();
@@ -115,6 +128,31 @@ fn main() -> anyhow::Result<()> {
     // secondary), the parked real-cursor position, and the pinned-edge push detector.
     let ctrl: Arc<Mutex<Ctrl>> = Arc::new(Mutex::new(Ctrl::default()));
 
+    // ---- Startup diagnostics dump (file-based; stderr is invisible when launched from Finder) ----
+    {
+        let l = layout.lock().unwrap();
+        let screens = l
+            .screens
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}({}x{}@{},{} local={})",
+                    s.name, s.w, s.h, s.ox, s.oy, s.is_local
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        diag::log(&format!(
+            "startup mode={} name={} port={} screens=[{}] bbox={:?} diag_log={}",
+            mode,
+            my_name,
+            port,
+            screens,
+            l.local_bbox(),
+            diag::log_path().display()
+        ));
+    }
+
     // ---- Incoming message handler ----
     {
         let net = net.clone();
@@ -186,13 +224,88 @@ fn main() -> anyhow::Result<()> {
 
     // ---- Capture ----
     if mode == "primary" {
-        let net = net.clone();
-        let layout = layout.clone();
-        let ctrl = ctrl.clone();
-        let primary_name = primary_name.clone();
-        input::start_capture(move |event: Event| {
-            handle_capture(event, &net, &layout, &ctrl, &primary_name);
-        });
+        {
+            let net = net.clone();
+            let layout = layout.clone();
+            let ctrl = ctrl.clone();
+            let primary_name = primary_name.clone();
+            input::start_capture(move |event: Event| {
+                handle_capture(event, &net, &layout, &ctrl, &primary_name);
+            });
+        }
+        // ---- Edge-rest poller (primary only) ----
+        // A second, event-independent crossing trigger. Samples the cursor position straight
+        // from the OS: if it rests inside a shared-edge pin zone (position unchanged — which
+        // is exactly what a pinned cursor does) for EDGE_REST_MS while control is local,
+        // control is handed to the secondary beyond that edge. This works even when the
+        // event stream is silent at the edge, which is what made crossing unreliable before.
+        {
+            let net = net.clone();
+            let layout = layout.clone();
+            let ctrl = ctrl.clone();
+            std::thread::spawn(move || {
+                let mut last_pos: Option<(f64, f64)> = None;
+                let mut rest_since: Option<std::time::Instant> = None;
+                let mut reported = false;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+                    let Some((x, y)) = input::cursor_position() else {
+                        return; // no OS sampler on this platform
+                    };
+                    // Cursor moved? reset the rest clock.
+                    if let Some((px, py)) = last_pos {
+                        if (x - px).abs() > 0.5 || (y - py).abs() > 0.5 {
+                            rest_since = None;
+                            reported = false;
+                        }
+                    }
+                    last_pos = Some((x, y));
+
+                    // Only meaningful while control is local.
+                    let is_local_ctrl = { ctrl.lock().unwrap().remote.is_none() };
+                    if !is_local_ctrl {
+                        rest_since = None;
+                        continue;
+                    }
+                    let (hit, bbox) = {
+                        let l = layout.lock().unwrap();
+                        if l.screens.len() <= 1 {
+                            continue;
+                        }
+                        let Some(bbox) = l.local_bbox() else { continue };
+                        let hit = edge_remote(l.screens.iter().filter(|s| !s.is_local), bbox, x, y);
+                        (hit, bbox)
+                    };
+                    let Some((side, name)) = hit else {
+                        rest_since = None;
+                        reported = false;
+                        continue;
+                    };
+                    let since = *rest_since.get_or_insert_with(std::time::Instant::now);
+                    let rested = since.elapsed().as_millis();
+                    // Throttled diagnostics: one line when the cursor first comes to rest in a
+                    // pin zone, then one per second while it stays there.
+                    if !reported {
+                        reported = true;
+                        diag::log(&format!(
+                            "poller: cursor at rest in {:?} pin zone at ({:.0},{:.0}) bbox={:?} target={} rest_ms={}",
+                            side, x, y, bbox, name, rested
+                        ));
+                    }
+                    if rested >= EDGE_REST_MS {
+                        diag::log(&format!(
+                            "poller: handing control to {} ({:?}) after {}ms rest at ({:.0},{:.0})",
+                            name, side, rested, x, y
+                        ));
+                        let mut c = ctrl.lock().unwrap();
+                        let l = layout.lock().unwrap();
+                        hand_off(&mut c, &l, &net, side, &name, x, y, bbox);
+                        rest_since = None;
+                        reported = false;
+                    }
+                }
+            });
+        }
     } else {
         info!("running as secondary; waiting for input from {}", server_addr);
         // Secondaries also listen for the switch hotkey (ScrollLock, or Ctrl+Alt+Space — most
@@ -293,6 +406,14 @@ const PIN_THRESHOLD: u32 = 1;
 const PIN_WINDOW_MS: u128 = 900;
 /// Max drift of the parked real cursor from the anchor before it is re-centred.
 const PARK_SLACK: f64 = 40.0;
+/// How often the edge-rest poller samples the cursor position.
+const POLL_INTERVAL_MS: u64 = 50;
+/// How long the cursor must REST inside a shared-edge pin zone (position unchanged) before
+/// the poller hands control to the secondary beyond it. This trigger does not depend on the
+/// event stream at all: when the OS pins the cursor at a display edge it may deliver no
+/// motion events (or only zero-delta echoes) — both are invisible to the event path, but a
+/// direct OS position sample still shows the cursor sitting in the pin zone.
+const EDGE_REST_MS: u128 = 400;
 
 /// Which side of the local bounding box a secondary is attached to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,6 +564,21 @@ fn local_move(
     y: f64,
     d: (f64, f64),
 ) {
+    // Throttled position sampling (every 100th motion event): shows whether the reported
+    // cursor coordinates line up with the layout's bbox at all. A mismatch here (e.g. a
+    // coordinate-space or display-arrangement discrepancy) is the #1 crossing killer.
+    if MOTION_SAMPLES.fetch_add(1, Ordering::Relaxed) % 100 == 0 {
+        diag::log(&format!(
+            "sample: cursor=({:.0},{:.0}) delta=({:.0},{:.0}) bbox={:?} remote={} controls_remote={}",
+            x,
+            y,
+            d.0,
+            d.1,
+            bbox,
+            l.screens.iter().filter(|s| !s.is_local).count(),
+            c.remote.is_some()
+        ));
+    }
     let Some((side, name)) = edge_remote(l.screens.iter().filter(|s| !s.is_local), bbox, x, y)
     else {
         // Not pinned: let the user roam the local displays natively; decay stale pushes.
@@ -475,7 +611,10 @@ fn local_move(
     let back = bounce_point(side, bbox, x, y);
     input::warp_cursor(back.0, back.1);
     c.last_real = back;
-    log::debug!("pinned at {:?} edge (push {} of {})", side, c.pins, PIN_THRESHOLD);
+    diag::log(&format!(
+        "event-path pin: side={:?} at ({:.0},{:.0}) push={}/{} target={} bbox={:?}",
+        side, x, y, c.pins, PIN_THRESHOLD, name, bbox
+    ));
     if c.pins >= PIN_THRESHOLD {
         hand_off(c, &l, net, side, &name, back.0, back.1, bbox);
     }
@@ -527,6 +666,10 @@ fn remote_move(
         input::warp_cursor(target.0, target.1);
         c.last_real = target;
         info!("control returned to {}", primary_name);
+        diag::log(&format!(
+            "RETURN <- {} exit=({:.0},{:.0}) target=({:.0},{:.0}) bbox={:?}",
+            r.name, vx, vy, target.0, target.1, bbox
+        ));
         return;
     }
     vx = vx.clamp(0.0, w - 1.0);
@@ -573,6 +716,10 @@ fn hand_off(
     input::warp_cursor(anchor.0, anchor.1);
     c.last_real = anchor;
     info!("control handed to {} ({:?})", name, side);
+    diag::log(&format!(
+        "HAND-OFF -> {} side={:?} entry=({:.0},{:.0}) park=({:.0},{:.0}) bbox={:?}",
+        name, side, vx, vy, anchor.0, anchor.1, bbox
+    ));
 }
 
 /// Is the cursor pinned against an outer edge of the local bbox that has a secondary attached
@@ -702,8 +849,67 @@ fn cycle_control(
     hand_off(&mut c, &l, net, side, &name, anchor.0, anchor.1, bbox);
 }
 
-/// Build the primary's initial layout from the machine's real displays.
+/// `--probe`: coordinate-space self-test for the crossing pipeline.
 ///
+/// Warps the cursor to a series of known points (screen corners and the shared-edge zone of
+/// whatever layout this machine reports), then prints — side by side — the position the
+/// event stream reports (`rdev::listen`) and a direct OS read (`CGEventGetLocation`). If the
+/// two disagree, or land far from the requested point, the coordinates the crossing logic
+/// relies on are broken and the mismatch is right there on the screen.
+fn probe() -> anyhow::Result<()> {
+    println!("MouseShare coordinate probe");
+    let layout = detect_primary_layout("probe-primary");
+    let bbox = layout.local_bbox().unwrap_or((0.0, 0.0, 1920.0, 1080.0));
+    for s in &layout.screens {
+        println!(
+            "  screen {} {}x{}@({},{} ) local={}",
+            s.name, s.w, s.h, s.ox, s.oy, s.is_local
+        );
+    }
+    println!("  local bbox = {:?}", bbox);
+
+    // Latest position reported by the event stream.
+    let last: Arc<Mutex<Option<(f64, f64)>>> = Arc::new(Mutex::new(None));
+    {
+        let last = last.clone();
+        input::start_capture(move |e: Event| {
+            if let EventType::MouseMove { x, y } = e.event_type {
+                *last.lock().unwrap() = Some((x, y));
+            }
+        });
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300)); // let the tap come up
+
+    let (bl, bt, br, bb) = bbox;
+    let points: Vec<(&str, f64, f64)> = vec![
+        ("local-bbox top-left", bl + 5.0, bt + 5.0),
+        ("local-bbox centre", (bl + br) / 2.0, (bt + bb) / 2.0),
+        ("local-bbox right edge", br - 2.0, (bt + bb) / 2.0),
+        ("local-bbox bottom edge", (bl + br) / 2.0, bb - 2.0),
+        ("origin", 1.0, 1.0),
+    ];
+    for (label, wx, wy) in points {
+        // Clear the last-seen marker so the next event must be fresh.
+        *last.lock().unwrap() = None;
+        input::warp_cursor(wx, wy);
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        let heard = *last.lock().unwrap();
+        let direct = input::cursor_position();
+        println!("warp to {:?} ({:.0},{:.0})", label, wx, wy);
+        match heard {
+            Some((x, y)) => println!("    listen : {:.1},{:.1}", x, y),
+            None => println!("    listen : <no event>"),
+        }
+        match direct {
+            Some((x, y)) => println!("    direct : {:.1},{:.1}", x, y),
+            None => println!("    direct : <unavailable>"),
+        }
+    }
+    println!("probe done");
+    Ok(())
+}
+
+/// Build the primary's initial layout from the machine's real displays.
 /// On macOS this enumerates every attached screen via `display-info` (Core Graphics), placing each
 /// at its true virtual-desktop position — so a Mac with two monitors shows both and the cursor can
 /// roam between them natively (each is `is_local = true`). Coordinates come from `CGDisplayBounds`,
