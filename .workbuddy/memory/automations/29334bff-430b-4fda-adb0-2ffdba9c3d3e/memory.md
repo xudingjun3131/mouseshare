@@ -48,3 +48,18 @@
 - 修复 src/app.rs：header 包进 `ui.vertical` 取实际高度，用 `ui.max_rect()` 减去 header 得到精确 canvas_rect 传给 draw_layout；hint/tip 改用 `Label::wrap()` 强制换行避免溢出
 - 提交 8bb9fb8，打 tag v0.3.10，CI 三平台全绿，Release v0.3.10 资产齐全
 - 结论：英文版布局修复，发版成功
+
+### 2026-09-04 11:10（第六次执行，副机连接 + 布局同步）
+- 用户报 Windows 副机连不上 Mac 主机（地址端口对）、且副机界面无连接入口、无主机屏幕
+- 修复：新增 `Message::Layout` 协议让主机把布局推给副机（副机即可看到 Mac 屏）；副机新增 `reconnect()` + 「连接主机/重试/重连」按钮（运行中点保存不再需要重启）；主机每 2s 节流 broadcast_layout；副机断线 net 置 Idle 并显示状态
+- 提交 37a7279，打 tag v0.3.11，CI 三平台全绿（6 check run 全 success），Release v0.3.11 资产齐全
+- 结论：副机连接入口 + 主机屏幕显示修复，发版成功
+- 排障：本机 curl 调 GitHub API 匿名限流，改用 WebFetch 查 check-runs/release
+
+### 2026-09-04 11:26（第七次执行，仅记忆更新）
+- HEAD 与 origin/main 同步（0 0），工作区改动仅 2 个文件且都在 .workbuddy/ 下
+  （memory/2026-09-04.md 与 automation memory.md 本身）
+- 走「仅 .workbuddy 改动」分支：提交 `docs: update memory` 并 push，不打 tag、不发版
+- 无产品代码改动，CI 无需动作
+- 结论：仅记忆/文档同步，无需发版
+
