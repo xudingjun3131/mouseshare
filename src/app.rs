@@ -3,25 +3,59 @@
 //! UI conventions:
 //! * All user-facing text comes from `crate::i18n` (Chinese / English, toggled in the title bar
 //!   and persisted in `Config.lang`).
-//! * The left side panel holds grouped setting cards; the central panel is a dark canvas where
-//!   the virtual desktop is laid out.
+//! * Visual language follows macOS HIG: a toolbar-style title bar with the app glyph, grouped
+//!   inset cards in the sidebar, and a soft neutral "Displays" canvas where the virtual desktop
+//!   is laid out. One accent color (system blue), hairline separators, generous spacing.
+//! * Colors are derived from the egui theme so both light and dark system appearances stay
+//!   readable. Screen tiles use solid fills with white labels, so they read on any canvas.
 
 use crate::clipboard;
 use crate::config::{save_config, Config};
 use crate::i18n::{tr, Lang, Tr};
 use crate::layout::Layout;
 use crate::network::Net;
-use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Rect, Sense};
+use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Rect, Rounding, Sense};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-// ---- Central-canvas palette (fixed dark, independent of the egui theme) ----
-const CANVAS_BG: Color32 = Color32::from_rgb(26, 28, 36);
-const COL_PRIMARY: Color32 = Color32::from_rgb(64, 118, 255);
-const COL_ME: Color32 = Color32::from_rgb(46, 184, 114);
-const COL_OTHER: Color32 = Color32::from_rgb(88, 96, 116);
-const CANVAS_TEXT: Color32 = Color32::from_gray(235);
-const CANVAS_MUTED: Color32 = Color32::from_gray(165);
+// ---- Accent + screen role colors (solid, contrast-safe on any canvas) ----
+const COL_PRIMARY: Color32 = Color32::from_rgb(0, 122, 255); // macOS system blue
+const COL_ME: Color32 = Color32::from_rgb(48, 199, 89); // iOS green
+const COL_CLIENT: Color32 = Color32::from_rgb(120, 120, 128); // iOS gray (label-safe)
+
+/// Theme-derived palette. Everything outside the canvas uses the egui theme directly; the canvas
+/// and its tiles need explicit colors so they stay legible in both light and dark modes.
+#[derive(Clone, Copy)]
+struct UiTheme {
+    canvas_bg: Color32,
+    canvas_text: Color32,
+    canvas_muted: Color32,
+    accent: Color32,
+    hairline: Color32,
+}
+
+impl UiTheme {
+    fn from_ctx(ctx: &egui::Context) -> Self {
+        let dark = ctx.style().visuals.dark_mode;
+        if dark {
+            UiTheme {
+                canvas_bg: Color32::from_rgb(30, 30, 36),
+                canvas_text: Color32::from_rgb(235, 235, 240),
+                canvas_muted: Color32::from_rgb(150, 150, 157),
+                accent: Color32::from_rgb(10, 132, 255),
+                hairline: Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+            }
+        } else {
+            UiTheme {
+                canvas_bg: Color32::from_rgb(243, 243, 248), // systemGray6
+                canvas_text: Color32::from_rgb(60, 60, 67),  // label
+                canvas_muted: Color32::from_rgb(142, 142, 147),
+                accent: Color32::from_rgb(0, 122, 255),
+                hairline: Color32::from_rgba_unmultiplied(0, 0, 0, 12),
+            }
+        }
+    }
+}
 
 /// Install a CJK fallback font so Chinese/Japanese/Korean glyphs render instead of tofu boxes.
 ///
@@ -99,13 +133,25 @@ pub fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Global look & feel: roomier spacing, chunkier buttons. Colors follow the system theme;
-/// only the layout canvas is fixed-dark (see `CANVAS_BG`).
+/// Global look & feel: macOS-flavored metrics — consistent 8px control rounding, roomy spacing.
+/// Colors stay theme-driven; the canvas derives its own palette in `UiTheme`.
 pub fn setup_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = vec2(8.0, 8.0);
-    style.spacing.button_padding = vec2(12.0, 5.0);
+    style.spacing.item_spacing = vec2(10.0, 10.0);
+    style.spacing.button_padding = vec2(14.0, 7.0);
     style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.spacing.indent = 14.0;
+    // Uniform control rounding across buttons / inputs / radios — the macOS look (squircle-ish).
+    for w in [
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
+        &mut style.visuals.widgets.noninteractive,
+    ] {
+        w.rounding = Rounding::same(8.0);
+    }
+    style.visuals.window_stroke = egui::Stroke::NONE;
     ctx.set_style(style);
 }
 
@@ -159,100 +205,134 @@ impl eframe::App for MouseShareApp {
             }
         }
 
-        // ---- Title bar: brand + language toggle ----
+        let theme = UiTheme::from_ctx(ctx);
+
+        // ---- Title bar: app glyph + brand + language toggle ----
         egui::TopBottomPanel::top("titlebar").show(ctx, |ui| {
-            ui.add_space(8.0);
+            let panel_rect = ui.max_rect();
+            ui.add_space(11.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("MouseShare").heading().strong());
-                ui.label(egui::RichText::new(t.tagline).weak().small());
+                // App glyph (mouse) drawn in the accent color.
+                let (_, icon_rect) = ui.allocate_space(vec2(24.0, 24.0));
+                draw_mouse_icon(ui.painter(), icon_rect, theme.accent);
+
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("MouseShare")
+                        .size(17.0)
+                        .strong()
+                        .color(ui.visuals().strong_text_color()),
+                );
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(t.tagline).size(12.0).color(ui.visuals().weak_text_color()));
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button(egui::RichText::new(self.lang.toggle_label()).strong())
-                        .clicked()
-                    {
+                    let pill = egui::Button::new(
+                        egui::RichText::new(self.lang.toggle_label()).size(12.5),
+                    )
+                    .rounding(8.0)
+                    .fill(ui.visuals().widgets.inactive.bg_fill)
+                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke);
+                    if ui.add(pill).clicked() {
                         self.lang = self.lang.toggled();
                         self.config.lang = self.lang.code().to_string();
                         save_config(&self.config); // persist immediately
                     }
                 });
             });
-            ui.add_space(8.0);
+            ui.add_space(11.0);
+            // Hairline under the toolbar.
+            ui.painter().line_segment(
+                [pos2(panel_rect.left(), panel_rect.bottom()), pos2(panel_rect.right(), panel_rect.bottom())],
+                (1.0, theme.hairline),
+            );
         });
 
         // ---- Startup failure banner (network error at boot) ----
         if self.startup_error.is_some() {
             let err = self.startup_error.clone().unwrap();
             egui::TopBottomPanel::top("startup_error").show(ctx, |ui| {
+                ui.add_space(10.0);
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(70, 32, 36))
-                    .inner_margin(egui::Margin::same(10.0))
-                    .rounding(egui::Rounding::same(6.0))
+                    .fill(Color32::from_rgb(255, 235, 236))
+                    .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                    .rounding(Rounding::same(10.0))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(255, 200, 202)))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 egui::RichText::new(t.err_title)
                                     .strong()
-                                    .color(Color32::from_rgb(255, 150, 150)),
+                                    .color(Color32::from_rgb(196, 30, 44)),
                             );
                             ui.label(
-                                egui::RichText::new(err).color(Color32::from_rgb(255, 205, 205)),
+                                egui::RichText::new(err).color(Color32::from_rgb(120, 30, 36)),
                             );
                         });
                         ui.label(
-                            egui::RichText::new(t.err_hint).small().color(CANVAS_MUTED),
+                            egui::RichText::new(t.err_hint)
+                                .size(12.0)
+                                .color(Color32::from_rgb(150, 90, 95)),
                         );
                     });
+                ui.add_space(10.0);
             });
         }
 
-        // ---- Left panel: grouped setting cards ----
+        // ---- Left sidebar: grouped setting cards ----
         egui::SidePanel::left("config")
-            .default_width(340.0)
+            .default_width(360.0)
             .resizable(true)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.basic_card(ui, t);
+                        self.basic_card(ui, t, theme);
                         self.screens_card(ui, t);
-                        self.status_card(ui, t);
+                        self.status_card(ui, t, theme);
                     });
             });
 
-        // ---- Central panel: dark canvas with the virtual desktop ----
+        // ---- Central canvas: the virtual desktop ----
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(CANVAS_BG))
+            .frame(egui::Frame::none().fill(theme.canvas_bg))
             .show(ctx, |ui| {
-                ui.style_mut().visuals.override_text_color = Some(CANVAS_TEXT);
-                ui.add_space(12.0);
+                ui.add_space(16.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    ui.label(egui::RichText::new(t.layout_title).heading().strong());
-                });
-                ui.horizontal(|ui| {
-                    ui.add_space(16.0);
+                    ui.add_space(20.0);
                     ui.label(
-                        egui::RichText::new(t.layout_hint)
-                            .small()
-                            .color(CANVAS_MUTED),
+                        egui::RichText::new(t.layout_title)
+                            .size(15.0)
+                            .strong()
+                            .color(theme.canvas_text),
                     );
                 });
-                ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    legend_chip(ui, COL_PRIMARY, t.legend_primary);
-                    legend_chip(ui, COL_ME, t.legend_me);
-                    legend_chip(ui, COL_OTHER, t.legend_client);
+                    ui.add_space(20.0);
+                    ui.label(
+                        egui::RichText::new(t.layout_hint)
+                            .size(12.5)
+                            .color(theme.canvas_muted),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    legend_chip(ui, COL_PRIMARY, t.legend_primary, theme);
+                    ui.add_space(14.0);
+                    legend_chip(ui, COL_ME, t.legend_me, theme);
+                    ui.add_space(14.0);
+                    legend_chip(ui, COL_CLIENT, t.legend_client, theme);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(16.0);
+                        ui.add_space(20.0);
                         ui.label(
                             egui::RichText::new(t.layout_tip)
-                                .small()
-                                .color(CANVAS_MUTED),
+                                .size(12.0)
+                                .color(theme.canvas_muted),
                         );
                     });
                 });
-                ui.add_space(4.0);
+                ui.add_space(8.0);
 
                 let mut layout = self.shared_layout.lock().unwrap();
                 if layout.screens.is_empty() {
@@ -264,203 +344,212 @@ impl eframe::App for MouseShareApp {
                         h: 1080,
                     });
                 }
-                draw_layout(ui, &mut layout, &self.config.primary_name, &self.config.name, t);
+                draw_layout(ui, &mut layout, &self.config.primary_name, &self.config.name, t, theme);
             });
     }
 }
 
 impl MouseShareApp {
-    fn basic_card(&mut self, ui: &mut egui::Ui, t: Tr) {
-        ui.add_space(4.0);
-        egui::Frame::none()
-            .fill(ui.visuals().extreme_bg_color)
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::same(12.0))
-            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(t.section_basic).strong().heading());
+    fn basic_card(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
+        card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_header(ui, t.section_basic);
 
-                ui.label(egui::RichText::new(t.machine_name).weak());
+            field_label(ui, t.machine_name, theme);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.config.name)
+                    .desired_width(f32::INFINITY),
+            );
+
+            ui.add_space(10.0);
+            field_label(ui, t.role, theme);
+            ui.radio_value(&mut self.config.mode, "primary".to_string(), t.role_primary);
+            ui.radio_value(&mut self.config.mode, "secondary".to_string(), t.role_secondary);
+
+            if self.config.mode == "secondary" {
+                ui.add_space(10.0);
+                field_label(ui, t.server_addr, theme);
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.config.name)
-                        .desired_width(f32::INFINITY),
+                    egui::TextEdit::singleline(&mut self.config.server_addr)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace),
                 );
-
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(t.role).weak());
-                ui.radio_value(
-                    &mut self.config.mode,
-                    "primary".to_string(),
-                    t.role_primary,
-                );
-                ui.radio_value(
-                    &mut self.config.mode,
-                    "secondary".to_string(),
-                    t.role_secondary,
-                );
-
-                if self.config.mode == "secondary" {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(t.server_addr).weak());
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.config.server_addr)
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                } else {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(t.listen_port).weak());
-                        ui.add(egui::DragValue::new(&mut self.config.port).speed(1));
-                    });
-                    if ui.button(t.detect_ip).clicked() {
-                        if let Ok(ip) = local_ip_address::local_ip() {
-                            self.config.server_addr =
-                                format!("{}:{}", ip, self.config.port);
-                        }
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(t.address).weak());
-                        ui.monospace(&self.config.server_addr);
-                    });
-                    if ui.button(t.copy_addr).clicked() {
-                        clipboard::set_clipboard(&self.config.server_addr);
-                        self.show_toast(t.copied);
+            } else {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    field_label(ui, t.listen_port, theme);
+                    ui.add(egui::DragValue::new(&mut self.config.port).speed(1));
+                });
+                if ui.button(t.detect_ip).clicked() {
+                    if let Ok(ip) = local_ip_address::local_ip() {
+                        self.config.server_addr = format!("{}:{}", ip, self.config.port);
                     }
                 }
-
-                ui.separator();
-                ui.label(egui::RichText::new(t.primary_name).weak());
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.config.primary_name)
-                        .desired_width(f32::INFINITY),
-                );
-
-                ui.add_space(6.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 34.0],
-                        egui::Button::new(egui::RichText::new(t.save).strong()),
-                    )
-                    .clicked()
-                {
-                    self.config.layout = self.shared_layout.lock().unwrap().clone();
-                    save_config(&self.config);
-                    self.show_toast(t.saved_hint);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(t.address).weak().size(12.0));
+                    ui.monospace(&self.config.server_addr);
+                });
+                if ui.button(t.copy_addr).clicked() {
+                    clipboard::set_clipboard(&self.config.server_addr);
+                    self.show_toast(t.copied);
                 }
+            }
 
-                if let Some((_, msg)) = &self.toast {
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new(msg.clone())
-                            .color(Color32::from_rgb(70, 180, 110)),
-                    );
-                }
-            });
-        ui.add_space(4.0);
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+            field_label(ui, t.primary_name, theme);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.config.primary_name)
+                    .desired_width(f32::INFINITY),
+            );
+
+            ui.add_space(14.0);
+            // Primary action — filled accent button.
+            let save = egui::Button::new(
+                egui::RichText::new(t.save).strong().color(Color32::WHITE),
+            )
+            .min_size(vec2(ui.available_width(), 36.0))
+            .rounding(9.0)
+            .fill(theme.accent);
+            if ui.add(save).clicked() {
+                self.config.layout = self.shared_layout.lock().unwrap().clone();
+                save_config(&self.config);
+                self.show_toast(t.saved_hint);
+            }
+
+            if let Some((_, msg)) = &self.toast {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("✓").strong().color(COL_ME).size(13.0));
+                    ui.label(egui::RichText::new(msg.clone()).size(12.5).color(COL_ME));
+                });
+            }
+        });
     }
 
     fn screens_card(&mut self, ui: &mut egui::Ui, t: Tr) {
-        egui::Frame::none()
-            .fill(ui.visuals().extreme_bg_color)
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::same(12.0))
-            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(t.section_screens).strong().heading());
-                ui.label(egui::RichText::new(t.screens_hint).weak().small());
+        card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_header(ui, t.section_screens);
+            ui.label(egui::RichText::new(t.screens_hint).weak().size(12.0));
+            ui.add_space(4.0);
 
-                let mut layout = self.shared_layout.lock().unwrap();
-                let mut dup_idx: Option<usize> = None;
-                let mut del_idx: Option<usize> = None;
-                for (i, s) in layout.screens.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.monospace(format!("{}  {}×{}", s.name, s.w, s.h));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.small_button(t.del).clicked() {
-                                    del_idx = Some(i);
-                                }
-                                if ui.small_button(t.dup).clicked() {
-                                    dup_idx = Some(i);
-                                }
-                            },
-                        );
+            let mut layout = self.shared_layout.lock().unwrap();
+            let mut dup_idx: Option<usize> = None;
+            let mut del_idx: Option<usize> = None;
+            for (i, s) in layout.screens.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.monospace(format!("{}  {}×{}", s.name, s.w, s.h));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button(t.del).clicked() {
+                            del_idx = Some(i);
+                        }
+                        if ui.small_button(t.dup).clicked() {
+                            dup_idx = Some(i);
+                        }
                     });
+                });
+            }
+            if let Some(i) = dup_idx {
+                layout.duplicate_screen(i);
+            }
+            if let Some(i) = del_idx {
+                if layout.screens.len() > 1 {
+                    layout.screens.remove(i);
+                } else {
+                    self.toast = Some((Instant::now(), t.keep_one.to_string()));
                 }
-                if let Some(i) = dup_idx {
-                    layout.duplicate_screen(i);
-                }
-                if let Some(i) = del_idx {
-                    if layout.screens.len() > 1 {
-                        layout.screens.remove(i);
-                    } else {
-                        // Direct field write (not a method call): the layout guard still
-                        // borrows self.shared_layout below, so &mut self is unavailable.
-                        self.toast = Some((Instant::now(), t.keep_one.to_string()));
-                    }
-                }
+            }
 
-                if ui.button(t.add_screen).clicked() {
-                    let max_x = layout
-                        .screens
-                        .iter()
-                        .map(|s| s.ox + s.w as i32)
-                        .max()
-                        .unwrap_or(0);
-                    let n = layout.screens.len() + 1;
-                    layout.screens.push(crate::layout::Screen {
-                        name: format!("machine-{}", n),
-                        ox: max_x + 40,
-                        oy: 0,
-                        w: 1920,
-                        h: 1080,
-                    });
-                }
-            });
-        ui.add_space(4.0);
+            ui.add_space(8.0);
+            if ui.button(t.add_screen).clicked() {
+                let max_x = layout
+                    .screens
+                    .iter()
+                    .map(|s| s.ox + s.w as i32)
+                    .max()
+                    .unwrap_or(0);
+                let n = layout.screens.len() + 1;
+                layout.screens.push(crate::layout::Screen {
+                    name: format!("machine-{}", n),
+                    ox: max_x + 40,
+                    oy: 0,
+                    w: 1920,
+                    h: 1080,
+                });
+            }
+        });
     }
 
-    fn status_card(&mut self, ui: &mut egui::Ui, t: Tr) {
-        egui::Frame::none()
-            .fill(ui.visuals().extreme_bg_color)
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::same(12.0))
-            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(t.section_status).strong().heading());
-                let peers = self.net.lock().unwrap().peer_count();
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(t.peers).weak());
-                    ui.label(
-                        egui::RichText::new(format!("{}", peers))
-                            .strong()
-                            .heading(),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(t.local_name).weak());
-                    ui.monospace(&self.my_name);
-                });
-                if let Some((_, msg)) = &self.toast {
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new(msg.clone())
-                            .color(Color32::from_rgb(70, 180, 110)),
-                    );
-                }
+    fn status_card(&mut self, ui: &mut egui::Ui, t: Tr, _theme: UiTheme) {
+        card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_header(ui, t.section_status);
+            let peers = self.net.lock().unwrap().peer_count();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(t.peers).weak());
+                ui.label(egui::RichText::new(format!("{}", peers)).strong().size(15.0));
             });
-        ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(t.local_name).weak());
+                ui.monospace(&self.my_name);
+            });
+        });
     }
 }
 
-fn legend_chip(ui: &mut egui::Ui, color: Color32, text: &str) {
-    ui.label(egui::RichText::new("●").color(color));
-    ui.label(egui::RichText::new(text).small().color(CANVAS_MUTED));
+/// A macOS-style inset card: subtle fill, hairline border, 12px radius.
+fn card(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(8.0);
+    egui::Frame::none()
+        .fill(ui.visuals().extreme_bg_color)
+        .rounding(Rounding::same(12.0))
+        .inner_margin(egui::Margin::same(14.0))
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .show(ui, body);
+}
+
+/// Section title inside a card.
+fn section_header(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).size(13.0).strong().color(ui.visuals().strong_text_color()));
+    ui.add_space(8.0);
+}
+
+/// Small caption above an input field.
+fn field_label(ui: &mut egui::Ui, text: &str, _theme: UiTheme) {
+    ui.label(egui::RichText::new(text).size(12.0).color(ui.visuals().weak_text_color()));
+    ui.add_space(4.0);
+}
+
+fn legend_chip(ui: &mut egui::Ui, color: Color32, text: &str, theme: UiTheme) {
+    let (_, r) = ui.allocate_space(vec2(11.0, 11.0));
+    ui.painter().rect_filled(r, 3.0, color);
+    ui.label(egui::RichText::new(text).size(12.0).color(theme.canvas_muted));
+}
+
+/// Draw a small mouse glyph (the app icon) in the given color.
+fn draw_mouse_icon(p: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let w = rect.width();
+    let h = rect.height();
+    let body = Rect::from_center_size(c, vec2(w, h));
+    // Soft drop shadow.
+    p.rect_filled(
+        Rect::from_center_size(c + vec2(0.0, 1.0), vec2(w, h)),
+        h * 0.5,
+        Color32::from_black_alpha(35),
+    );
+    // Body (vertical pill).
+    p.rect_filled(body, h * 0.5, color);
+    // Scroll wheel near the top.
+    let wheel_w = w * 0.2;
+    let wheel_h = h * 0.18;
+    let wheel = Rect::from_center_size(
+        pos2(c.x, rect.top() + h * 0.28),
+        vec2(wheel_w, wheel_h),
+    );
+    p.rect_filled(wheel, wheel_w * 0.5, Color32::from_white_alpha(200));
 }
 
 fn draw_layout(
@@ -469,6 +558,7 @@ fn draw_layout(
     primary_name: &str,
     my_name: &str,
     t: Tr,
+    theme: UiTheme,
 ) {
     let avail = ui.available_size();
     if avail.x < 40.0 || avail.y < 40.0 {
@@ -478,7 +568,7 @@ fn draw_layout(
     let (minx, miny, maxx, maxy) = bounds(layout);
     let vw = (maxx - minx).max(1) as f32;
     let vh = (maxy - miny).max(1) as f32;
-    let pad = 48.0;
+    let pad = 56.0;
     let scale = ((avail.x - pad * 2.0) / vw)
         .min((avail.y - pad * 2.0) / vh)
         .max(0.05);
@@ -511,22 +601,28 @@ fn draw_layout(
         } else if is_me {
             COL_ME
         } else {
-            COL_OTHER
+            COL_CLIENT
         };
         let stroke = if resp.hovered() || resp.dragged() {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 220)
+            Color32::from_white_alpha(235)
         } else {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 120)
+            Color32::from_white_alpha(120)
         };
 
-        // Soft drop shadow, then the card itself.
+        // Soft drop shadow, then the tile.
         ui.painter().rect_filled(
-            rect.translate(vec2(0.0, 5.0)),
-            10.0,
-            Color32::from_black_alpha(110),
+            rect.translate(vec2(0.0, 6.0)),
+            12.0,
+            Color32::from_black_alpha(70),
         );
-        ui.painter().rect_filled(rect, 10.0, fill);
-        ui.painter().rect_stroke(rect, 10.0, (1.5, stroke));
+        ui.painter().rect_filled(rect, 12.0, fill);
+        // Top sheen for a bit of depth.
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, vec2(rect.width(), rect.height().min(14.0))),
+            12.0,
+            Color32::from_white_alpha(28),
+        );
+        ui.painter().rect_stroke(rect, 12.0, (1.5, stroke));
 
         if w > 56.0 && h > 40.0 {
             let title = if is_primary {
@@ -540,7 +636,7 @@ fn draw_layout(
                 pos2(rect.center().x, title_y),
                 Align2::CENTER_CENTER,
                 &title,
-                FontId::proportional(16.0),
+                FontId::proportional(15.5),
                 Color32::WHITE,
             );
             if h > 76.0 {
@@ -549,7 +645,7 @@ fn draw_layout(
                     Align2::CENTER_CENTER,
                     &format!("{}×{}", s.w, s.h),
                     FontId::proportional(12.0),
-                    Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+                    Color32::from_white_alpha(210),
                 );
             }
         }
@@ -557,11 +653,11 @@ fn draw_layout(
 
     // Bottom-center hint on the canvas.
     ui.painter().text(
-        pos2(avail.x / 2.0, avail.y - 14.0),
+        pos2(avail.x / 2.0, avail.y - 16.0),
         Align2::CENTER_CENTER,
         t.layout_tip,
         FontId::proportional(12.0),
-        CANVAS_MUTED,
+        theme.canvas_muted,
     );
 }
 

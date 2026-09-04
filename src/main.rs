@@ -160,10 +160,23 @@ fn main() -> anyhow::Result<()> {
 
     // ---- GUI on the main thread ----
     let gui_app = app::MouseShareApp::new(config, layout, net, my_name, startup_error);
+
+    // Window icon: the bundled mouse logo. Without this a bare (non-.app) binary shows the
+    // generic executable icon in the Dock / title bar; the .app bundle still gets AppIcon.icns
+    // from the CI packaging step, so this only makes the dev/preview build match the release.
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../resources/mouse-logo.png"))
+        .map(Arc::new)
+        .ok();
+
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([1120.0, 720.0])
+        .with_min_inner_size([860.0, 560.0]);
+    if let Some(icon) = icon {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 720.0])
-            .with_min_inner_size([860.0, 560.0]),
+        viewport,
         ..Default::default()
     };
     let result = eframe::run_native(
