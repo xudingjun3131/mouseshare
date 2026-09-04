@@ -16,3 +16,13 @@
 - 顺带核查 v0.3.3 状态：三平台 check-run 全 completed+success，Release 5 个资产齐全
   （deb / linux.tar.gz / mac.dmg / Setup.exe / windows.zip）
 - 结论：无需修复动作
+
+### 2026-09-04 09:20（第二次执行）
+- HEAD 32355c1，与 origin/main 同步（0 0），有产品代码改动：src/app.rs、src/main.rs
+- 提交 6de8175 `feat: auto-commit dev changes` 并 push，打 tag v0.3.6
+- 执行中被用户打断反馈 UI 遮挡：屏幕布局区蓝色屏幕块压到标题/提示
+- 修复 src/app.rs：draw_layout 改用 available_rect_before_wrap 并以画布矩形原点绘制
+- 提交 e5a06bb `fix: prevent layout tiles from overlapping header` 并 push，打 tag v0.3.7
+- 等待后 CI 三平台（ubuntu/windows/macos）全部 completed+success
+- Release v0.3.7 资产齐全（deb / linux.tar.gz / mac.dmg / Setup.exe / windows.zip）
+- 结论：发版成功，无需进一步修复
