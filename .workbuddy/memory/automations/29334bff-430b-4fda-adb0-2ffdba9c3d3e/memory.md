@@ -69,3 +69,17 @@
 - 无产品代码改动，CI 无需动作
 - 结论：仅记忆/文档同步，无需发版
 
+### 2026-09-04 12:10（第八次执行，多屏 + 跨屏修复）
+- 用户报：Mac(主机) 鼠标移不到 Win(副机)；Mac 双显示器只识别一块
+- 根因：① `ensure_screen` 留 40px 死区 + `clamp` 把虚拟光标 snap 回 → 跨屏结构性不可能；② 主机布局写死单屏，无运行时显示器枚举
+- 修复：Screen 加 is_local 标志（本机多屏均 true、副机 false）；ensure_screen 改为紧贴无死区；detect_primary_layout 用 display-info 枚举 Mac 真实显示器（CGDisplayBounds 坐标与 rdev 一致）；handle_capture 重写跨屏转发 + treadmill（基于本地包围盒、仅外侧有副机屏时 warp）
+- 提交 9bb680a 打 tag v0.3.13；随后 b1131bc 把 display-info 限定 macOS-only（避免 Win/Linux 编 windows 0.62 巨无霸）
+- v0.3.13 的 tag CI 在 Windows 卡 56+ 分钟（display-info 未限定平台时 Win 编 windows 0.62 + LTO 疑似卡死）；改为从优化后的 b1131bc 打 tag **v0.3.14**
+- Release v0.3.14 已发布（draft:false），5 资产齐全；win/mac/linux 三平台 CI 全绿（Win 仅 3 分钟）
+- 结论：多屏识别 + 跨屏修复发版成功，让用户用 v0.3.14
+
+### 2026-09-04 12:28（第八次执行，空跑）
+- `git fetch` 后工作区 `git status --porcelain` 为空，且 `HEAD...origin/main` 为 "0 0"
+- 判定无事可做，直接结束；未提交、未打 tag、未触发 CI
+- 结论：仓库已与远端同步，无待发布改动
+
