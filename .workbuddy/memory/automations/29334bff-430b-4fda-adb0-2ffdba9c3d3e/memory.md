@@ -56,6 +56,12 @@
 - 结论：副机连接入口 + 主机屏幕显示修复，发版成功
 - 排障：本机 curl 调 GitHub API 匿名限流，改用 WebFetch 查 check-runs/release
 
+### 2026-09-04 11:25（第七次执行，Windows 图标）
+- 用户报 Windows 版的 logo 没带上
+- 根因：Windows 构建完全没接图标（无 .ico / 无 .rc / 无 winresource / installer.iss 无 SetupIconFile）；macOS 用 AppIcon.icns、Linux 用运行时 with_icon 都正常
+- 修复：Pillow 由 mouse-logo.png 生成 resources/AppIcon.ico（10 档 16–256）；新增 build.rs 用 winresource 把 .ico 编进 .exe（非 Windows 为空 main）；Cargo.toml 加 winresource build-dep；installer.iss 加 SetupIconFile
+- 提交 d38053b，打 tag v0.3.12；windows/macos completed+success，Release v0.3.12 资产齐全（含 Setup.exe/windows.zip）
+
 ### 2026-09-04 11:26（第七次执行，仅记忆更新）
 - HEAD 与 origin/main 同步（0 0），工作区改动仅 2 个文件且都在 .workbuddy/ 下
   （memory/2026-09-04.md 与 automation memory.md 本身）
