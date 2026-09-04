@@ -116,6 +116,8 @@ pub struct Tr {
     pub conn_connected: &'static str,
     pub conn_idle: &'static str,
     pub hotkey_hint: &'static str,
+    pub background_hint: &'static str,
+    pub exit_app: &'static str,
 }
 
 pub const ZH: Tr = Tr {
@@ -160,6 +162,8 @@ pub const ZH: Tr = Tr {
     conn_connected: "已连接主机",
     conn_idle: "未连接",
     hotkey_hint: "按 ScrollLock 在主机与各副机之间切换鼠标控制权。",
+    background_hint: "关闭窗口后 MouseShare 会最小化到后台继续共享；要彻底退出请点下方按钮。",
+    exit_app: "退出程序",
 };
 
 pub const EN: Tr = Tr {
@@ -204,6 +208,8 @@ pub const EN: Tr = Tr {
     conn_connected: "Connected to host",
     conn_idle: "Not connected",
     hotkey_hint: "Press ScrollLock to switch the mouse between the primary and each secondary.",
+    background_hint: "Closing this window minimises MouseShare to the background and sharing keeps running. Use the button below to quit for real.",
+    exit_app: "Quit MouseShare",
 };
 
 /// Look up the string table for a language.

@@ -265,6 +265,16 @@ impl eframe::App for MouseShareApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let t = tr(self.lang);
 
+        // Keep running when the window is closed: sharing (input capture/injection, clipboard,
+        // network) lives on background threads that don't need the window. Cancel the close and
+        // minimise instead of exiting — the "Quit" button in the status card exits for real.
+        // Without this the process died with the window and the user had to keep the window
+        // open for sharing to work at all.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
         // Expire the transient toast.
         if let Some((at, _)) = &self.toast {
             if at.elapsed() > Duration::from_secs(3) {
@@ -444,7 +454,7 @@ impl eframe::App for MouseShareApp {
                         is_local: true,
                     });
                 }
-                draw_layout(
+                let layout_changed = draw_layout(
                     ui,
                     &mut layout,
                     &self.config.name,
@@ -452,6 +462,13 @@ impl eframe::App for MouseShareApp {
                     theme,
                     canvas_rect,
                 );
+                drop(layout);
+                // Persist drag repositioning immediately (primary only — it owns the layout and
+                // broadcasts it to every secondary within 2 s).
+                if layout_changed && self.config.mode == "primary" {
+                    self.config.layout = self.shared_layout.lock().unwrap().clone();
+                    save_config(&self.config);
+                }
             });
 
         // Primary: push the current layout to every secondary every couple of seconds so all
@@ -649,6 +666,20 @@ impl MouseShareApp {
                     .size(12.0)
                     .color(ui.visuals().weak_text_color()),
             );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(t.background_hint)
+                    .size(12.0)
+                    .color(ui.visuals().weak_text_color()),
+            );
+            if ui.button(t.exit_app).clicked() {
+                // Persist the (possibly dragged) layout before quitting on the primary.
+                if self.config.mode == "primary" {
+                    self.config.layout = self.shared_layout.lock().unwrap().clone();
+                    save_config(&self.config);
+                }
+                std::process::exit(0);
+            }
         });
     }
 }
@@ -706,6 +737,8 @@ fn draw_mouse_icon(p: &egui::Painter, rect: Rect, color: Color32) {
     p.rect_filled(wheel, wheel_w * 0.5, Color32::from_white_alpha(200));
 }
 
+/// Draw the virtual desktop. Returns `true` when the layout was changed by dragging, so the
+/// caller can persist it.
 fn draw_layout(
     ui: &mut egui::Ui,
     layout: &mut Layout,
@@ -713,13 +746,14 @@ fn draw_layout(
     t: Tr,
     theme: UiTheme,
     canvas_rect: Rect,
-) {
+) -> bool {
+    let mut changed = false;
     // The caller has already reserved the exact rectangle left in the central panel after the
     // header. We just draw into it, using its origin so tiles never creep up and occlude the
     // title/hint/legend.
     let avail = canvas_rect.size();
     if avail.x < 40.0 || avail.y < 40.0 {
-        return;
+        return false;
     }
 
     let (minx, miny, maxx, maxy) = bounds(layout);
@@ -816,6 +850,7 @@ fn draw_layout(
         FontId::proportional(12.0),
         theme.canvas_muted,
     );
+    changed
 }
 
 fn bounds(layout: &Layout) -> (i32, i32, i32, i32) {
