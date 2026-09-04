@@ -448,8 +448,18 @@ const BOUNCE_IN: f64 = 12.0;
 const PIN_THRESHOLD: u32 = 1;
 /// Pushes inside this time window accumulate toward the hand-off.
 const PIN_WINDOW_MS: u128 = 900;
-/// Max drift of the parked real cursor from the anchor before it is re-centred.
-const PARK_SLACK: f64 = 40.0;
+/// Max drift of the parked real cursor from the anchor before it is re-centred. The parked
+/// cursor is hidden while a secondary has control, so a generous slack costs nothing and
+/// avoids a re-centre warp on nearly every motion event (each warp emits echo/stale events
+/// that would otherwise have to be filtered out of the remote delta stream).
+const PARK_SLACK: f64 = 300.0;
+/// A single-event motion delta larger than this is a warp artifact, not a real mouse move.
+/// Events queued before one of our own cursor warps (hand-off park / re-centre / return)
+/// arrive after it, and the warp echo itself carries the edge→anchor jump (measured in the
+/// field: 1695px = exactly the edge-to-anchor distance). No physical mouse produces 400px
+/// in one event; such deltas must never reach the virtual cursor — a single 1695px artifact
+/// slammed the secondary's cursor into a screen corner and stuck it there.
+const ECHO_MAX: f64 = 400.0;
 /// How often the edge-rest poller samples the cursor position.
 const POLL_INTERVAL_MS: u64 = 50;
 /// How long the cursor must REST inside a shared-edge pin zone (position unchanged) before
@@ -497,6 +507,8 @@ struct Ctrl {
     /// because the returned cursor is parked just inside the shared edge and any stray push
     /// along that edge would otherwise re-cross immediately (a hand-off/return ping-pong).
     cooldown_until: Option<std::time::Instant>,
+    /// Consecutive warp-artifact drops (see `ECHO_MAX`); resets on any accepted motion event.
+    drops: u32,
     /// Modifier/hotkey bookkeeping for the switch hotkey.
     hk: HotkeyState,
 }
@@ -541,10 +553,34 @@ fn handle_capture(
                 return;
             }
             let d = (x - c.last_real.0, y - c.last_real.1);
-            c.last_real = (x, y);
             if d.0 == 0.0 && d.1 == 0.0 {
                 return; // echo of our own warp — no real motion
             }
+            if d.0.abs() > ECHO_MAX || d.1.abs() > ECHO_MAX {
+                // Warp artifact: a stale event queued before one of our own cursor warps
+                // (hand-off park / re-centre / return), or the warp echo carrying the
+                // edge→anchor jump. Never advance the virtual cursor with it — a single
+                // 1695px artifact was seen throwing the secondary's cursor into a corner.
+                // Keep last_real at the warp target (where the cursor physically is now) so
+                // the user's next real delta is small again; if the stream stays implausible
+                // anyway, re-baseline to avoid starving the delta chain.
+                c.drops += 1;
+                if c.drops > 8 {
+                    c.drops = 0;
+                    c.last_real = (x, y);
+                }
+                diag::log(&format!(
+                    "drop warp artifact #{}: pos=({x},{y}) d=({:.0},{:.0}) last=({:.0},{:.0})",
+                    c.drops,
+                    d.0,
+                    d.1,
+                    c.last_real.0,
+                    c.last_real.1
+                ));
+                return;
+            }
+            c.drops = 0;
+            c.last_real = (x, y);
             let l = layout.lock().unwrap();
             if l.screens.len() <= 1 {
                 return; // nothing to hand control to
