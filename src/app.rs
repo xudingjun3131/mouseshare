@@ -184,6 +184,9 @@ pub struct MouseShareApp {
     pub inc_tx: Sender<(String, Message)>,
     /// Throttle timestamp for the primary's periodic layout push to secondaries.
     pub last_layout_push: Option<Instant>,
+    /// The capture thread's control-plane state (who has the mouse, edge-push progress).
+    /// Shared read-only here so the status card can show live hand-off state.
+    pub ctrl: Arc<Mutex<crate::Ctrl>>,
 }
 
 impl MouseShareApp {
@@ -194,6 +197,7 @@ impl MouseShareApp {
         my_name: String,
         startup_error: Option<String>,
         inc_tx: Sender<(String, Message)>,
+        ctrl: Arc<Mutex<crate::Ctrl>>,
     ) -> Self {
         let lang = Lang::from_code(&config.lang);
         Self {
@@ -206,6 +210,7 @@ impl MouseShareApp {
             startup_error,
             inc_tx,
             last_layout_push: None,
+            ctrl,
         }
     }
 
@@ -651,6 +656,29 @@ impl MouseShareApp {
                 ui.label(egui::RichText::new(t.conn_status).weak());
                 ui.label(egui::RichText::new(conn_label).strong().size(15.0));
             });
+            // Live control-plane state (primary only): who has the mouse right now, and —
+            // while the cursor is pinned against a shared edge — how many pushes are in.
+            if self.config.mode == "primary" {
+                let c = self.ctrl.lock().unwrap();
+                let line = if let Some(r) = &c.remote {
+                    t.ctrl_remote.replace("{}", &r.name)
+                } else if c.pins > 0
+                    && c.last_pin
+                        .map(|t0| t0.elapsed().as_millis() < crate::PIN_WINDOW_MS)
+                        .unwrap_or(false)
+                {
+                    t.ctrl_pushing
+                        .replace("{n}", &c.pins.to_string())
+                        .replace("{total}", &crate::PIN_THRESHOLD.to_string())
+                } else {
+                    t.ctrl_local.to_string()
+                };
+                drop(c);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(t.ctrl_status).weak());
+                    ui.label(egui::RichText::new(line).strong().size(15.0));
+                });
+            }
             if self.config.mode == "secondary" {
                 let is_idle = matches!(&*self.net.lock().unwrap(), Net::Idle);
                 if is_idle {
@@ -766,6 +794,10 @@ fn draw_layout(
     let offx = canvas_rect.min.x + (avail.x - vw * scale) / 2.0 - minx as f32 * scale;
     let offy = canvas_rect.min.y + (avail.y - vh * scale) / 2.0 - miny as f32 * scale;
 
+    // Bounding box of the primary's own displays, for magnet-snapping remote tiles flush
+    // while they are dragged (the cursor can only cross when a remote sits at the edge).
+    let lbb = layout.local_bbox();
+
     for s in layout.screens.iter_mut() {
         let x = offx + s.ox as f32 * scale;
         let y = offy + s.oy as f32 * scale;
@@ -780,6 +812,31 @@ fn draw_layout(
             let d = resp.drag_delta();
             s.ox += (d.x / scale) as i32;
             s.oy += (d.y / scale) as i32;
+            changed = true;
+            // Magnetic snap: pull a remote tile flush against the local bounding box when it
+            // comes close, so the shared edge lines up and the cursor can cross. Without this,
+            // a tile dragged "almost" flush could silently disable crossing.
+            if !s.is_local {
+                if let Some((bl, bt, br, bb)) = lbb {
+                    const SNAP: f64 = 24.0;
+                    let sl = s.ox as f64;
+                    let st = s.oy as f64;
+                    let sr = sl + s.w as f64;
+                    let sb = st + s.h as f64;
+                    if (sl - br).abs() <= SNAP {
+                        s.ox = br as i32; // flush against the bbox's right edge
+                    }
+                    if (sr - bl).abs() <= SNAP {
+                        s.ox = (bl - s.w as f64) as i32; // flush against the left edge
+                    }
+                    if (st - bt).abs() <= SNAP {
+                        s.oy = bt as i32; // top-aligned with the bbox
+                    }
+                    if (sb - bb).abs() <= SNAP {
+                        s.oy = (bb - s.h as f64) as i32; // bottom-aligned
+                    }
+                }
+            }
         }
         let resp = if resp.hovered() {
             resp.on_hover_cursor(CursorIcon::Grab)

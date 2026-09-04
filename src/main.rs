@@ -207,7 +207,15 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ---- GUI on the main thread ----
-    let gui_app = app::MouseShareApp::new(config, layout, net, my_name, startup_error, inc_tx.clone());
+    let gui_app = app::MouseShareApp::new(
+        config,
+        layout,
+        net,
+        my_name,
+        startup_error,
+        inc_tx.clone(),
+        ctrl.clone(),
+    );
 
     // Window icon: the bundled mouse logo. Without this a bare (non-.app) binary shows the
     // generic executable icon in the Dock / title bar; the .app bundle still gets AppIcon.icns
@@ -266,7 +274,10 @@ fn main() -> anyhow::Result<()> {
 /// Within this distance of the bbox edge the cursor counts as pinned against it.
 const EDGE_PIN: f64 = 2.0;
 /// A remote counts as attached just beyond an edge when its gap is within this distance.
-const EDGE_ATTACH: f64 = 4.0;
+/// Generous on purpose: hand-dragging a tile in the canvas cannot reliably hit a 4px window,
+/// and a silent miss disables crossing entirely. A moderate gap is harmless — the hand-off
+/// only needs to know which neighbour lies beyond the edge.
+const EDGE_ATTACH: f64 = 60.0;
 /// After a pin, pull the cursor this far back inside so the next push produces fresh events.
 const BOUNCE_IN: f64 = 12.0;
 /// Outward pushes needed (within `PIN_WINDOW_MS`) before control is handed off.
