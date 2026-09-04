@@ -14,6 +14,7 @@
 - 🖱️ 跨平台鼠标 / 键盘共享（基于 [rdev](https://github.com/Narsil/rdev)）
 - 📋 剪贴板双向同步（基于 [arboard](https://github.com/1Password/arboard)，带回环抑制）
 - 🖥️ 可拖拽的屏幕布局（基于 [egui](https://github.com/emilk/egui)），所见即所得
+- 🌍 **中文 / English 界面一键切换**（标题栏右上角，选择会保存；含启动错误提示）
 - 🔢 **客户端数量无上限**：从机连上 Primary 后，自动登记为布局里的一块屏幕，无需手动添加
 - 📑 布局里可**一键复制 / 删除**任意屏幕，快速搭好多机布局
 - 📎 Primary 界面可**一键复制连接地址**（`host:port`），直接粘给新机器填
@@ -92,6 +93,14 @@ cargo build --release
 
 - **macOS**：需要授予**辅助功能**权限 —— 系统设置 → 隐私与安全性 → 辅助功能 → 打开 MouseShare 开关（添加后需重启应用）。
 - **Linux**：必须在 **X11** 会话下运行，Wayland 下无法捕获全局输入。
+
+### 本地 `cargo run`（debug 构建）在 macOS 上启动即崩溃？
+
+macOS 的 debug 构建会在启动时 panic（objc2/winit 的 Objective-C 方法签名运行时校验，报 `expected return to have type code 'q', but found 'Q'`）。这是调试校验问题，**不影响 release 构建**。本地体验请用：
+
+```bash
+cargo build --release && ./target/release/mouseshare
+```
 
 ## 已知限制 / 后续可优化
 

@@ -18,6 +18,7 @@ mod network;
 mod protocol;
 
 use crate::config::{load_config, Config};
+use crate::i18n::Lang;
 use crate::layout::Layout;
 use crate::network::{connect_client, start_hub, Net};
 use crate::protocol::{InputEvent, Message};
@@ -48,10 +49,8 @@ fn main() -> anyhow::Result<()> {
         match start_hub(port, inc_tx.clone()) {
             Ok(n) => n,
             Err(e) => {
-                let msg = format!(
-                    "无法监听端口 {}（{}）。端口很可能已被另一个正在运行的 MouseShare 占用——请检查 Dock 或活动监视器里是否已有 MouseShare，退出后重新启动。",
-                    port, e
-                );
+                // Error text follows the UI language chosen in the config.
+                let msg = Lang::from_code(&config.lang).listen_fail(port, e);
                 log::error!("{}", msg);
                 startup_error = Some(msg);
                 Net::idle()
@@ -70,10 +69,7 @@ fn main() -> anyhow::Result<()> {
                 n
             }
             Err(e) => {
-                let msg = format!(
-                    "无法连接到主机 {}（{}）。请确认主机上的 MouseShare 已启动、地址正确、防火墙未拦截；可在左侧修改地址后保存并重启。",
-                    server_addr, e
-                );
+                let msg = Lang::from_code(&config.lang).connect_fail(&server_addr, e);
                 log::error!("{}", msg);
                 startup_error = Some(msg);
                 Net::idle()

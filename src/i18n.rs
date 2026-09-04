@@ -42,6 +42,34 @@ impl Lang {
             Lang::En => Lang::Zh,
         }
     }
+
+    /// Startup error: the primary could not bind its listen port.
+    pub fn listen_fail(self, port: u16, err: impl std::fmt::Display) -> String {
+        match self {
+            Lang::Zh => format!(
+                "无法监听端口 {}（{}）。端口很可能已被另一个正在运行的 MouseShare 占用——请检查 Dock 或活动监视器里是否已有 MouseShare，退出后重新启动。",
+                port, err
+            ),
+            Lang::En => format!(
+                "Cannot listen on port {} ({}). The port is most likely taken by another running MouseShare — check the Dock / Activity Monitor, quit it, then start again.",
+                port, err
+            ),
+        }
+    }
+
+    /// Startup error: a secondary could not reach the primary.
+    pub fn connect_fail(self, addr: &str, err: impl std::fmt::Display) -> String {
+        match self {
+            Lang::Zh => format!(
+                "无法连接到主机 {}（{}）。请确认主机上的 MouseShare 已启动、地址正确、防火墙未拦截；可在左侧修改地址后保存并重启。",
+                addr, err
+            ),
+            Lang::En => format!(
+                "Cannot connect to primary {} ({}). Make sure MouseShare is running on the primary, the address is correct, and no firewall is blocking it. Fix the address on the left, save, then restart.",
+                addr, err
+            ),
+        }
+    }
 }
 
 /// All user-facing UI strings.
