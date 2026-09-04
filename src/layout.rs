@@ -13,6 +13,18 @@ pub struct Screen {
     /// Screen size in pixels.
     pub w: u32,
     pub h: u32,
+    /// `true` for a display that physically belongs to *this* machine (the primary's own
+    /// monitors). Input landing on a local screen is never forwarded — the real cursor is
+    /// already there. `false` marks a remote (secondary) screen, which receives injected input.
+    /// This flag (rather than comparing `name` to `primary_name`) is what lets the primary have
+    /// more than one local display: every one of its monitors is `is_local = true` while still
+    /// carrying a unique `name`.
+    #[serde(default = "default_is_local")]
+    pub is_local: bool,
+}
+
+fn default_is_local() -> bool {
+    true
 }
 
 impl Screen {
@@ -63,10 +75,37 @@ impl Layout {
         self.screens.iter().position(|s| s.name == name)
     }
 
-    /// Ensure a screen named `name` exists, adding it (placed to the right of the rightmost
-    /// existing screen) only if absent. Returns true when a new screen was created.
-    /// Used to auto-register every secondary that connects, so the client count is unbounded.
-    pub fn ensure_screen(&mut self, name: &str, w: u32, h: u32) -> bool {
+    /// Axis-aligned bounding box (left, top, right, bottom) of every `is_local` screen, in
+    /// virtual-desktop coordinates. `None` when there is no local screen (shouldn't happen on a
+    /// running primary, but the caller can fall back to a single screen).
+    pub fn local_bbox(&self) -> Option<(f64, f64, f64, f64)> {
+        let mut it = self.screens.iter().filter(|s| s.is_local);
+        let first = it.next()?;
+        let (mut l, mut t, mut r, mut b) = (
+            first.ox as f64,
+            first.oy as f64,
+            first.ox as f64 + first.w as f64,
+            first.oy as f64 + first.h as f64,
+        );
+        for s in it {
+            l = l.min(s.ox as f64);
+            t = t.min(s.oy as f64);
+            r = r.max(s.ox as f64 + s.w as f64);
+            b = b.max(s.oy as f64 + s.h as f64);
+        }
+        Some((l, t, r, b))
+    }
+
+    /// Ensure a screen named `name` exists, adding it (placed *adjacent* to the right of the
+    /// current rightmost screen — no gap) only if absent. Returns true when a new screen was
+    /// created. Used to auto-register every secondary that connects, so the client count is
+    /// unbounded.
+    ///
+    /// Placing the new screen flush against the existing extent (instead of leaving a 40px dead
+    /// band) is what makes cursor hand-off possible: the virtual cursor advances continuously and
+    /// steps straight from the last local pixel into the first remote pixel, so `screen_at` finds
+    /// the remote screen instead of a gap that `clamp` would snap back.
+    pub fn ensure_screen(&mut self, name: &str, w: u32, h: u32, is_local: bool) -> bool {
         if self.index_of(name).is_some() {
             return false;
         }
@@ -78,10 +117,11 @@ impl Layout {
             .unwrap_or(0);
         self.screens.push(Screen {
             name: name.to_string(),
-            ox: if self.screens.is_empty() { 0 } else { max_x + 40 },
+            ox: if self.screens.is_empty() { 0 } else { max_x },
             oy: 0,
             w,
             h,
+            is_local,
         });
         true
     }
@@ -105,6 +145,7 @@ impl Layout {
                 oy: src.oy,
                 w: src.w,
                 h: src.h,
+                is_local: src.is_local,
             });
         }
     }

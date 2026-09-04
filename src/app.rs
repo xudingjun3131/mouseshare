@@ -441,12 +441,12 @@ impl eframe::App for MouseShareApp {
                         oy: 0,
                         w: 1920,
                         h: 1080,
+                        is_local: true,
                     });
                 }
                 draw_layout(
                     ui,
                     &mut layout,
-                    &self.config.primary_name,
                     &self.config.name,
                     t,
                     theme,
@@ -604,6 +604,7 @@ impl MouseShareApp {
                     oy: 0,
                     w: 1920,
                     h: 1080,
+                    is_local: false,
                 });
             }
         });
@@ -702,7 +703,6 @@ fn draw_mouse_icon(p: &egui::Painter, rect: Rect, color: Color32) {
 fn draw_layout(
     ui: &mut egui::Ui,
     layout: &mut Layout,
-    primary_name: &str,
     my_name: &str,
     t: Tr,
     theme: UiTheme,
@@ -733,7 +733,7 @@ fn draw_layout(
         let h = s.h as f32 * scale;
         let rect = Rect::from_min_size(pos2(x, y), vec2(w, h));
 
-        let is_primary = s.name == primary_name;
+        let is_primary = s.is_local;
         let is_me = s.name == my_name;
         let resp = ui.interact(rect, Id::new(("screen", &s.name)), Sense::drag());
         if resp.dragged() {

@@ -156,7 +156,7 @@ fn handle_primary_conn(
     log::info!("secondary connected: {}", name);
 
     // Register the peer's screen (idempotent) so the layout we push already includes it.
-    layout.lock().unwrap().ensure_screen(&name, width, height);
+    layout.lock().unwrap().ensure_screen(&name, width, height, false);
 
     let (tx, rx) = channel::<Message>();
     peers.lock().unwrap().insert(name.clone(), tx.clone());

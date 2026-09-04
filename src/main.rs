@@ -61,7 +61,14 @@ fn main() -> anyhow::Result<()> {
 
     // Shared layout state (used by the hub to push screens to secondaries, by the incoming
     // handler to register peers, and by the capture thread for cursor hand-off).
-    let layout: Arc<Mutex<Layout>> = Arc::new(Mutex::new(config.layout.clone()));
+    // The primary's layout starts from its *real* displays (so a multi-monitor Mac shows every
+    // screen and the cursor roams between them natively); secondaries adopt the layout the
+    // primary pushes once connected.
+    let layout: Arc<Mutex<Layout>> = Arc::new(Mutex::new(if mode == "primary" {
+        detect_primary_layout(&primary_name)
+    } else {
+        config.layout.clone()
+    }));
 
     let net: Arc<Mutex<Net>> = if mode == "primary" {
         match start_hub(port, inc_tx.clone(), layout.clone()) {
@@ -131,7 +138,7 @@ fn main() -> anyhow::Result<()> {
                         // Auto-register every secondary as a screen so the client count is
                         // unbounded — no manual layout editing required to add more machines.
                         if mode2 == "primary" {
-                            if layout.lock().unwrap().ensure_screen(&name, width, height) {
+                            if layout.lock().unwrap().ensure_screen(&name, width, height, false) {
                                 info!("auto-registered screen for peer {}", name);
                             }
                         }
@@ -269,23 +276,29 @@ fn handle_capture(
             };
 
             if let Some(idx) = owning_idx {
-                let (name, ox, oy) = {
+                let (name, ox, oy, is_local) = {
                     let l = layout.lock().unwrap();
                     let s = &l.screens[idx];
-                    (s.name.clone(), s.ox as f64, s.oy as f64)
+                    (s.name.clone(), s.ox as f64, s.oy as f64, s.is_local)
                 };
                 *ownership.lock().unwrap() = name.clone();
-                if name != primary_name {
+                if !is_local {
+                    // Remote screen: inject the absolute position *inside* that screen.
                     net.lock()
                         .unwrap()
                         .send_input(&name, InputEvent::MouseMove { x: cx - ox, y: cy - oy });
                 }
+                // Local screen: the real cursor is already there — nothing to inject. This is what
+                // lets the primary's own multiple monitors work: every one is `is_local`, so the
+                // cursor roams between them natively without any forwarding.
             } else {
-                // In a gap: keep forwarding to the current owner (clamped).
+                // In a gap: keep forwarding to the current owner (clamped). Only matters when a
+                // screen was dragged away leaving a dead band — normally the secondary sits flush
+                // against the local bbox, so the cursor never lands here.
                 let cur = ownership.lock().unwrap().clone();
-                if cur != primary_name {
-                    let l = layout.lock().unwrap();
-                    if let Some(s) = l.screens.iter().find(|s| s.name == cur) {
+                let l = layout.lock().unwrap();
+                if let Some(s) = l.screens.iter().find(|s| s.name == cur) {
+                    if !s.is_local {
                         let (gx, gy) = l.clamp(cx, cy);
                         net.lock().unwrap().send_input(
                             &cur,
@@ -297,45 +310,79 @@ fn handle_capture(
                     }
                 }
                 let mut vc = vcursor.lock().unwrap();
-                *vc = layout.lock().unwrap().clamp(cx, cy);
+                *vc = l.clamp(cx, cy);
             }
 
-            // Treadmill: when multiple screens exist and the real cursor is shoved against an
-            // edge while still moving outward, warp it to the opposite edge so it keeps producing
-            // motion — that motion is what carries the virtual cursor onto the neighbour.
-            let recycle = layout.lock().unwrap().screens.len() > 1;
-            if recycle && (d.0 != 0.0 || d.1 != 0.0) {
-                let (pw, ph) = {
-                    let l = layout.lock().unwrap();
-                    let s = l.index_of(primary_name).and_then(|i| l.screens.get(i));
-                    s.map(|s| (s.w as f64, s.h as f64)).unwrap_or((1920.0, 1080.0))
-                };
-                let margin = 4.0;
-                let near_right = x >= pw - margin;
-                let near_left = x <= margin;
-                let near_bottom = y >= ph - margin;
-                let near_top = y <= margin;
-                let pushing_out = (near_right && d.0 > 0.0)
-                    || (near_left && d.0 < 0.0)
-                    || (near_bottom && d.1 > 0.0)
-                    || (near_top && d.1 < 0.0);
-                if pushing_out {
-                    let nx = if near_right {
-                        margin
-                    } else if near_left {
-                        pw - margin
-                    } else {
-                        x
-                    };
-                    let ny = if near_bottom {
-                        margin
-                    } else if near_top {
-                        ph - margin
-                    } else {
-                        y
-                    };
-                    input::warp_cursor(nx, ny);
-                    *last_real.lock().unwrap() = (nx, ny);
+            // Treadmill: keep the physical cursor producing motion once it hits an edge of the
+            // primary's own (local) bounding box while still pushing outward, so the virtual cursor
+            // can keep marching onto the neighbouring remote screen. We only warp on an edge that
+            // actually has a remote screen just beyond it, and we warp the real cursor to the
+            // *opposite* edge of the local bbox so it stays on the primary. Without this, the OS
+            // would clamp the real cursor at the display edge and the virtual cursor would stall.
+            let l = layout.lock().unwrap();
+            if l.screens.len() > 1 {
+                // Is the real cursor currently on one of the primary's own (local) screens?
+                if let Some(local_idx) = l.screen_at(x, y).filter(|&i| l.screens[i].is_local) {
+                    let ls = &l.screens[local_idx];
+                    let bbox = l.local_bbox().unwrap_or((
+                        ls.ox as f64,
+                        ls.oy as f64,
+                        ls.ox as f64 + ls.w as f64,
+                        ls.oy as f64 + ls.h as f64,
+                    ));
+                    let (bb_left, bb_top, bb_right, bb_bottom) = bbox;
+                    let margin = 4.0;
+                    let near_right = x >= bb_right - margin;
+                    let near_left = x <= bb_left + margin;
+                    let near_bottom = y >= bb_bottom - margin;
+                    let near_top = y <= bb_top + margin;
+                    // Is there a remote screen just beyond each edge (overlapping on the crossing axis)?
+                    let remote_right = l.screens.iter().any(|s| {
+                        !s.is_local
+                            && (s.ox as f64) >= bb_right - 2.0
+                            && (s.ox as f64) <= bb_right + 120.0
+                            && overlap_y(s, bb_top, bb_bottom)
+                    });
+                    let remote_left = l.screens.iter().any(|s| {
+                        !s.is_local
+                            && ((s.ox + s.w as i32) as f64) <= bb_left + 2.0
+                            && ((s.ox + s.w as i32) as f64) >= bb_left - 120.0
+                            && overlap_y(s, bb_top, bb_bottom)
+                    });
+                    let remote_bottom = l.screens.iter().any(|s| {
+                        !s.is_local
+                            && (s.oy as f64) >= bb_bottom - 2.0
+                            && (s.oy as f64) <= bb_bottom + 120.0
+                            && overlap_x(s, bb_left, bb_right)
+                    });
+                    let remote_top = l.screens.iter().any(|s| {
+                        !s.is_local
+                            && ((s.oy + s.h as i32) as f64) <= bb_top + 2.0
+                            && ((s.oy + s.h as i32) as f64) >= bb_top - 120.0
+                            && overlap_x(s, bb_left, bb_right)
+                    });
+                    let pushing_out = (remote_right && near_right && d.0 > 0.0)
+                        || (remote_left && near_left && d.0 < 0.0)
+                        || (remote_bottom && near_bottom && d.1 > 0.0)
+                        || (remote_top && near_top && d.1 < 0.0);
+                    if pushing_out {
+                        let nx = if remote_right {
+                            bb_left + margin
+                        } else if remote_left {
+                            bb_right - margin
+                        } else {
+                            x
+                        };
+                        let ny = if remote_bottom {
+                            bb_top + margin
+                        } else if remote_top {
+                            bb_bottom - margin
+                        } else {
+                            y
+                        };
+                        input::warp_cursor(nx, ny);
+                        *last_real.lock().unwrap() = (nx, ny);
+                    }
                 }
             }
         }
@@ -386,5 +433,86 @@ fn forward_button(
             }
         };
         net.lock().unwrap().send_input(&target, ev);
+    }
+}
+
+/// Do two screen vertical ranges overlap? Used to decide whether a remote screen sits just
+/// beyond the local bbox's left/right edge (so the treadmill may engage on that edge).
+fn overlap_y(s: &crate::layout::Screen, top: f64, bottom: f64) -> bool {
+    let st = s.oy as f64;
+    let sb = s.oy as f64 + s.h as f64;
+    st < bottom && sb > top
+}
+
+/// Do two screen horizontal ranges overlap? Used for the top/bottom edges.
+fn overlap_x(s: &crate::layout::Screen, left: f64, right: f64) -> bool {
+    let sl = s.ox as f64;
+    let sr = s.ox as f64 + s.w as f64;
+    sl < right && sr > left
+}
+
+/// Build the primary's initial layout from the machine's real displays.
+///
+/// On macOS this enumerates every attached screen via `display-info` (Core Graphics), placing each
+/// at its true virtual-desktop position — so a Mac with two monitors shows both and the cursor can
+/// roam between them natively (each is `is_local = true`). Coordinates come from `CGDisplayBounds`,
+/// whose global display space (origin top-left of the main display, y down) matches the cursor
+/// coordinates `rdev` reports on macOS, so the layout lines up with reality. On other platforms, or
+/// if enumeration fails, we fall back to a single 1080p screen at the origin. Remote (secondary)
+/// screens are added later as peers connect (see `Layout::ensure_screen`).
+fn detect_primary_layout(primary_name: &str) -> Layout {
+    #[cfg(target_os = "macos")]
+    {
+        match display_info::DisplayInfo::all() {
+            Ok(displays) if !displays.is_empty() => {
+                // Stable left-to-right, then top-to-bottom order. The main display keeps the bare
+                // `primary_name`; the rest get a "#n" suffix (every local screen needs a unique
+                // name, but all share `is_local = true` so none of them is ever forwarded).
+                let mut d: Vec<_> = displays.into_iter().collect();
+                d.sort_by(|a, b| a.x.cmp(&b.x).then_with(|| a.y.cmp(&b.y)));
+                let mut screens = Vec::with_capacity(d.len());
+                for (i, disp) in d.iter().enumerate() {
+                    let name = if disp.is_primary || i == 0 {
+                        primary_name.to_string()
+                    } else {
+                        format!("{} #{}", primary_name, i + 1)
+                    };
+                    screens.push(crate::layout::Screen {
+                        name,
+                        ox: disp.x,
+                        oy: disp.y,
+                        w: disp.width,
+                        h: disp.height,
+                        is_local: true,
+                    });
+                }
+                info!(
+                    "detected {} display(s) on primary: {}",
+                    screens.len(),
+                    screens
+                        .iter()
+                        .map(|s| format!("{} {}x{}@({},{}))", s.name, s.w, s.h, s.ox, s.oy))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return Layout { screens };
+            }
+            Ok(_) => log::warn!("no displays reported; falling back to a single 1080p screen"),
+            Err(e) => log::warn!("display enumeration failed ({}); falling back to single screen", e),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = primary_name;
+    }
+    Layout {
+        screens: vec![crate::layout::Screen {
+            name: primary_name.to_string(),
+            ox: 0,
+            oy: 0,
+            w: 1920,
+            h: 1080,
+            is_local: true,
+        }],
     }
 }

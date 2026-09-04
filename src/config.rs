@@ -43,6 +43,7 @@ impl Default for Config {
                     oy: 0,
                     w: 1920,
                     h: 1080,
+                    is_local: true,
                 }],
             },
             primary_name: host,
