@@ -46,9 +46,9 @@ pub fn warp_cursor(x: f64, y: f64) {
 ///
 /// While the OS pins the cursor against a display edge it may deliver no motion events at
 /// all (or only zero-delta echoes), which makes a purely event-driven edge-crossing
-/// unreliable. The edge-rest poller samples this instead: same Core Graphics global space
-/// (`CGEventGetLocation`, origin = top-left of the main display, y down) that rdev reports
-/// for motion events, so the coordinates are interchangeable.
+/// unreliable. The remote-motion driver (src/drive.rs) samples this instead: same Core
+/// Graphics global space (`CGEventGetLocation`, origin = top-left of the main display, y
+/// down) that rdev reports for motion events, so the coordinates are interchangeable.
 #[cfg(target_os = "macos")]
 pub fn cursor_position() -> Option<(f64, f64)> {
     use core_graphics::event::CGEvent;
@@ -59,8 +59,70 @@ pub fn cursor_position() -> Option<(f64, f64)> {
     Some((p.x, p.y))
 }
 
-/// Non-macOS: no direct sampler wired up yet; the event stream is the only source.
-#[cfg(not(target_os = "macos"))]
+/// Windows: `GetCursorPos` in virtual-desktop coordinates. The process is declared
+/// per-monitor DPI aware at startup (see main), so these are *physical* pixels — the same
+/// space `MOUSEEVENTF_ABSOLUTE` injection normalises against.
+#[cfg(target_os = "windows")]
+pub fn cursor_position() -> Option<(f64, f64)> {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetCursorPos(lp_point: *mut Point) -> i32;
+    }
+    let mut p = Point { x: 0, y: 0 };
+    let ok = unsafe { GetCursorPos(&mut p) };
+    if ok != 0 {
+        Some((p.x as f64, p.y as f64))
+    } else {
+        None
+    }
+}
+
+/// Linux/X11: `XQueryPointer` on the default root window. Returns `None` when there is no
+/// X display (e.g. a Wayland session) — the driver then falls back to the event stream.
+#[cfg(target_os = "linux")]
+pub fn cursor_position() -> Option<(f64, f64)> {
+    use x11_dl::xlib::{Xlib, XRootWindow};
+    let xlib = Xlib::open().ok()?;
+    unsafe {
+        let display = (xlib.XOpenDisplay)(std::ptr::null());
+        if display.is_null() {
+            return None;
+        }
+        let root = (xlib.XRootWindow)(display, 0);
+        let mut root_ret = 0u64;
+        let mut child_ret = 0u64;
+        let mut rx = 0i32;
+        let mut ry = 0i32;
+        let mut wx = 0i32;
+        let mut wy = 0i32;
+        let mut mask = 0u32;
+        let ok = (xlib.XQueryPointer)(
+            display,
+            root,
+            &mut root_ret,
+            &mut child_ret,
+            &mut rx,
+            &mut ry,
+            &mut wx,
+            &mut wy,
+            &mut mask,
+        );
+        (xlib.XCloseDisplay)(display);
+        if ok != 0 {
+            Some((rx as f64, ry as f64))
+        } else {
+            None
+        }
+    }
+}
+
+/// Other platforms: no direct sampler wired up.
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn cursor_position() -> Option<(f64, f64)> {
     None
 }

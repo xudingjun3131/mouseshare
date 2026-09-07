@@ -34,6 +34,11 @@ struct UiTheme {
     canvas_muted: Color32,
     accent: Color32,
     hairline: Color32,
+    /// Canvas dot-grid colour — barely-there texture so the virtual desktop does not read as
+    /// one flat slab of colour.
+    grid: Color32,
+    /// Shadow cast by a screen tile, plus the halo drawn around it while hovering/dragging.
+    shadow: Color32,
 }
 
 impl UiTheme {
@@ -46,6 +51,8 @@ impl UiTheme {
                 canvas_muted: Color32::from_rgb(150, 150, 157),
                 accent: Color32::from_rgb(10, 132, 255),
                 hairline: Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+                grid: Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+                shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 96),
             }
         } else {
             UiTheme {
@@ -54,8 +61,95 @@ impl UiTheme {
                 canvas_muted: Color32::from_rgb(142, 142, 147),
                 accent: Color32::from_rgb(0, 122, 255),
                 hairline: Color32::from_rgba_unmultiplied(0, 0, 0, 12),
+                grid: Color32::from_rgba_unmultiplied(0, 0, 0, 26),
+                shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 40),
             }
         }
+    }
+}
+
+// ---- Canvas drawing helpers -----------------------------------------------------------
+//
+// egui has no gradient or shadow primitives, so a few small painters do the work. They are
+// cheap (a couple of dozen rects per tile) and keep the canvas looking like a designed
+// surface rather than flat coloured boxes.
+
+/// Linear blend between two colours.
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t) as u8;
+    Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
+}
+
+/// Fill a rounded rect with a vertical gradient.
+///
+/// Drawn as horizontal bands with per-corner radii (top band rounds the top corners, bottom
+/// band rounds the bottom ones, middle bands stay square) — that is what makes the result a
+/// *rounded* gradient rect instead of a rectangle with gradient stripes over it.
+fn fill_gradient(painter: &egui::Painter, rect: Rect, radius: f32, top: Color32, bottom: Color32) {
+    let steps = rect.height().max(8.0) / 4.0; // one band per ~4 px
+    let steps = steps.clamp(4.0, 40.0) as i32;
+    let band = rect.height() / steps as f32;
+    for i in 0..steps {
+        let t = i as f32 / (steps - 1).max(1) as f32;
+        let r = egui::CornerRadius {
+            nw: if i == 0 { radius as u8 } else { 0 },
+            ne: if i == 0 { radius as u8 } else { 0 },
+            sw: if i == steps - 1 { radius as u8 } else { 0 },
+            se: if i == steps - 1 { radius as u8 } else { 0 },
+        };
+        painter.rect_filled(
+            Rect::from_min_size(
+                pos2(rect.min.x, rect.min.y + i as f32 * band),
+                vec2(rect.width(), band + 0.8), // overlap kills seams between bands
+            ),
+            r,
+            mix(top, bottom, t),
+        );
+    }
+}
+
+/// Layered soft shadow: a few progressively wider, fainter rounded rects pushed downward.
+/// Reads far closer to a real drop shadow than a single hard offset rect.
+fn soft_shadow(painter: &egui::Painter, rect: Rect, radius: f32, color: Color32, lift: f32) {
+    let layers = 5;
+    for i in 1..=layers {
+        let f = i as f32 / layers as f32;
+        let spread = 2.0 + f * 10.0 * lift;
+        let alpha = (color.a() as f32 * (1.0 - f) * 0.34) as u8;
+        if alpha == 0 {
+            continue;
+        }
+        painter.rect_filled(
+            rect.expand(spread).translate(vec2(0.0, f * 7.0 * lift)),
+            egui::CornerRadius::same((radius + spread) as u8),
+            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha),
+        );
+    }
+}
+
+/// Dot grid over the canvas — texture without visual noise.
+fn dot_grid(painter: &egui::Painter, rect: Rect, color: Color32) {
+    const STEP: f32 = 26.0;
+    let mut y = rect.min.y + STEP;
+    while y < rect.max.y {
+        let mut x = rect.min.x + STEP;
+        while x < rect.max.x {
+            painter.circle_filled(pos2(x, y), 1.1, color);
+            x += STEP;
+        }
+        y += STEP;
+    }
+}
+
+/// Tile gradient pair for a screen role: (top, bottom).
+fn tile_colors(is_primary: bool, is_me: bool) -> (Color32, Color32) {
+    if is_primary {
+        (Color32::from_rgb(90, 165, 255), Color32::from_rgb(0, 92, 214))
+    } else if is_me {
+        (Color32::from_rgb(96, 219, 130), Color32::from_rgb(24, 160, 74))
+    } else {
+        (Color32::from_rgb(158, 158, 167), Color32::from_rgb(88, 88, 98))
     }
 }
 
@@ -150,11 +244,20 @@ pub fn setup_fonts(ctx: &egui::Context) {
 /// Colors stay theme-driven; the canvas derives its own palette in `UiTheme`.
 pub fn setup_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = vec2(10.0, 10.0);
-    style.spacing.button_padding = vec2(14.0, 7.0);
+    let dark = style.visuals.dark_mode;
+
+    // Rhythm: generous, consistent spacing is most of what makes a UI feel designed.
+    style.spacing.item_spacing = vec2(10.0, 11.0);
+    style.spacing.button_padding = vec2(15.0, 8.0);
     style.spacing.menu_margin = egui::Margin::same(8);
-    style.spacing.indent = 14.0;
-    // Uniform control rounding across buttons / inputs / radios — the macOS look (squircle-ish).
+    style.spacing.indent = 16.0;
+    style.spacing.window_margin = egui::Margin::same(0);
+    // Text never gets cramped inside a field.
+    style.spacing.text_edit_width = 220.0;
+    style.spacing.combo_width = 220.0;
+    style.spacing.scroll.bar_width = 8.0;
+
+    // Uniform control rounding — the macOS squircle look.
     for w in [
         &mut style.visuals.widgets.inactive,
         &mut style.visuals.widgets.hovered,
@@ -162,9 +265,33 @@ pub fn setup_style(ctx: &egui::Context) {
         &mut style.visuals.widgets.open,
         &mut style.visuals.widgets.noninteractive,
     ] {
-        w.corner_radius = egui::CornerRadius::same(8);
+        w.corner_radius = egui::CornerRadius::same(10);
+        // A hairline on every control keeps the panel from looking like a wall of flat fills.
+        w.bg_stroke = egui::Stroke::new(
+            1.0_f32,
+            if dark {
+                Color32::from_white_alpha(26)
+            } else {
+                Color32::from_black_alpha(20)
+            },
+        );
     }
+    style.visuals.widgets.hovered.expansion = 0.0;
+    style.visuals.widgets.active.expansion = 0.0;
+
+    // Slightly tinted panel background so the sidebar reads as a distinct surface from the
+    // central canvas instead of merging into it.
+    style.visuals.panel_fill = if dark {
+        Color32::from_rgb(24, 24, 29)
+    } else {
+        Color32::from_rgb(249, 249, 252)
+    };
+    style.visuals.window_fill = style.visuals.panel_fill;
     style.visuals.window_stroke = egui::Stroke::NONE;
+
+    // Softer scrollbar that fades rather than shouts.
+    style.visuals.handle_shape = egui::style::HandleShape::Circle;
+
     ctx.set_style(style);
 }
 
@@ -832,6 +959,12 @@ fn draw_layout(
     // while they are dragged (the cursor can only cross when a remote sits at the edge).
     let lbb = layout.local_bbox();
 
+    // Canvas texture: a faint dot grid so the empty area reads as a surface, not a void.
+    dot_grid(ui.painter(), canvas_rect, theme.grid);
+
+    // The tile currently being dragged, painted last so it floats above the others.
+    let mut dragged: Option<(Rect, bool, bool, String, (u32, u32), f32)> = None;
+
     for s in layout.screens.iter_mut() {
         let x = offx + s.ox as f32 * scale;
         let y = offy + s.oy as f32 * scale;
@@ -877,65 +1010,67 @@ fn draw_layout(
         } else {
             resp
         };
+        let hover = resp.hovered() || resp.dragged();
 
-        let fill = if is_primary {
-            COL_PRIMARY
-        } else if is_me {
-            COL_ME
-        } else {
-            COL_CLIENT
-        };
-        let stroke = if resp.hovered() || resp.dragged() {
-            Color32::from_white_alpha(235)
-        } else {
-            Color32::from_white_alpha(120)
-        };
-
-        // Soft drop shadow, then the tile.
-        ui.painter().rect_filled(
-            rect.translate(vec2(0.0, 6.0)),
-            12.0,
-            Color32::from_black_alpha(70),
-        );
-        ui.painter().rect_filled(rect, 12.0, fill);
-        // Top sheen for a bit of depth.
-        ui.painter().rect_filled(
-            Rect::from_min_size(rect.min, vec2(rect.width(), rect.height().min(14.0))),
-            12.0,
-            Color32::from_white_alpha(28),
-        );
-        ui.painter().rect_stroke(rect, egui::CornerRadius::same(12), (1.5, stroke), egui::StrokeKind::Inside);
-
-        if w > 56.0 && h > 40.0 {
-            let title = if is_primary {
-                format!("★ {}", s.name)
-            } else {
-                s.name.clone()
-            };
-            let cy = rect.center().y;
-            let title_y = if h > 76.0 { cy - 12.0 } else { cy };
-            ui.painter().text(
-                pos2(rect.center().x, title_y),
-                Align2::CENTER_CENTER,
-                &title,
-                FontId::proportional(15.5),
-                Color32::WHITE,
-            );
-            if h > 76.0 {
-                ui.painter().text(
-                    pos2(rect.center().x, cy + 12.0),
-                    Align2::CENTER_CENTER,
-                    &if s.physical_size() != (s.w, s.h) {
-                        format!("{}×{} @{}x", s.w, s.h, s.scale)
-                    } else {
-                        format!("{}×{}", s.w, s.h)
-                    },
-                    FontId::proportional(12.0),
-                    Color32::from_white_alpha(210),
-                );
-            }
+        let (top, bottom) = tile_colors(is_primary, is_me);
+        // A dragged tile is deferred to the end of the loop so it floats above the others
+        // instead of sliding underneath them.
+        if resp.dragged() {
+            dragged = Some((
+                rect,
+                is_primary,
+                is_me,
+                s.name.clone(),
+                s.physical_size(),
+                s.scale,
+            ));
+            continue;
         }
+        soft_shadow(
+            ui.painter(),
+            rect,
+            16.0,
+            theme.shadow,
+            if hover { 1.3 } else { 1.0 },
+        );
+        paint_tile(
+            ui.painter(),
+            rect,
+            &s.name,
+            s.physical_size(),
+            s.scale,
+            is_primary,
+            is_me,
+            hover,
+            theme,
+            top,
+            bottom,
+        );
     }
+
+    // The actively dragged tile, painted on top of everything.
+    if let Some((rect, is_primary, is_me, name, phys, sc)) = dragged {
+        let (top, bottom) = tile_colors(is_primary, is_me);
+        soft_shadow(ui.painter(), rect, 16.0, theme.shadow, 2.0);
+        paint_tile(
+            ui.painter(),
+            rect,
+            &name,
+            phys,
+            sc,
+            is_primary,
+            is_me,
+            true,
+            theme,
+            top,
+            bottom,
+        );
+    }
+
+    // Shared edges: where this machine's displays meet a secondary's, the cursor can cross.
+    // Making them visible turns "why can't I cross?" into something you can see at a glance —
+    // a missing or misaligned shared edge is the usual answer.
+    paint_shared_edges(ui.painter(), layout, offx, offy, scale, theme);
 
     // Live cursor dot: the control plane's idea of where the real cursor is. While you move
     // the mouse on this machine the dot must track it 1:1 — if it doesn't (or sits elsewhere)
@@ -963,6 +1098,147 @@ fn draw_layout(
         theme.canvas_muted,
     );
     changed
+}
+
+/// Paint one screen tile: a gradient "monitor" with an inset glass area, a specular top
+/// edge, and the machine name / resolution inside.
+#[allow(clippy::too_many_arguments)]
+fn paint_tile(
+    painter: &egui::Painter,
+    rect: Rect,
+    name: &str,
+    phys: (u32, u32),
+    scale: f32,
+    is_primary: bool,
+    is_me: bool,
+    hover: bool,
+    theme: UiTheme,
+    top: Color32,
+    bottom: Color32,
+) {
+    const R: f32 = 16.0;
+    fill_gradient(painter, rect, R, top, bottom);
+
+    // Inset "glass" panel — the part that reads as the actual display.
+    let inset = rect.shrink(9.0);
+    if inset.width() > 4.0 && inset.height() > 4.0 {
+        painter.rect_filled(
+            inset,
+            egui::CornerRadius::same(9),
+            Color32::from_white_alpha(if hover { 30 } else { 18 }),
+        );
+    }
+
+    // Specular highlight along the top edge.
+    let sheen = Rect::from_min_size(rect.min, vec2(rect.width(), rect.height().min(3.0)));
+    painter.rect_filled(
+        sheen,
+        egui::CornerRadius { nw: R as u8, ne: R as u8, sw: 0, se: 0 },
+        Color32::from_white_alpha(55),
+    );
+
+    // Border: subtle normally, a bright accent halo while hovered/dragged.
+    let stroke = if hover {
+        (2.5, Color32::from_white_alpha(235))
+    } else {
+        (1.0, Color32::from_white_alpha(70))
+    };
+    painter.rect_stroke(rect, egui::CornerRadius::same(R as u8), stroke, egui::StrokeKind::Inside);
+    if hover {
+        painter.rect_stroke(
+            rect.expand(4.0),
+            egui::CornerRadius::same((R + 4.0) as u8),
+            (2.0, Color32::from_rgba_unmultiplied(theme.accent.r(), theme.accent.g(), theme.accent.b(), 150)),
+            egui::StrokeKind::Outside,
+        );
+    }
+
+    // Label: name (with a star on the primary's own displays) + resolution.
+    if rect.width() > 56.0 && rect.height() > 40.0 {
+        let title = if is_primary {
+            format!("★ {name}")
+        } else {
+            name.to_string()
+        };
+        let cy = rect.center().y;
+        let two_line = rect.height() > 76.0;
+        painter.text(
+            pos2(rect.center().x, if two_line { cy - 11.0 } else { cy }),
+            Align2::CENTER_CENTER,
+            title,
+            FontId::proportional(15.5),
+            Color32::WHITE,
+        );
+        if two_line {
+            painter.text(
+                pos2(rect.center().x, cy + 11.0),
+                Align2::CENTER_CENTER,
+                if phys != (rect.width() as u32, rect.height() as u32) && scale != 1.0 {
+                    format!("{}×{}  @{}x", phys.0, phys.1, scale)
+                } else {
+                    format!("{}×{}", phys.0, phys.1)
+                },
+                FontId::proportional(12.0),
+                Color32::from_white_alpha(215),
+            );
+        }
+        if is_me && rect.height() > 110.0 {
+            painter.text(
+                pos2(rect.center().x, rect.max.y - 16.0),
+                Align2::CENTER_CENTER,
+                "本机",
+                FontId::proportional(11.0),
+                Color32::from_white_alpha(190),
+            );
+        }
+    }
+}
+
+/// Highlight every edge where one of this machine's displays touches a secondary's — those
+/// are the only places the cursor can cross.
+fn paint_shared_edges(
+    painter: &egui::Painter,
+    layout: &Layout,
+    offx: f32,
+    offy: f32,
+    scale: f32,
+    theme: UiTheme,
+) {
+    let (ar, ag, ab) = (theme.accent.r(), theme.accent.g(), theme.accent.b());
+    for a in layout.screens.iter() {
+        if !a.is_local {
+            continue;
+        }
+        let al = a.ox as f64;
+        let at = a.oy as f64;
+        let ar_ = al + a.w as f64;
+        let ab_ = at + a.h as f64;
+        for b in layout.screens.iter() {
+            if b.is_local {
+                continue;
+            }
+            let bl = b.ox as f64;
+            let bt = b.oy as f64;
+            let br = bl + b.w as f64;
+            let bb = bt + b.h as f64;
+            // Vertical shared edge: a's right side flush with b's left (or mirrored).
+            let (ex, y0, y1) = if (ar_ - bl).abs() <= 1.0 {
+                (ar_, at.max(bt), ab_.min(bb))
+            } else if (br - al).abs() <= 1.0 {
+                (al, at.max(bt), ab_.min(bb))
+            } else {
+                continue;
+            };
+            if y1 <= y0 + 1.0 {
+                continue;
+            }
+            let x = offx + ex as f32 * scale;
+            let p0 = pos2(x, offy + y0 as f32 * scale);
+            let p1 = pos2(x, offy + y1 as f32 * scale);
+            painter.line_segment([p0, p1], (7.0, Color32::from_rgba_unmultiplied(ar, ag, ab, 55)));
+            painter.line_segment([p0, p1], (2.5, Color32::from_rgb(ar, ag, ab)));
+        }
+    }
 }
 
 fn bounds(layout: &Layout) -> (i32, i32, i32, i32) {

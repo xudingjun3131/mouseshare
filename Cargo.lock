@@ -2557,6 +2557,7 @@ dependencies = [
  "tray-icon",
  "whoami",
  "winresource",
+ "x11-dl",
 ]
 
 [[package]]

@@ -19,14 +19,13 @@
 mod app;
 mod clipboard;
 mod config;
-#[cfg(target_os = "macos")]
-mod delta;
 mod diag;
 mod i18n;
 mod input;
 mod layout;
 mod network;
 mod protocol;
+mod single_instance;
 #[cfg(target_os = "windows")]
 mod tray;
 
@@ -112,6 +111,18 @@ fn main() -> anyhow::Result<()> {
     }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Refuse to run twice. Two copies would fight over the listen port and over the input
+    // capture tap; the second one used to fail with a confusing "cannot listen" error (and on
+    // Windows, with no console attached, looked like it simply did nothing).
+    let _instance_guard = match single_instance::acquire() {
+        Some(g) => g,
+        None => {
+            single_instance::notify_already_running();
+            log::warn!("another MouseShare instance is already running; exiting");
+            return Ok(());
+        }
+    };
 
     let mut config: Config = load_config();
     let my_name = config.name.clone();
@@ -308,19 +319,18 @@ fn main() -> anyhow::Result<()> {
                 handle_capture(event, &net, &layout, &ctrl, &primary_name);
             });
         }
-        // ---- Delta tap (primary, macOS only) ----
-        // Raw hardware mouse-motion deltas. While a secondary has control, event-stream
-        // positions are clamped by the OS at display edges and starve the remote cursor;
-        // deltas bypass clamping entirely (see src/delta.rs).
-        #[cfg(target_os = "macos")]
+        // ---- Remote-motion driver (primary, all platforms) ----
+        // Samples the real cursor and runs the treadmill, so a secondary's cursor keeps
+        // receiving deltas no matter where the local cursor is pinned. This is the single
+        // motion source for remote control on every platform — it replaces the macOS-only
+        // delta tap, which left Windows and Linux primaries unable to drive a remote
+        // cursor at all.
         {
             let net = net.clone();
             let layout = layout.clone();
             let ctrl = ctrl.clone();
             let primary_name = primary_name.clone();
-            delta::start(Box::new(move |dx, dy| {
-                remote_delta(&net, &layout, &ctrl, &primary_name, dx, dy);
-            }));
+            start_remote_driver(net, layout, ctrl, primary_name);
         }
         // ---- Edge-rest poller (primary only) ----
         // A second, event-independent crossing trigger. Samples the cursor position straight
@@ -501,11 +511,6 @@ const BOUNCE_IN: f64 = 12.0;
 const PIN_THRESHOLD: u32 = 1;
 /// Pushes inside this time window accumulate toward the hand-off.
 const PIN_WINDOW_MS: u128 = 900;
-/// Max drift of the parked real cursor from the anchor before it is re-centred. The parked
-/// cursor is hidden while a secondary has control, so a generous slack costs nothing and
-/// avoids a re-centre warp on nearly every motion event (each warp emits echo/stale events
-/// that would otherwise have to be filtered out of the remote delta stream).
-const PARK_SLACK: f64 = 300.0;
 /// A single-event motion delta larger than this is a warp artifact, not a real mouse move.
 /// Events queued before one of our own cursor warps (hand-off park / re-centre / return)
 /// arrive after it, and the warp echo itself carries the edge→anchor jump (measured in the
@@ -525,6 +530,15 @@ const EDGE_REST_MS: u128 = 400;
 /// The returned cursor parks just inside the shared edge, so without this a stray push or
 /// a glide along that edge re-crosses immediately and control ping-pongs between machines.
 const RETURN_COOLDOWN_MS: u64 = 700;
+
+/// How often the remote-motion driver samples the real cursor while a secondary has control.
+/// 8 ms ≈ 125 Hz — comfortably above the ~60–125 Hz a mouse reports, so no motion is missed,
+/// and cheap enough (one `GetCursorPos`/`CGEventGetLocation` call) to poll continuously.
+const DRIVE_INTERVAL_MS: u64 = 8;
+/// Distance from the local bounding-box edge at which the treadmill pulls the cursor back to
+/// the centre. Large enough that even a fast flick cannot jump clean past the band in one
+/// sample and reach an edge that would clamp it.
+const TREADMILL_MARGIN: f64 = 120.0;
 
 /// Which side of the local bounding box a secondary is attached to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -641,18 +655,15 @@ fn handle_capture(
             let Some(bbox) = l.local_bbox() else { return };
             match c.remote.clone() {
                 None => local_move(&mut c, l, net, bbox, x, y, d),
-                Some(r) => {
-                    // macOS: remote-control motion comes exclusively from the delta tap
-                    // (src/delta.rs). Event-stream *positions* are useless here — the OS
-                    // clamps them at the display edge the cursor happens to be pinned to,
-                    // which starved the remote cursor of deltas (the long-standing "crossing
-                    // doesn't work" bug). Buttons/wheel/keys still flow through this stream.
-                    #[cfg(target_os = "macos")]
-                    {
-                        let _ = (&net, &primary_name, r, &l);
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    remote_move(&mut c, l, net, bbox, primary_name, r, x, y, d);
+                // A secondary has control: motion is driven exclusively by the remote-motion
+                // driver (see `start_remote_driver`), which samples the real cursor and runs
+                // the treadmill. Nothing is forwarded from the event stream here — doing so
+                // would double every delta (the stream and the driver both see the motion),
+                // and the stream's positions are clamped at the shared edge anyway, which is
+                // precisely what starved the remote cursor before.
+                Some(_r) => {
+                    // Buttons, wheel and keys still flow through this stream via
+                    // `forward_if_remote` — only *motion* belongs to the driver.
                 }
             }
         }
@@ -780,30 +791,6 @@ fn local_move(
     }
 }
 
-/// A secondary has control (event-stream path, non-macOS primaries): forward the motion
-/// delta as an absolute position inside its screen, keep the real cursor parked near the
-/// anchor (so nothing visibly moves here), and return control when the user crosses back
-/// over the shared edge. On macOS this path is bypassed entirely — see `remote_delta`.
-fn remote_move(
-    c: &mut Ctrl,
-    l: std::sync::MutexGuard<'_, Layout>,
-    net: &Arc<Mutex<Net>>,
-    bbox: (f64, f64, f64, f64),
-    primary_name: &str,
-    r: RemoteCtrl,
-    x: f64,
-    y: f64,
-    d: (f64, f64),
-) {
-    remote_step(c, &l, net, primary_name, r, d);
-    // Re-centre the parked cursor when it drifts, so it never visibly roams the primary.
-    let anchor = park_anchor(bbox);
-    if (x - anchor.0).abs() > PARK_SLACK || (y - anchor.1).abs() > PARK_SLACK {
-        input::warp_cursor(anchor.0, anchor.1);
-        c.last_real = anchor;
-    }
-}
-
 /// The shared remote-control step: apply one motion delta `d` to the secondary's virtual
 /// cursor, send it, and hand control back when the virtual cursor exits the screen across
 /// the shared edge. Used by the event-stream path (`remote_move`, non-macOS) and by the
@@ -871,24 +858,6 @@ fn remote_step(
     vy = vy.clamp(0.0, h - 1.0);
     net.lock().unwrap().send_input(&r.name, InputEvent::MouseMove { x: vx, y: vy });
     c.remote = Some(RemoteCtrl { name: r.name.clone(), side: r.side, vx, vy });
-}
-
-/// Remote-control motion on macOS (delta tap thread): the hardware deltas bypass cursor
-/// clamping entirely, so the remote cursor keeps moving even while the (hidden) local
-/// cursor is pinned against a display edge.
-#[cfg(target_os = "macos")]
-fn remote_delta(
-    net: &Arc<Mutex<Net>>,
-    layout: &Arc<Mutex<Layout>>,
-    ctrl: &Arc<Mutex<Ctrl>>,
-    primary_name: &str,
-    dx: f64,
-    dy: f64,
-) {
-    let mut c = ctrl.lock().unwrap();
-    let Some(r) = c.remote.clone() else { return };
-    let l = layout.lock().unwrap();
-    remote_step(&mut c, &l, net, primary_name, r, (dx, dy));
 }
 
 /// Hand control to the secondary `name` attached on `side`. Seeds its virtual cursor at the
@@ -1062,6 +1031,114 @@ fn cycle_control(
     let side = attached_side(remotes[idx], bbox).unwrap_or(Side::Right);
     let anchor = park_anchor(bbox);
     hand_off(&mut c, &l, net, side, &name, anchor.0, anchor.1, bbox);
+}
+
+/// Start the **remote-motion driver** — the one thing that actually moves a secondary's
+/// cursor while it has control.
+///
+/// ## Why this exists
+///
+/// The OS clamps the real cursor at a display edge: once it touches one, the position stops
+/// changing no matter how hard the user pushes. So after a hand-off the cursor sits pinned at
+/// the shared edge, and any motion source based on *cursor positions* — the rdev event
+/// stream, a `GetCursorPos`/`CGEventGetLocation` poll — goes completely silent. That is why
+/// crossing looked broken for so long: the hand-off happened, but the secondary never
+/// received another delta.
+///
+/// macOS had a workaround (a raw hardware delta tap, `src/delta.rs`), but Windows and Linux
+/// had none at all, so a non-macOS primary could never drive a remote cursor.
+///
+/// ## The fix: treadmill
+///
+/// Sample the real cursor at a high rate and **never let it reach an edge** — whenever it
+/// comes within `TREADMILL_MARGIN` of the local bounding box, warp it back to the centre.
+/// The user's motion therefore always produces a measurable delta, on every platform, with
+/// no reliance on the event stream and no per-OS raw-input plumbing. The delta for the frame
+/// that triggers the re-centre is still delivered, so no motion is lost.
+///
+/// The local cursor is hidden while a secondary has control, so the re-centre is invisible.
+fn start_remote_driver(
+    net: Arc<Mutex<Net>>,
+    layout: Arc<Mutex<Layout>>,
+    ctrl: Arc<Mutex<Ctrl>>,
+    primary_name: String,
+) {
+    std::thread::spawn(move || {
+        let mut last: Option<(f64, f64)> = None;
+        let mut announced = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(DRIVE_INTERVAL_MS));
+            let Some(pos) = input::cursor_position() else {
+                // No OS sampler for this platform — the driver cannot run. Log once so the
+                // situation is visible instead of the thread just vanishing.
+                if !announced {
+                    announced = true;
+                    diag::log("remote driver: no OS cursor sampler on this platform; driver idle");
+                }
+                return;
+            };
+            let Some(bbox) = layout.lock().unwrap().local_bbox() else {
+                continue;
+            };
+
+            // Compute the treadmill target *before* taking the ctrl lock: re-centre on the
+            // local display the cursor is currently on, not on the bounding-box centre —
+            // with an L-shaped or staggered multi-monitor arrangement the bbox centre can
+            // fall in a gap where no display exists, and warping there gets clamped straight
+            // back to an edge (which is exactly the starvation we are trying to avoid).
+            let (bl, bt, br, bb) = bbox;
+            let centre = ((bl + br) / 2.0, (bt + bb) / 2.0);
+            let home = {
+                let l = layout.lock().unwrap();
+                l.screens
+                    .iter()
+                    .filter(|s| s.is_local)
+                    .find(|s| s.contains(pos.0, pos.1))
+                    .map(|s| {
+                        (
+                            s.ox as f64 + s.w as f64 / 2.0,
+                            s.oy as f64 + s.h as f64 / 2.0,
+                        )
+                    })
+                    .unwrap_or(centre)
+            };
+
+            // Lock order: ctrl, then layout, then net (same as handle_capture).
+            let mut c = ctrl.lock().unwrap();
+            let Some(r) = c.remote.clone() else {
+                // Local control: keep the baseline fresh so the first remote sample after a
+                // hand-off is a real delta, not the edge→park jump.
+                last = Some(pos);
+                continue;
+            };
+            let Some(prev) = last else {
+                last = Some(pos);
+                continue;
+            };
+            let d = (pos.0 - prev.0, pos.1 - prev.1);
+            if d.0 == 0.0 && d.1 == 0.0 {
+                continue; // cursor parked — nothing moved
+            }
+            last = Some(pos);
+
+            // Treadmill: pull the cursor back to the centre before it can be clamped by an
+            // edge, so the next frame still yields a real delta.
+            if pos.0 < bl + TREADMILL_MARGIN
+                || pos.0 > br - TREADMILL_MARGIN
+                || pos.1 < bt + TREADMILL_MARGIN
+                || pos.1 > bb - TREADMILL_MARGIN
+            {
+                input::warp_cursor(home.0, home.1);
+                last = Some(home);
+                // Keep the event-stream baseline in sync so it does not read our own warp as
+                // a huge real delta.
+                c.last_real = home;
+            }
+
+            let l = layout.lock().unwrap();
+            remote_step(&mut c, &l, &net, &primary_name, r, d);
+        }
+    });
 }
 
 /// `--probe`: coordinate-space self-test for the crossing pipeline.
