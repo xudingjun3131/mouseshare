@@ -84,15 +84,35 @@ pub fn cursor_position() -> Option<(f64, f64)> {
 
 /// Linux/X11: `XQueryPointer` on the default root window. Returns `None` when there is no
 /// X display (e.g. a Wayland session) — the driver then falls back to the event stream.
+///
+/// The display connection is cached: the remote-motion driver samples at a high rate, and
+/// `XOpenDisplay`/`XCloseDisplay` on every sample (a full socket handshake each time) is
+/// expensive enough to starve the poll loop.
 #[cfg(target_os = "linux")]
 pub fn cursor_position() -> Option<(f64, f64)> {
-    use x11_dl::xlib::{Xlib, XRootWindow};
-    let xlib = Xlib::open().ok()?;
+    use x11_dl::xlib::{Display, Xlib};
+
+    // Cache library handle + display connection for the process lifetime. `XOpenDisplay` is a
+    // full socket handshake; doing it on every sample would starve the poll loop.
+    // NB: the pointer is kept as `usize` because raw pointers are neither `Send` nor `Sync`
+    // and therefore cannot live inside a `static`.
+    static CONN: std::sync::OnceLock<Option<(&'static Xlib, usize)>> = std::sync::OnceLock::new();
+
+    let (xlib, display) = CONN
+        .get_or_init(|| {
+            let xlib: &'static Xlib = Box::leak(Box::new(Xlib::open().ok()?));
+            // Xlib is not thread-safe by default and we sample from a dedicated driver thread.
+            unsafe { (xlib.XInitThreads)() };
+            let display = unsafe { (xlib.XOpenDisplay)(std::ptr::null()) };
+            if display.is_null() {
+                return None;
+            }
+            Some((xlib, display as usize))
+        })
+        .as_ref()?;
+    let (xlib, display) = (*xlib, *display as *mut Display);
+
     unsafe {
-        let display = (xlib.XOpenDisplay)(std::ptr::null());
-        if display.is_null() {
-            return None;
-        }
         let root = (xlib.XRootWindow)(display, 0);
         let mut root_ret = 0u64;
         let mut child_ret = 0u64;
@@ -112,7 +132,6 @@ pub fn cursor_position() -> Option<(f64, f64)> {
             &mut wy,
             &mut mask,
         );
-        (xlib.XCloseDisplay)(display);
         if ok != 0 {
             Some((rx as f64, ry as f64))
         } else {
