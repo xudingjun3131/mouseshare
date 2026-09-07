@@ -1,24 +1,27 @@
 //! MouseShare — share mouse / keyboard / clipboard across computers over LAN.
 //!
-//! Architecture
-//! -----------
-//! * The **primary** runs a TCP hub and captures the real input via `rdev::listen`.
-//! * **Secondaries** connect to the primary and inject the forwarded input via `rdev::simulate`.
-//! * A shared `Layout` (edited in the GUI) defines where each machine's screen sits in a virtual
-//!   desktop; crossing an edge hands control (and the cursor) to the neighbour.
-//! * Clipboard changes are broadcast and loop-suppressed.
+//! # Architecture (rewrite: native grab + relative deltas)
+//!
+//! * The **primary** runs a TCP hub and *grabs* the real input via a `CGEventTap` (macOS) — the tap
+//!   returns `None` for events while a secondary has control, so the OS never sees them and never
+//!   clamps the cursor at a display edge.
+//! * The capture layer forwards **relative mouse deltas** (`MouseMotion { dx, dy }`); the receiver
+//!   accumulates them against its own real cursor, so no screen-geometry/DPI agreement is needed.
+//! * Crossing is predicted from `location + delta` *before* the cursor reaches an edge. There is no
+//!   treadmill, no edge-rest poller, no park-and-bounce — those were band-aids for the old observer
+//!   architecture (which couldn't keep the delta stream alive once the OS pinned the cursor).
+//! * **Secondaries** receive input and inject it relatively; they run no capture of their own (only a
+//!   lightweight hotkey listener to hand control back).
+//! * Network / clipboard / config / egui UI are unchanged from the previous build.
 
-// On Windows, build a GUI-subsystem executable (no black console window). The window then
-// shows in the taskbar with the embedded logo icon instead of spawning a `cmd` console.
-// Ignored on macOS/Linux (no such subsystem there).
+// On Windows, build a GUI-subsystem executable (no black console window).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
-// NOTE: when control is local the primary's cursor must be allowed to leave a local screen at the
-// edge that has a secondary beyond it (see `handle_capture` / `outward_handoff`). The OS pins the
-// real cursor onto a display, so the hand-off check runs *before* local tracking.
 
 mod app;
+mod capture;
 mod clipboard;
 mod config;
+mod control;
 mod diag;
 mod i18n;
 mod input;
@@ -29,63 +32,23 @@ mod single_instance;
 #[cfg(target_os = "windows")]
 mod tray;
 
+// `app.rs` historically referenced `crate::Ctrl`; keep that path working after the move.
+pub use control::Ctrl;
+
+use log::info;
+
 use crate::config::{load_config, save_config, Config};
+use crate::control::{CaptureMode, GrabCtx, HotkeyState, on_enter_screen, on_leave_screen, on_secondary_input, cycle_control};
 use crate::i18n::Lang;
 use crate::layout::Layout;
 use crate::network::{connect_client, start_hub, Net};
-use crate::protocol::{InputEvent, Message};
-use log::info;
-use rdev::{display_size, Event, EventType, Key};
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::protocol::Message;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 
-/// Throttle counter for diagnostic cursor-position samples (one per 100 motion events).
-static MOTION_SAMPLES: AtomicU64 = AtomicU64::new(0);
-/// Throttle counter for diagnostic samples taken while a secondary has control.
-static REMOTE_SAMPLES: AtomicU64 = AtomicU64::new(0);
-
-/// macOS cursor visibility, used to hide the real cursor while a secondary has control.
-/// This is the perceptual core of the hand-off: when control moves to the secondary, the
-/// local cursor *vanishes* and the secondary's cursor appears — the same cue Synergy gives.
-/// Without it, the parked cursor sitting visibly in the middle of the screen reads as
-/// "crossing failed", the user reaches for the mouse, and control instantly bounces back.
-#[cfg(target_os = "macos")]
-mod sys_cursor {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static HIDDEN: AtomicBool = AtomicBool::new(false);
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGDisplayHideCursor(display: u32) -> i32;
-        fn CGDisplayShowCursor(display: u32) -> i32;
-        fn CGMainDisplayID() -> u32;
-    }
-    pub fn hide() {
-        if !HIDDEN.swap(true, Ordering::Relaxed) {
-            unsafe { CGDisplayHideCursor(CGMainDisplayID()) };
-        }
-    }
-    pub fn show() {
-        if HIDDEN.swap(false, Ordering::Relaxed) {
-            unsafe { CGDisplayShowCursor(CGMainDisplayID()) };
-        }
-    }
-}
-/// Non-macOS: nothing to do — the parking cursor is only a cosmetic concern there and the
-/// primary currently always runs on macOS in practice.
-#[cfg(not(target_os = "macos"))]
-mod sys_cursor {
-    pub fn hide() {}
-    pub fn show() {}
-}
-
 fn main() -> anyhow::Result<()> {
-    // Windows: declare per-monitor DPI awareness BEFORE anything queries display metrics.
-    // Without it Windows DPI-virtualizes the process: `GetSystemMetrics` (and therefore
-    // rdev's `display_size`) reports the *scaled logical* resolution (e.g. 1755x1097 for a
-    // 2560x1600 panel), while absolute mouse injection via `MOUSEEVENTF_ABSOLUTE|VIRTUALDESK`
-    // is normalized against the *physical* virtual desktop — a coordinate-space mismatch
-    // that misreports the screen size AND skews cursor injection on any scaled display.
+    // Windows: declare per-monitor DPI awareness BEFORE anything queries display metrics, so
+    // absolute coordinate spaces match between the event stream and injection.
     #[cfg(target_os = "windows")]
     {
         #[link(name = "user32")]
@@ -95,26 +58,15 @@ fn main() -> anyhow::Result<()> {
         }
         const PER_MONITOR_AWARE_V2: isize = -4;
         unsafe {
-            // Win10 1703+: per-monitor v2; older Windows falls back to system DPI aware.
             if SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) == 0 {
                 SetProcessDPIAware();
             }
         }
     }
 
-    // `--probe`: coordinate-space self-test. Warps the cursor to known points and compares
-    // the positions reported by the event stream (rdev::listen) with direct Core Graphics
-    // reads (CGEventGetLocation). Any mismatch between the two — or versus the layout
-    // coordinates — is the #1 crossing killer, so this makes it measurable in one command.
-    if std::env::args().any(|a| a == "--probe") {
-        return probe();
-    }
-
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Refuse to run twice. Two copies would fight over the listen port and over the input
-    // capture tap; the second one used to fail with a confusing "cannot listen" error (and on
-    // Windows, with no console attached, looked like it simply did nothing).
+    // Refuse to run twice (two copies would fight over the capture tap + listen port).
     let _instance_guard = match single_instance::acquire() {
         Some(g) => g,
         None => {
@@ -127,15 +79,10 @@ fn main() -> anyhow::Result<()> {
     let mut config: Config = load_config();
     let my_name = config.name.clone();
 
-    // Windows: tray icon (notification area) with show/quit menu. The sharing process runs
-    // in the background, so the tray is the only always-visible handle on it.
     #[cfg(target_os = "windows")]
-    tray::init(crate::i18n::Lang::from_code(&config.lang));
+    tray::init(Lang::from_code(&config.lang));
 
-    // For the primary, the address shown to secondaries must be this machine's real LAN IP,
-    // not the `192.168.1.100` placeholder shipped in Config::default(). Auto-detect it on
-    // startup so the GUI always displays a connectable address. (The "检测IP" button still
-    // works as a manual refresh.)
+    // Auto-detect the primary's LAN IP so the GUI shows a connectable address.
     if config.mode == "primary" {
         if let Ok(ip) = local_ip_address::local_ip() {
             config.server_addr = format!("{}:{}", ip, config.port);
@@ -150,19 +97,11 @@ fn main() -> anyhow::Result<()> {
     let port = config.port;
     let primary_name = config.primary_name.clone();
 
-    // Incoming channel: (peer name, message).
     let (inc_tx, inc_rx) = channel::<(String, Message)>();
 
-    // Never let a networking failure kill the process silently: when launched from Finder that
-    // looks exactly like "I clicked the app and nothing happened, no dialog either". Record the
-    // error, fall back to an idle Net, and always open the GUI so the user can see and fix it.
     let mut startup_error: Option<String> = None;
 
-    // Shared layout state (used by the hub to push screens to secondaries, by the incoming
-    // handler to register peers, and by the capture thread for cursor hand-off).
-    // The primary's layout starts from its *real* displays (so a multi-monitor Mac shows every
-    // screen and the cursor roams between them natively); secondaries adopt the layout the
-    // primary pushes once connected.
+    // Shared layout state (hub pushes screens to secondaries, capture reads bounds for crossing).
     let layout: Arc<Mutex<Layout>> = Arc::new(Mutex::new(if mode == "primary" {
         detect_primary_layout(&primary_name)
     } else {
@@ -173,7 +112,6 @@ fn main() -> anyhow::Result<()> {
         match start_hub(port, inc_tx.clone(), layout.clone()) {
             Ok(n) => n,
             Err(e) => {
-                // Error text follows the UI language chosen in the config.
                 let msg = Lang::from_code(&config.lang).listen_fail(port, e);
                 log::error!("{}", msg);
                 startup_error = Some(msg);
@@ -184,7 +122,7 @@ fn main() -> anyhow::Result<()> {
         let n = Net::idle();
         match connect_client(&server_addr, inc_tx.clone(), n.clone()) {
             Ok((net_inner, tx)) => {
-                let (w, h) = display_size().unwrap_or((1920, 1080));
+                let (w, h) = rdev::display_size().unwrap_or((1920, 1080));
                 tx.send(Message::Hello {
                     name: my_name.clone(),
                     width: w as u32,
@@ -202,9 +140,28 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Control-plane state: which machine currently "has" the mouse (local or a remote
-    // secondary), the parked real-cursor position, and the pinned-edge push detector.
-    let ctrl: Arc<Mutex<Ctrl>> = Arc::new(Mutex::new(Ctrl::default()));
+    // This host's own display rectangle(s): used to seed/clamp the virtual cursor while a secondary
+    // is being driven, and as the capture bbox on the primary.
+    let own_layout: Layout = if mode == "primary" {
+        layout.lock().unwrap().clone()
+    } else {
+        detect_primary_layout(&my_name)
+    };
+    input::set_local_layout(&own_layout);
+
+    // Control plane.
+    let ctrl: Arc<Mutex<Ctrl>> = Arc::new(Mutex::new(Ctrl {
+        local_bbox: own_layout.local_bbox(),
+        ..Default::default()
+    }));
+    let grab_ctx: Arc<GrabCtx> = Arc::new(GrabCtx {
+        net: net.clone(),
+        layout: layout.clone(),
+        ctrl: ctrl.clone(),
+        mode: Mutex::new(CaptureMode::Local),
+        my_name: my_name.clone(),
+        primary_name: primary_name.clone(),
+    });
 
     // ---- Startup diagnostics dump (file-based; stderr is invisible when launched from Finder) ----
     {
@@ -220,10 +177,7 @@ fn main() -> anyhow::Result<()> {
                         s.name, s.w, s.h, s.ox, s.oy, phys.0, phys.1, s.is_local
                     )
                 } else {
-                    format!(
-                        "{}({}x{}@{},{} local={})",
-                        s.name, s.w, s.h, s.ox, s.oy, s.is_local
-                    )
+                    format!("{}({}x{}@{},{} local={})", s.name, s.w, s.h, s.ox, s.oy, s.is_local)
                 }
             })
             .collect::<Vec<_>>()
@@ -243,33 +197,26 @@ fn main() -> anyhow::Result<()> {
     {
         let net = net.clone();
         let layout = layout.clone();
-        let last_seen = Arc::new(Mutex::new(String::new()));
+        let grab_ctx = grab_ctx.clone();
         let mode2 = mode.clone();
-        let ctrl = ctrl.clone();
-        let primary_name = primary_name.clone();
         std::thread::spawn(move || {
             for (from, msg) in inc_rx {
                 match msg {
                     Message::Clipboard { text } => {
                         if mode2 == "secondary" {
                             clipboard::set_clipboard(&text);
-                            *last_seen.lock().unwrap() = text;
                         } else {
-                            // Primary: mirror locally and relay to other secondaries.
                             clipboard::set_clipboard(&text);
-                            *last_seen.lock().unwrap() = text.clone();
                             net.lock().unwrap().broadcast_clipboard(&text, Some(&from));
                         }
                     }
                     Message::Input(ev) => {
+                        // Only a secondary applies forwarded input (it is being driven).
                         if mode2 == "secondary" {
-                            input::apply_input(&ev);
+                            on_secondary_input(&grab_ctx, ev);
                         }
-                        // Primary originated the input; never receives it back.
                     }
                     Message::Hello { name, width, height } => {
-                        // Auto-register every secondary as a screen so the client count is
-                        // unbounded — no manual layout editing required to add more machines.
                         if mode2 == "primary" {
                             if layout.lock().unwrap().ensure_screen(&name, width, height, false) {
                                 info!("auto-registered screen for peer {}", name);
@@ -277,18 +224,24 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     Message::Layout { layout: new_layout } => {
-                        // The primary pushes its full layout to secondaries so every machine
-                        // draws the same map. Secondaries adopt it verbatim; the primary never
-                        // receives this message.
                         if mode2 == "secondary" {
                             *layout.lock().unwrap() = new_layout;
                         }
                     }
+                    Message::EnterScreen { side, fx, fy } => {
+                        if mode2 == "secondary" {
+                            on_enter_screen(&grab_ctx, side, fx, fy);
+                        }
+                    }
+                    Message::LeaveScreen => {
+                        if mode2 == "secondary" {
+                            on_leave_screen(&grab_ctx);
+                        }
+                    }
                     Message::Hotkey => {
-                        // A secondary pressed the switch hotkey; only the primary actually rotates
-                        // control (it owns the cursor and the layout).
+                        // A secondary pressed the switch hotkey; only the primary rotates control.
                         if mode2 == "primary" {
-                            cycle_control(&net, &layout, &ctrl, &primary_name);
+                            cycle_control(&grab_ctx);
                         }
                     }
                     _ => {}
@@ -300,135 +253,33 @@ fn main() -> anyhow::Result<()> {
     // ---- Clipboard monitor (both roles) ----
     {
         let net = net.clone();
-        let last_seen = Arc::new(Mutex::new(String::new()));
-        let mode2 = mode.clone();
-        clipboard::start_monitor(last_seen, move |text: String| {
+        clipboard::start_monitor(Arc::new(Mutex::new(String::new())), move |text: String| {
             net.lock().unwrap().broadcast_clipboard(&text, None);
-            let _ = &mode2;
         });
     }
 
     // ---- Capture ----
     if mode == "primary" {
-        {
-            let net = net.clone();
-            let layout = layout.clone();
-            let ctrl = ctrl.clone();
-            let primary_name = primary_name.clone();
-            input::start_capture(move |event: Event| {
-                handle_capture(event, &net, &layout, &ctrl, &primary_name);
-            });
-        }
-        // ---- Remote-motion driver (primary, all platforms) ----
-        // Samples the real cursor and runs the treadmill, so a secondary's cursor keeps
-        // receiving deltas no matter where the local cursor is pinned. This is the single
-        // motion source for remote control on every platform — it replaces the macOS-only
-        // delta tap, which left Windows and Linux primaries unable to drive a remote
-        // cursor at all.
-        {
-            let net = net.clone();
-            let layout = layout.clone();
-            let ctrl = ctrl.clone();
-            let primary_name = primary_name.clone();
-            start_remote_driver(net, layout, ctrl, primary_name);
-        }
-        // ---- Edge-rest poller (primary only) ----
-        // A second, event-independent crossing trigger. Samples the cursor position straight
-        // from the OS: if it rests inside a shared-edge pin zone (position unchanged — which
-        // is exactly what a pinned cursor does) for EDGE_REST_MS while control is local,
-        // control is handed to the secondary beyond that edge. This works even when the
-        // event stream is silent at the edge, which is what made crossing unreliable before.
-        {
-            let net = net.clone();
-            let layout = layout.clone();
-            let ctrl = ctrl.clone();
-            std::thread::spawn(move || {
-                let mut last_pos: Option<(f64, f64)> = None;
-                let mut rest_since: Option<std::time::Instant> = None;
-                let mut reported = false;
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
-                    let Some((x, y)) = input::cursor_position() else {
-                        return; // no OS sampler on this platform
-                    };
-                    // Cursor moved? reset the rest clock.
-                    if let Some((px, py)) = last_pos {
-                        if (x - px).abs() > 0.5 || (y - py).abs() > 0.5 {
-                            rest_since = None;
-                            reported = false;
-                        }
-                    }
-                    last_pos = Some((x, y));
-
-                    // Only meaningful while control is local (and outside the just-returned
-                    // grace window — the returned cursor parks inside the shared-edge pin
-                    // zone, so the poller would otherwise re-cross immediately).
-                    let blocked = {
-                        let c = ctrl.lock().unwrap();
-                        c.remote.is_some()
-                            || c.cooldown_until
-                                .map(|t| std::time::Instant::now() < t)
-                                .unwrap_or(false)
-                    };
-                    if blocked {
-                        rest_since = None;
-                        continue;
-                    }
-                    let (hit, bbox) = {
-                        let l = layout.lock().unwrap();
-                        if l.screens.len() <= 1 {
-                            continue;
-                        }
-                        let Some(bbox) = l.local_bbox() else { continue };
-                        let hit = edge_remote(l.screens.iter().filter(|s| !s.is_local), bbox, x, y);
-                        (hit, bbox)
-                    };
-                    let Some((side, name)) = hit else {
-                        rest_since = None;
-                        reported = false;
-                        continue;
-                    };
-                    let since = *rest_since.get_or_insert_with(std::time::Instant::now);
-                    let rested = since.elapsed().as_millis();
-                    // Throttled diagnostics: one line when the cursor first comes to rest in a
-                    // pin zone, then one per second while it stays there.
-                    if !reported {
-                        reported = true;
-                        diag::log(&format!(
-                            "poller: cursor at rest in {:?} pin zone at ({:.0},{:.0}) bbox={:?} target={} rest_ms={}",
-                            side, x, y, bbox, name, rested
-                        ));
-                    }
-                    if rested >= EDGE_REST_MS {
-                        diag::log(&format!(
-                            "poller: handing control to {} ({:?}) after {}ms rest at ({:.0},{:.0})",
-                            name, side, rested, x, y
-                        ));
-                        let mut c = ctrl.lock().unwrap();
-                        let l = layout.lock().unwrap();
-                        hand_off(&mut c, &l, &net, side, &name, x, y, bbox);
-                        rest_since = None;
-                        reported = false;
-                    }
-                }
-            });
-        }
+        // Native grab: CGEventTap on macOS; rdev observer (legacy) elsewhere.
+        capture::start_capture(grab_ctx.clone());
     } else {
         info!("running as secondary; waiting for input from {}", server_addr);
-        // Secondaries also listen for the switch hotkey (ScrollLock, or Ctrl+Alt+Space — most
-        // Mac keyboards have no ScrollLock key) so the user can hand control back to the primary
-        // from the Windows side — the press is forwarded to the primary, which rotates ownership.
+        // Lightweight hotkey listener so the user can hand control back from the Windows/Mac side.
         let net_hk = net.clone();
         let hk = Arc::new(Mutex::new(HotkeyState::default()));
-        input::start_capture(move |e: Event| {
-            let (k, down) = match e.event_type {
-                EventType::KeyPress(k) => (k, true),
-                EventType::KeyRelease(k) => (k, false),
-                _ => return,
-            };
-            if hotkey_fired(k, down, &mut hk.lock().unwrap()) {
-                net_hk.lock().unwrap().send_message(Message::Hotkey);
-            }
+        std::thread::spawn(move || {
+            let _ = rdev::listen(move |e: rdev::Event| {
+                let (k, down) = match e.event_type {
+                    rdev::EventType::KeyPress(k) => (k, true),
+                    rdev::EventType::KeyRelease(k) => (k, false),
+                    _ => return,
+                };
+                let mut st = hk.lock().unwrap();
+                if hotkey_fired(k, down, &mut st) {
+                    drop(st);
+                    net_hk.lock().unwrap().send_message(Message::Hotkey);
+                }
+            });
         });
     }
 
@@ -443,9 +294,6 @@ fn main() -> anyhow::Result<()> {
         ctrl.clone(),
     );
 
-    // Window icon: the bundled mouse logo. Without this a bare (non-.app) binary shows the
-    // generic executable icon in the Dock / title bar; the .app bundle still gets AppIcon.icns
-    // from the CI packaging step, so this only makes the dev/preview build match the release.
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../resources/mouse-logo.png"))
         .map(Arc::new)
         .ok();
@@ -465,9 +313,6 @@ fn main() -> anyhow::Result<()> {
         "MouseShare",
         options,
         Box::new(move |cc| {
-            // Install a CJK fallback font BEFORE the GUI starts drawing, so the very first frame
-            // already shows Chinese correctly (otherwise first frame is tofu, then it gets
-            // replaced on the next frame).
             app::setup_fonts(&cc.egui_ctx);
             app::setup_style(&cc.egui_ctx);
             Ok::<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>>(Box::new(gui_app))
@@ -479,744 +324,23 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---- Control plane: which machine "has" the mouse ----------------------------------
-//
-// A two-state machine (Synergy-style):
-//
-// * **Local** — the real cursor is free on this machine. NOTHING is ever forwarded, so a
-//   second cursor can never move on another machine while this one moves (the old
-//   "both move at once" bug is impossible by construction). We only watch for the cursor
-//   being *pinned* against an outer edge of the local bounding box that has a secondary
-//   attached just beyond it. The OS clamps the cursor at a display edge, so a continuous
-//   outward push arrives as an event *at* the edge with an outward delta — that single
-//   pinned push (`PIN_THRESHOLD = 1`) hands control to the secondary right away: crossing
-//   is permanently on, no repeated push-jamming required.
-//
-// * **Remote** — a secondary has control. Every motion delta is forwarded to it as an
-//   absolute position inside its own screen, and the real cursor is re-centred on this
-//   machine whenever it drifts, so nothing visibly moves here. Moving back across the
-//   shared edge inside the secondary's screen returns control to this machine.
-
-/// Within this distance of the bbox edge the cursor counts as pinned against it.
-const EDGE_PIN: f64 = 3.0;
-/// A remote counts as attached just beyond an edge when its gap is within this distance.
-/// Generous on purpose: tiles dragged in the canvas only line up roughly (small up/down/
-/// left/right offsets), and crossing must stay permanently on regardless. The hand-off only
-/// needs to know which neighbour lies beyond the edge — the exact gap is irrelevant.
-const EDGE_ATTACH: f64 = 240.0;
-/// After a pin, pull the cursor this far back inside so the next push produces fresh events.
-const BOUNCE_IN: f64 = 12.0;
-/// Outward pushes needed (within `PIN_WINDOW_MS`) before control is handed off.
-/// 1 = cross on the first push into a shared edge — crossing is always on.
-const PIN_THRESHOLD: u32 = 1;
-/// Pushes inside this time window accumulate toward the hand-off.
-const PIN_WINDOW_MS: u128 = 900;
-/// A single-event motion delta larger than this is a warp artifact, not a real mouse move.
-/// Events queued before one of our own cursor warps (hand-off park / re-centre / return)
-/// arrive after it, and the warp echo itself carries the edge→anchor jump (measured in the
-/// field: 1695px = exactly the edge-to-anchor distance). No physical mouse produces 400px
-/// in one event; such deltas must never reach the virtual cursor — a single 1695px artifact
-/// slammed the secondary's cursor into a screen corner and stuck it there.
-const ECHO_MAX: f64 = 400.0;
-/// How often the edge-rest poller samples the cursor position.
-const POLL_INTERVAL_MS: u64 = 50;
-/// How long the cursor must REST inside a shared-edge pin zone (position unchanged) before
-/// the poller hands control to the secondary beyond it. This trigger does not depend on the
-/// event stream at all: when the OS pins the cursor at a display edge it may deliver no
-/// motion events (or only zero-delta echoes) — both are invisible to the event path, but a
-/// direct OS position sample still shows the cursor sitting in the pin zone.
-const EDGE_REST_MS: u128 = 400;
-/// After control returns to the primary, automatic hand-offs are suppressed for this long.
-/// The returned cursor parks just inside the shared edge, so without this a stray push or
-/// a glide along that edge re-crosses immediately and control ping-pongs between machines.
-const RETURN_COOLDOWN_MS: u64 = 700;
-
-/// How often the remote-motion driver samples the real cursor while a secondary has control.
-/// 8 ms ≈ 125 Hz — comfortably above the ~60–125 Hz a mouse reports, so no motion is missed,
-/// and cheap enough (one `GetCursorPos`/`CGEventGetLocation` call) to poll continuously.
-const DRIVE_INTERVAL_MS: u64 = 8;
-/// Distance from the local bounding-box edge at which the treadmill pulls the cursor back to
-/// the centre. Large enough that even a fast flick cannot jump clean past the band in one
-/// sample and reach an edge that would clamp it.
-const TREADMILL_MARGIN: f64 = 120.0;
-
-/// Which side of the local bounding box a secondary is attached to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
-    Right,
-    Left,
-    Top,
-    Bottom,
-}
-
-/// Control of a remote secondary: its name, the shared edge, and the virtual cursor position
-/// in the secondary's own local coordinates (origin = top-left of its screen).
-#[derive(Debug, Clone)]
-struct RemoteCtrl {
-    name: String,
-    side: Side,
-    vx: f64,
-    vy: f64,
-}
-
-/// Mutable control-plane state shared between the capture thread and the hotkey paths.
-/// Lock order: `ctrl` first, then `layout`, then `net` — never the other way around.
-#[derive(Debug, Default)]
-struct Ctrl {
-    init: bool,
-    last_real: (f64, f64),
-    /// `Some` while a secondary has control (cursor handed off); `None` = local control.
-    remote: Option<RemoteCtrl>,
-    /// Consecutive outward pushes at a pinned edge (drives the automatic hand-off).
-    pins: u32,
-    last_pin: Option<std::time::Instant>,
-    /// Suppress automatic hand-offs until this instant — set right after control returns,
-    /// because the returned cursor is parked just inside the shared edge and any stray push
-    /// along that edge would otherwise re-cross immediately (a hand-off/return ping-pong).
-    cooldown_until: Option<std::time::Instant>,
-    /// Consecutive warp-artifact drops (see `ECHO_MAX`); resets on any accepted motion event.
-    drops: u32,
-    /// Modifier/hotkey bookkeeping for the switch hotkey.
-    hk: HotkeyState,
-}
-
-/// State for the switch-hotkey detector: which modifiers are currently held.
-#[derive(Debug, Default)]
-struct HotkeyState {
-    ctrl: bool,
-    alt: bool,
-}
-
-/// Switch hotkey: **ScrollLock** (kept for compatibility) or **Ctrl+Alt+Space**.
-///
-/// Ctrl+Alt+Space is the primary choice because most Mac keyboards — every MacBook's built-in
-/// keyboard — have no ScrollLock key at all, which made the hotkey look unimplemented there.
-/// This is called for both key presses and releases so the modifier state stays in sync; it
-/// returns `true` only on the press that fires the switch.
-fn hotkey_fired(k: Key, down: bool, st: &mut HotkeyState) -> bool {
-    match k {
-        Key::ControlLeft | Key::ControlRight => st.ctrl = down,
-        Key::Alt | Key::AltGr => st.alt = down,
-        Key::ScrollLock => return down,
-        Key::Space => return down && st.ctrl && st.alt,
-        _ => {}
-    }
-    false
-}
-
-fn handle_capture(
-    event: Event,
-    net: &Arc<Mutex<Net>>,
-    layout: &Arc<Mutex<Layout>>,
-    ctrl: &Arc<Mutex<Ctrl>>,
-    primary_name: &str,
-) {
-    match event.event_type {
-        EventType::MouseMove { x, y } => {
-            let mut c = ctrl.lock().unwrap();
-            if !c.init {
-                c.init = true;
-                c.last_real = (x, y);
-                return;
-            }
-            let d = (x - c.last_real.0, y - c.last_real.1);
-            if d.0 == 0.0 && d.1 == 0.0 {
-                return; // echo of our own warp — no real motion
-            }
-            if d.0.abs() > ECHO_MAX || d.1.abs() > ECHO_MAX {
-                // Warp artifact: a stale event queued before one of our own cursor warps
-                // (hand-off park / re-centre / return), or the warp echo carrying the
-                // edge→anchor jump. Never advance the virtual cursor with it — a single
-                // 1695px artifact was seen throwing the secondary's cursor into a corner.
-                // Keep last_real at the warp target (where the cursor physically is now) so
-                // the user's next real delta is small again; if the stream stays implausible
-                // anyway, re-baseline to avoid starving the delta chain.
-                c.drops += 1;
-                if c.drops > 8 {
-                    c.drops = 0;
-                    c.last_real = (x, y);
-                }
-                diag::log(&format!(
-                    "drop warp artifact #{}: pos=({x},{y}) d=({:.0},{:.0}) last=({:.0},{:.0})",
-                    c.drops,
-                    d.0,
-                    d.1,
-                    c.last_real.0,
-                    c.last_real.1
-                ));
-                return;
-            }
-            c.drops = 0;
-            c.last_real = (x, y);
-            let l = layout.lock().unwrap();
-            if l.screens.len() <= 1 {
-                return; // nothing to hand control to
-            }
-            let Some(bbox) = l.local_bbox() else { return };
-            match c.remote.clone() {
-                None => local_move(&mut c, l, net, bbox, x, y, d),
-                // A secondary has control: motion is driven exclusively by the remote-motion
-                // driver (see `start_remote_driver`), which samples the real cursor and runs
-                // the treadmill. Nothing is forwarded from the event stream here — doing so
-                // would double every delta (the stream and the driver both see the motion),
-                // and the stream's positions are clamped at the shared edge anyway, which is
-                // precisely what starved the remote cursor before.
-                Some(_r) => {
-                    // Buttons, wheel and keys still flow through this stream via
-                    // `forward_if_remote` — only *motion* belongs to the driver.
-                }
-            }
-        }
-
-        EventType::ButtonPress(b) => forward_if_remote(
-            net,
-            ctrl,
-            InputEvent::MouseDown {
-                button: input::button_to_ms(b),
-            },
-        ),
-        EventType::ButtonRelease(b) => forward_if_remote(
-            net,
-            ctrl,
-            InputEvent::MouseUp {
-                button: input::button_to_ms(b),
-            },
-        ),
-
-        EventType::Wheel { delta_x, delta_y } => forward_if_remote(
-            net,
-            ctrl,
-            InputEvent::Wheel {
-                dx: delta_x,
-                dy: delta_y,
-            },
-        ),
-
-        EventType::KeyPress(k) => {
-            // The switch hotkey (ScrollLock, or Ctrl+Alt+Space — Mac keyboards have no
-            // ScrollLock key) rotates control to the next machine.
-            let fired = {
-                let mut c = ctrl.lock().unwrap();
-                hotkey_fired(k, true, &mut c.hk)
-            };
-            if fired {
-                cycle_control(net, layout, ctrl, primary_name);
-                return;
-            }
-            forward_if_remote(net, ctrl, InputEvent::KeyDown { key: k });
-        }
-        EventType::KeyRelease(k) => {
-            // Keep modifier state in sync on releases too (a no-op for non-modifier keys).
-            hotkey_fired(k, false, &mut ctrl.lock().unwrap().hk);
-            // Ignore the hotkey's own release so a single tap cycles exactly once.
-            if k == Key::ScrollLock {
-                return;
-            }
-            forward_if_remote(net, ctrl, InputEvent::KeyUp { key: k });
-        }
-    }
-}
-
-/// Local control: watch for an outward push at an edge that has a secondary beyond it.
-/// Never forwards anything — the double-motion bug is impossible by construction.
-fn local_move(
-    c: &mut Ctrl,
-    l: std::sync::MutexGuard<'_, Layout>,
-    net: &Arc<Mutex<Net>>,
-    bbox: (f64, f64, f64, f64),
-    x: f64,
-    y: f64,
-    d: (f64, f64),
-) {
-    // Throttled position sampling (every 100th motion event): shows whether the reported
-    // cursor coordinates line up with the layout's bbox at all. A mismatch here (e.g. a
-    // coordinate-space or display-arrangement discrepancy) is the #1 crossing killer.
-    if MOTION_SAMPLES.fetch_add(1, Ordering::Relaxed) % 100 == 0 {
-        diag::log(&format!(
-            "sample: cursor=({:.0},{:.0}) delta=({:.0},{:.0}) bbox={:?} remote={} controls_remote={}",
-            x,
-            y,
-            d.0,
-            d.1,
-            bbox,
-            l.screens.iter().filter(|s| !s.is_local).count(),
-            c.remote.is_some()
-        ));
-    }
-    let Some((side, name)) = edge_remote(l.screens.iter().filter(|s| !s.is_local), bbox, x, y)
-    else {
-        // Not pinned: let the user roam the local displays natively; decay stale pushes.
-        if let Some(t) = c.last_pin {
-            if t.elapsed().as_millis() >= PIN_WINDOW_MS {
-                c.pins = 0;
-            }
-        }
-        return;
-    };
-    // Just-returned grace window: the cursor is parked a few pixels inside the shared edge,
-    // so ignore any push into that edge until the user has had a beat to move away from it.
-    if let Some(t) = c.cooldown_until {
-        if std::time::Instant::now() < t {
-            return;
-        }
-    }
-    // Gliding ALONG the edge (e.g. moving down a list that hugs the border) is not a push:
-    // the along-axis delta is large while the crossing axis stays clamped.
-    let along = match side {
-        Side::Right | Side::Left => d.1,
-        Side::Top | Side::Bottom => d.0,
-    };
-    if along.abs() > 3.0 {
-        c.pins = 0;
-        c.last_pin = None;
-        return;
-    }
-    let now = std::time::Instant::now();
-    c.pins = match c.last_pin {
-        Some(t) if now.duration_since(t).as_millis() < PIN_WINDOW_MS => c.pins + 1,
-        _ => 1,
-    };
-    c.last_pin = Some(now);
-    // Bounce the cursor back inside so the next outward push produces fresh motion events
-    // (while pinned at a display edge the OS reports no movement at all).
-    let back = bounce_point(side, bbox, x, y);
-    input::warp_cursor(back.0, back.1);
-    c.last_real = back;
-    diag::log(&format!(
-        "event-path pin: side={:?} at ({:.0},{:.0}) push={}/{} target={} bbox={:?}",
-        side, x, y, c.pins, PIN_THRESHOLD, name, bbox
-    ));
-    if c.pins >= PIN_THRESHOLD {
-        hand_off(c, &l, net, side, &name, back.0, back.1, bbox);
-    }
-}
-
-/// The shared remote-control step: apply one motion delta `d` to the secondary's virtual
-/// cursor, send it, and hand control back when the virtual cursor exits the screen across
-/// the shared edge. Used by the event-stream path (`remote_move`, non-macOS) and by the
-/// delta tap (`remote_delta`, macOS).
-fn remote_step(
-    c: &mut Ctrl,
-    l: &Layout,
-    net: &Arc<Mutex<Net>>,
-    primary_name: &str,
-    r: RemoteCtrl,
-    d: (f64, f64),
-) {
-    let Some(s) = l.screens.iter().find(|s| s.name == r.name) else {
-        // The secondary vanished from the layout — take control back.
-        c.remote = None;
-        crate::sys_cursor::show();
-        return;
-    };
-    let (w, h) = (s.w as f64, s.h as f64);
-    // Throttled diagnostic sample while a secondary has control: shows whether the user's
-    // deltas are actually driving the secondary's virtual cursor (and how far it travels),
-    // which is the missing half of the picture in any "crossing doesn't work" report.
-    if REMOTE_SAMPLES.fetch_add(1, Ordering::Relaxed) % 100 == 0 {
-        diag::log(&format!(
-            "remote sample: {} vcursor=({:.0},{:.0}) screen={:.0}x{:.0} delta=({:.0},{:.0})",
-            r.name, r.vx, r.vy, w, h, d.0, d.1
-        ));
-    }
-    let mut vx = r.vx + d.0;
-    let mut vy = r.vy + d.1;
-    let back = match r.side {
-        Side::Right => vx < -1.0,
-        Side::Left => vx > w,
-        Side::Bottom => vy < -1.0,
-        Side::Top => vy > h,
-    };
-    if back {
-        // Crossed back over the shared edge: control returns to the primary. Place the real
-        // cursor just inside the local bbox where the virtual cursor exited. Show the cursor
-        // BEFORE warping — a warp issued while the cursor is hidden does not stick on macOS.
-        let (bl, bt, br, bb) = l.local_bbox().unwrap_or((0.0, 0.0, 1920.0, 1080.0));
-        let fy = (vy / h).clamp(0.0, 1.0);
-        let fx = (vx / w).clamp(0.0, 1.0);
-        let target = match r.side {
-            Side::Right => (br - BOUNCE_IN, bt + fy * (bb - bt)),
-            Side::Left => (bl + BOUNCE_IN, bt + fy * (bb - bt)),
-            Side::Bottom => (bl + fx * (br - bl), bb - BOUNCE_IN),
-            Side::Top => (bl + fx * (br - bl), bt + BOUNCE_IN),
-        };
-        c.remote = None;
-        c.pins = 0;
-        c.cooldown_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(RETURN_COOLDOWN_MS));
-        crate::sys_cursor::show();
-        input::warp_cursor(target.0, target.1);
-        c.last_real = target;
-        info!("control returned to {}", primary_name);
-        diag::log(&format!(
-            "RETURN <- {} exit=({:.0},{:.0}) target=({:.0},{:.0})",
-            r.name, vx, vy, target.0, target.1
-        ));
-        return;
-    }
-    vx = vx.clamp(0.0, w - 1.0);
-    vy = vy.clamp(0.0, h - 1.0);
-    net.lock().unwrap().send_input(&r.name, InputEvent::MouseMove { x: vx, y: vy });
-    c.remote = Some(RemoteCtrl { name: r.name.clone(), side: r.side, vx, vy });
-}
-
-/// Hand control to the secondary `name` attached on `side`. Seeds its virtual cursor at the
-/// shared edge (proportionally aligned with where the real cursor left the primary).
-///
-/// NOTE: no park warp here. Warping the (now hidden) cursor to the middle of the local bbox
-/// does not stick on macOS while the pointer keeps receiving hardware motion, and it is no
-/// longer needed: during remote control the local cursor is hidden and its *positions* are
-/// ignored — motion is sourced from the delta tap (src/delta.rs). The cursor simply stays
-/// where it was (near the shared edge) until RETURN places it explicitly.
-fn hand_off(
-    c: &mut Ctrl,
-    l: &Layout,
-    net: &Arc<Mutex<Net>>,
-    side: Side,
-    name: &str,
-    from_x: f64,
-    from_y: f64,
-    bbox: (f64, f64, f64, f64),
-) {
-    let Some(s) = l.screens.iter().find(|s| s.name == name) else { return };
-    let (w, h) = (s.w as f64, s.h as f64);
-    let (bl, bt, br, bb) = bbox;
-    let fx = ((from_x - bl) / (br - bl)).clamp(0.0, 1.0);
-    let fy = ((from_y - bt) / (bb - bt)).clamp(0.0, 1.0);
-    let (vx, vy) = match side {
-        Side::Right => (6.0, 2.0 + fy * (h - 4.0)),
-        Side::Left => (w - 7.0, 2.0 + fy * (h - 4.0)),
-        Side::Bottom => (2.0 + fx * (w - 4.0), 6.0),
-        Side::Top => (2.0 + fx * (w - 4.0), h - 7.0),
-    };
-    c.remote = Some(RemoteCtrl { name: name.to_string(), side, vx, vy });
-    c.pins = 0;
-    c.last_pin = None;
-    // Hide the local cursor: control now lives on the secondary, and a cursor parked
-    // visibly in the middle of the screen reads as "crossing failed".
-    crate::sys_cursor::hide();
-    net.lock().unwrap().send_input(name, InputEvent::MouseMove { x: vx, y: vy });
-    info!("control handed to {} ({:?})", name, side);
-    diag::log(&format!(
-        "HAND-OFF -> {} side={:?} entry=({:.0},{:.0}) cursor_left_at=({:.0},{:.0}) bbox={:?}",
-        name, side, vx, vy, from_x, from_y, bbox
-    ));
-}
-
-/// Is the cursor pinned against an outer edge of the local bbox that has a secondary attached
-/// just beyond it? Returns that side and the secondary's name.
-fn edge_remote<'a>(
-    remotes: impl Iterator<Item = &'a crate::layout::Screen>,
-    bbox: (f64, f64, f64, f64),
-    x: f64,
-    y: f64,
-) -> Option<(Side, String)> {
-    let (bl, bt, br, bb) = bbox;
-    for s in remotes {
-        let sl = s.ox as f64;
-        let st = s.oy as f64;
-        let sr = sl + s.w as f64;
-        let sb = st + s.h as f64;
-        let overlap_v = st < bb && sb > bt; // overlaps the bbox's vertical span
-        let overlap_h = sl < br && sr > bl; // overlaps the bbox's horizontal span
-        if x >= br - EDGE_PIN && sl >= br - EDGE_ATTACH && overlap_v {
-            return Some((Side::Right, s.name.clone()));
-        }
-        if x <= bl + EDGE_PIN && sr <= bl + EDGE_ATTACH && overlap_v {
-            return Some((Side::Left, s.name.clone()));
-        }
-        if y >= bb - EDGE_PIN && st >= bb - EDGE_ATTACH && overlap_h {
-            return Some((Side::Bottom, s.name.clone()));
-        }
-        if y <= bt + EDGE_PIN && sb <= bt + EDGE_ATTACH && overlap_h {
-            return Some((Side::Top, s.name.clone()));
-        }
-    }
-    None
-}
-
-/// After a pin: pull the cursor this far back inside the bbox so the next outward push
-/// produces fresh motion events.
-fn bounce_point(side: Side, bbox: (f64, f64, f64, f64), x: f64, y: f64) -> (f64, f64) {
-    let (bl, bt, br, bb) = bbox;
-    match side {
-        Side::Right => (br - BOUNCE_IN, y.clamp(bt, bb - 1.0)),
-        Side::Left => (bl + BOUNCE_IN, y.clamp(bt, bb - 1.0)),
-        Side::Bottom => (x.clamp(bl, br - 1.0), bb - BOUNCE_IN),
-        Side::Top => (x.clamp(bl, br - 1.0), bt + BOUNCE_IN),
-    }
-}
-
-/// Where the real (primary) cursor is parked while a secondary has control: the centre of the
-/// local bbox. From there it cannot accidentally touch a shared edge, and every real motion is
-/// translated into remote deltas instead of moving anything on this machine.
-fn park_anchor(bbox: (f64, f64, f64, f64)) -> (f64, f64) {
-    ((bbox.0 + bbox.2) / 2.0, (bbox.1 + bbox.3) / 2.0)
-}
-
-/// Forward an input event to the secondary that currently has control — only while a
-/// hand-off is active. Local input is never forwarded.
-fn forward_if_remote(net: &Arc<Mutex<Net>>, ctrl: &Arc<Mutex<Ctrl>>, ev: InputEvent) {
-    let c = ctrl.lock().unwrap();
-    if let Some(r) = &c.remote {
-        net.lock().unwrap().send_input(&r.name, ev);
-    }
-}
-
-/// Which outer edge of the local bbox is this remote attached just beyond?
-fn attached_side(s: &crate::layout::Screen, bbox: (f64, f64, f64, f64)) -> Option<Side> {
-    let (bl, bt, br, bb) = bbox;
-    let sl = s.ox as f64;
-    let st = s.oy as f64;
-    let sr = sl + s.w as f64;
-    let sb = st + s.h as f64;
-    if sl >= br - EDGE_ATTACH {
-        Some(Side::Right)
-    } else if sr <= bl + EDGE_ATTACH {
-        Some(Side::Left)
-    } else if st >= bb - EDGE_ATTACH {
-        Some(Side::Bottom)
-    } else if sb <= bt + EDGE_ATTACH {
-        Some(Side::Top)
-    } else {
-        None
-    }
-}
-
-/// Rotate control: local machine → each secondary → back to local. Invoked by the hotkey
-/// (ScrollLock) on the primary, or relayed from a secondary.
-fn cycle_control(
-    net: &Arc<Mutex<Net>>,
-    layout: &Arc<Mutex<Layout>>,
-    ctrl: &Arc<Mutex<Ctrl>>,
-    primary_name: &str,
-) {
-    // Lock order: ctrl, then layout (same as handle_capture).
-    let mut c = ctrl.lock().unwrap();
-    let l = layout.lock().unwrap();
-    if l.screens.len() <= 1 {
-        return;
-    }
-    let Some(bbox) = l.local_bbox() else { return };
-    // Unique remote screens in layout order.
-    let mut remotes: Vec<&crate::layout::Screen> = Vec::new();
-    for s in &l.screens {
-        if !s.is_local && !remotes.iter().any(|r| r.name == s.name) {
-            remotes.push(s);
-        }
-    }
-    if remotes.is_empty() {
-        return;
-    }
-    let idx = match &c.remote {
-        Some(r) => remotes
-            .iter()
-            .position(|s| s.name == r.name)
-            .map(|i| i + 1)
-            .unwrap_or(0),
-        None => 0,
-    };
-    if idx >= remotes.len() {
-        // Wrap around: control returns to the primary. The real cursor is already parked at
-        // the anchor on this machine — just resume local control.
-        c.remote = None;
-        c.pins = 0;
-        c.cooldown_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(RETURN_COOLDOWN_MS));
-        crate::sys_cursor::show();
-        info!("control returned to {} (hotkey)", primary_name);
-        return;
-    }
-    let name = remotes[idx].name.clone();
-    let side = attached_side(remotes[idx], bbox).unwrap_or(Side::Right);
-    let anchor = park_anchor(bbox);
-    hand_off(&mut c, &l, net, side, &name, anchor.0, anchor.1, bbox);
-}
-
-/// Start the **remote-motion driver** — the one thing that actually moves a secondary's
-/// cursor while it has control.
-///
-/// ## Why this exists
-///
-/// The OS clamps the real cursor at a display edge: once it touches one, the position stops
-/// changing no matter how hard the user pushes. So after a hand-off the cursor sits pinned at
-/// the shared edge, and any motion source based on *cursor positions* — the rdev event
-/// stream, a `GetCursorPos`/`CGEventGetLocation` poll — goes completely silent. That is why
-/// crossing looked broken for so long: the hand-off happened, but the secondary never
-/// received another delta.
-///
-/// macOS had a workaround (a raw hardware delta tap, `src/delta.rs`), but Windows and Linux
-/// had none at all, so a non-macOS primary could never drive a remote cursor.
-///
-/// ## The fix: treadmill
-///
-/// Sample the real cursor at a high rate and **never let it reach an edge** — whenever it
-/// comes within `TREADMILL_MARGIN` of the local bounding box, warp it back to the centre.
-/// The user's motion therefore always produces a measurable delta, on every platform, with
-/// no reliance on the event stream and no per-OS raw-input plumbing. The delta for the frame
-/// that triggers the re-centre is still delivered, so no motion is lost.
-///
-/// The local cursor is hidden while a secondary has control, so the re-centre is invisible.
-fn start_remote_driver(
-    net: Arc<Mutex<Net>>,
-    layout: Arc<Mutex<Layout>>,
-    ctrl: Arc<Mutex<Ctrl>>,
-    primary_name: String,
-) {
-    std::thread::spawn(move || {
-        let mut last: Option<(f64, f64)> = None;
-        let mut announced = false;
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(DRIVE_INTERVAL_MS));
-            let Some(pos) = input::cursor_position() else {
-                // No OS sampler for this platform — the driver cannot run. Log once so the
-                // situation is visible instead of the thread just vanishing.
-                if !announced {
-                    announced = true;
-                    diag::log("remote driver: no OS cursor sampler on this platform; driver idle");
-                }
-                return;
-            };
-            let Some(bbox) = layout.lock().unwrap().local_bbox() else {
-                continue;
-            };
-
-            // Compute the treadmill target *before* taking the ctrl lock: re-centre on the
-            // local display the cursor is currently on, not on the bounding-box centre —
-            // with an L-shaped or staggered multi-monitor arrangement the bbox centre can
-            // fall in a gap where no display exists, and warping there gets clamped straight
-            // back to an edge (which is exactly the starvation we are trying to avoid).
-            let (bl, bt, br, bb) = bbox;
-            let centre = ((bl + br) / 2.0, (bt + bb) / 2.0);
-            let home = {
-                let l = layout.lock().unwrap();
-                l.screens
-                    .iter()
-                    .filter(|s| s.is_local)
-                    .find(|s| s.contains(pos.0, pos.1))
-                    .map(|s| {
-                        (
-                            s.ox as f64 + s.w as f64 / 2.0,
-                            s.oy as f64 + s.h as f64 / 2.0,
-                        )
-                    })
-                    .unwrap_or(centre)
-            };
-
-            // Lock order: ctrl, then layout, then net (same as handle_capture).
-            let mut c = ctrl.lock().unwrap();
-            let Some(r) = c.remote.clone() else {
-                // Local control: keep the baseline fresh so the first remote sample after a
-                // hand-off is a real delta, not the edge→park jump.
-                last = Some(pos);
-                continue;
-            };
-            let Some(prev) = last else {
-                last = Some(pos);
-                continue;
-            };
-            let d = (pos.0 - prev.0, pos.1 - prev.1);
-            if d.0 == 0.0 && d.1 == 0.0 {
-                continue; // cursor parked — nothing moved
-            }
-            last = Some(pos);
-
-            // Treadmill: pull the cursor back to the centre before it can be clamped by an
-            // edge, so the next frame still yields a real delta.
-            if pos.0 < bl + TREADMILL_MARGIN
-                || pos.0 > br - TREADMILL_MARGIN
-                || pos.1 < bt + TREADMILL_MARGIN
-                || pos.1 > bb - TREADMILL_MARGIN
-            {
-                input::warp_cursor(home.0, home.1);
-                last = Some(home);
-                // Keep the event-stream baseline in sync so it does not read our own warp as
-                // a huge real delta.
-                c.last_real = home;
-            }
-
-            let l = layout.lock().unwrap();
-            remote_step(&mut c, &l, &net, &primary_name, r, d);
-        }
-    });
-}
-
-/// `--probe`: coordinate-space self-test for the crossing pipeline.
-///
-/// Warps the cursor to a series of known points (screen corners and the shared-edge zone of
-/// whatever layout this machine reports), then prints — side by side — the position the
-/// event stream reports (`rdev::listen`) and a direct OS read (`CGEventGetLocation`). If the
-/// two disagree, or land far from the requested point, the coordinates the crossing logic
-/// relies on are broken and the mismatch is right there on the screen.
-fn probe() -> anyhow::Result<()> {
-    println!("MouseShare coordinate probe");
-    let layout = detect_primary_layout("probe-primary");
-    let bbox = layout.local_bbox().unwrap_or((0.0, 0.0, 1920.0, 1080.0));
-    for s in &layout.screens {
-        println!(
-            "  screen {} {}x{}@({},{} ) local={}",
-            s.name, s.w, s.h, s.ox, s.oy, s.is_local
-        );
-    }
-    println!("  local bbox = {:?}", bbox);
-
-    // Latest position reported by the event stream.
-    let last: Arc<Mutex<Option<(f64, f64)>>> = Arc::new(Mutex::new(None));
-    {
-        let last = last.clone();
-        input::start_capture(move |e: Event| {
-            if let EventType::MouseMove { x, y } = e.event_type {
-                *last.lock().unwrap() = Some((x, y));
-            }
-        });
-    }
-    std::thread::sleep(std::time::Duration::from_millis(300)); // let the tap come up
-
-    let (bl, bt, br, bb) = bbox;
-    let points: Vec<(&str, f64, f64)> = vec![
-        ("local-bbox top-left", bl + 5.0, bt + 5.0),
-        ("local-bbox centre", (bl + br) / 2.0, (bt + bb) / 2.0),
-        ("local-bbox right edge", br - 2.0, (bt + bb) / 2.0),
-        ("local-bbox bottom edge", (bl + br) / 2.0, bb - 2.0),
-        ("origin", 1.0, 1.0),
-    ];
-    for (label, wx, wy) in points {
-        // Clear the last-seen marker so the next event must be fresh.
-        *last.lock().unwrap() = None;
-        input::warp_cursor(wx, wy);
-        std::thread::sleep(std::time::Duration::from_millis(350));
-        let heard = *last.lock().unwrap();
-        let direct = input::cursor_position();
-        println!("warp to {:?} ({:.0},{:.0})", label, wx, wy);
-        match heard {
-            Some((x, y)) => println!("    listen : {:.1},{:.1}", x, y),
-            None => println!("    listen : <no event>"),
-        }
-        match direct {
-            Some((x, y)) => println!("    direct : {:.1},{:.1}", x, y),
-            None => println!("    direct : <unavailable>"),
-        }
-    }
-    println!("probe done");
-    Ok(())
+/// Switch hotkey detection (ScrollLock, or Ctrl+Alt+Space). Returns `true` only on the press that
+/// fires. Shared by the secondary hotkey listener; the primary detects it inside the grab tap.
+fn hotkey_fired(k: rdev::Key, down: bool, st: &mut HotkeyState) -> bool {
+    control::hotkey_fired(k, down, st)
 }
 
 /// Build the primary's initial layout from the machine's real displays.
-/// On macOS this enumerates every attached screen via `display-info` (Core Graphics), placing each
-/// at its true virtual-desktop position — so a Mac with two monitors shows both and the cursor can
-/// roam between them natively (each is `is_local = true`). Coordinates come from `CGDisplayBounds`,
-/// whose global display space (origin top-left of the main display, y down) matches the cursor
-/// coordinates `rdev` reports on macOS, so the layout lines up with reality. On other platforms, or
-/// if enumeration fails, we fall back to a single 1080p screen at the origin. Remote (secondary)
-/// screens are added later as peers connect (see `Layout::ensure_screen`).
+///
+/// On macOS this enumerates every attached screen via `display-info`, placing each at its true
+/// virtual-desktop position (each is `is_local = true`) so a multi-monitor Mac roams between them
+/// natively. On other platforms, or if enumeration fails, we fall back to a single 1080p screen at
+/// the origin. Remote (secondary) screens are added later as peers connect.
 fn detect_primary_layout(primary_name: &str) -> Layout {
     #[cfg(target_os = "macos")]
     {
         match display_info::DisplayInfo::all() {
             Ok(displays) if !displays.is_empty() => {
-                // Stable left-to-right, then top-to-bottom order. The main display keeps the bare
-                // `primary_name`; the rest get a "#n" suffix (every local screen needs a unique
-                // name, but all share `is_local = true` so none of them is ever forwarded).
                 let mut d: Vec<_> = displays.into_iter().collect();
                 d.sort_by(|a, b| a.x.cmp(&b.x).then_with(|| a.y.cmp(&b.y)));
                 let mut screens = Vec::with_capacity(d.len());
@@ -1248,15 +372,15 @@ fn detect_primary_layout(primary_name: &str) -> Layout {
                 return Layout { screens };
             }
             Ok(_) => log::warn!("no displays reported; falling back to a single 1080p screen"),
-            Err(e) => log::warn!("display enumeration failed ({}); falling back to single screen", e),
+            Err(e) => log::warn!(
+                "display enumeration failed ({}); falling back to single screen",
+                e
+            ),
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = primary_name;
-        // Real display size (physical pixels on Windows, which is DPI-aware at this point)
-        // instead of a hardcoded 1920x1080 guess, so a non-macOS primary starts with a
-        // bbox that actually matches its screen.
         if let Ok((w, h)) = rdev::display_size() {
             return Layout {
                 screens: vec![crate::layout::Screen {

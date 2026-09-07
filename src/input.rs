@@ -1,32 +1,38 @@
-//! Input capture (primary, via rdev::listen) and injection (secondary, via rdev::simulate).
+//! Input injection (secondary, via rdev::simulate) and cursor helpers shared by the capture layer.
+//!
+//! ## Why injection is *relative*
+//!
+//! The protocol forwards `MouseMotion { dx, dy }` — a delta, not a position. To apply it we read
+//! the receiver's *own* current cursor position, add the delta, clamp to the receiver's own screen
+//! rectangle (stored at startup via [`set_local_layout`]), and inject the resulting absolute
+//! position. This keeps the two machines' coordinate spaces completely independent: the primary may
+//! be HiDPI and the secondary 1x, yet the cursor tracks 1:1 because only deltas cross the wire.
 
+use crate::layout::Layout;
 use crate::protocol::{InputEvent, MsButton};
-use rdev::{simulate, Button as RdevButton, Event, EventType};
+use rdev::{simulate, Button as RdevButton, EventType};
+use std::sync::OnceLock;
 
-/// Start the global input listener. Blocks its own thread running the OS event loop.
-/// `cb` is invoked for every global event. (On macOS this requires Accessibility permission.)
-pub fn start_capture<F>(cb: F)
-where
-    F: FnMut(Event) + Send + 'static,
-{
-    std::thread::spawn(move || {
-        if let Err(e) = rdev::listen(cb) {
-            log::error!("input capture failed: {:?}", e);
-            log::error!("On macOS: grant Accessibility permission to the Terminal/app. On Linux: run under X11.");
-            crate::diag::log(&format!("CAPTURE FAILED: {:?} (check Accessibility permission)", e));
-        } else {
-            crate::diag::log("capture thread started (event tap active)");
-        }
-    });
+/// The receiver's own screens, used to clamp injected cursor positions. Set once at startup on
+/// every machine (even primaries, harmlessly) via [`set_local_layout`].
+static LOCAL_LAYOUT: OnceLock<Layout> = OnceLock::new();
+
+pub fn set_local_layout(layout: &Layout) {
+    let _ = LOCAL_LAYOUT.set(layout.clone());
 }
 
 /// Apply a forwarded input event on this machine (used by secondaries).
+///
+/// `MouseMotion` is applied relatively (see module docs); everything else is forwarded verbatim.
 pub fn apply_input(ev: &InputEvent) {
     let result = match ev {
-        InputEvent::MouseMove { x, y } => simulate(&EventType::MouseMove { x: *x, y: *y }),
+        InputEvent::MouseMotion { dx, dy } => inject_relative(*dx, *dy),
         InputEvent::MouseDown { button } => simulate(&EventType::ButtonPress(button.to_rdev())),
         InputEvent::MouseUp { button } => simulate(&EventType::ButtonRelease(button.to_rdev())),
-        InputEvent::Wheel { dx, dy } => simulate(&EventType::Wheel { delta_x: *dx, delta_y: *dy }),
+        InputEvent::Wheel { dx, dy } => simulate(&EventType::Wheel {
+            delta_x: *dx,
+            delta_y: *dy,
+        }),
         InputEvent::KeyDown { key } => simulate(&EventType::KeyPress(key.clone())),
         InputEvent::KeyUp { key } => simulate(&EventType::KeyRelease(key.clone())),
     };
@@ -35,20 +41,37 @@ pub fn apply_input(ev: &InputEvent) {
     }
 }
 
-/// Warp the local (primary) cursor to an absolute position — the "treadmill" trick that lets
-/// the physical cursor keep generating motion past a screen edge so the virtual cursor can
-/// continue onto a neighbouring screen.
+/// Relative motion: read the current cursor, add the delta, clamp to this machine's own screen,
+/// and inject the absolute result.
+fn inject_relative(dx: f64, dy: f64) -> Result<(), rdev::SimulateError> {
+    let Some((cx, cy)) = cursor_position() else {
+        // No OS sampler (shouldn't happen on a real secondary) — fall back to a raw absolute
+        // move from the origin so at least *something* happens.
+        return simulate(&EventType::MouseMove { x: dx, y: dy });
+    };
+    let (mut nx, mut ny) = (cx + dx, cy + dy);
+    if let Some(layout) = LOCAL_LAYOUT.get() {
+        if let Some((bl, bt, br, bb)) = layout.local_bbox() {
+            nx = nx.clamp(bl, br - 1.0);
+            ny = ny.clamp(bt, bb - 1.0);
+        }
+    }
+    simulate(&EventType::MouseMove { x: nx, y: ny })
+}
+
+/// Warp the local cursor to an absolute position — used by the capture layer to keep the (hidden)
+/// cursor parked against the shared edge while a secondary has control, so the OS never clamps it.
 pub fn warp_cursor(x: f64, y: f64) {
     let _ = simulate(&EventType::MouseMove { x, y });
 }
 
 /// Read the cursor position directly from the OS, *not* from the event stream.
 ///
-/// While the OS pins the cursor against a display edge it may deliver no motion events at
-/// all (or only zero-delta echoes), which makes a purely event-driven edge-crossing
-/// unreliable. The remote-motion driver (src/drive.rs) samples this instead: same Core
-/// Graphics global space (`CGEventGetLocation`, origin = top-left of the main display, y
-/// down) that rdev reports for motion events, so the coordinates are interchangeable.
+/// While the OS pins the cursor against a display edge it may deliver no motion events at all,
+/// which makes a purely event-driven edge-crossing unreliable. The capture layer samples this
+/// instead — same Core Graphics global space (`CGEventGetLocation`, origin = top-left of the main
+/// display, y down) that `MOUSE_EVENT_DELTA_*` are measured against, so the coordinates are
+/// interchangeable.
 #[cfg(target_os = "macos")]
 pub fn cursor_position() -> Option<(f64, f64)> {
     use core_graphics::event::CGEvent;
@@ -83,25 +106,20 @@ pub fn cursor_position() -> Option<(f64, f64)> {
 }
 
 /// Linux/X11: `XQueryPointer` on the default root window. Returns `None` when there is no
-/// X display (e.g. a Wayland session) — the driver then falls back to the event stream.
+/// X display (e.g. a Wayland session).
 ///
-/// The display connection is cached: the remote-motion driver samples at a high rate, and
+/// The display connection is cached: the capture layer samples at a high rate, and
 /// `XOpenDisplay`/`XCloseDisplay` on every sample (a full socket handshake each time) is
 /// expensive enough to starve the poll loop.
 #[cfg(target_os = "linux")]
 pub fn cursor_position() -> Option<(f64, f64)> {
     use x11_dl::xlib::{Display, Xlib};
 
-    // Cache library handle + display connection for the process lifetime. `XOpenDisplay` is a
-    // full socket handshake; doing it on every sample would starve the poll loop.
-    // NB: the pointer is kept as `usize` because raw pointers are neither `Send` nor `Sync`
-    // and therefore cannot live inside a `static`.
     static CONN: std::sync::OnceLock<Option<(&'static Xlib, usize)>> = std::sync::OnceLock::new();
 
     let (xlib, display) = CONN
         .get_or_init(|| {
             let xlib: &'static Xlib = Box::leak(Box::new(Xlib::open().ok()?));
-            // Xlib is not thread-safe by default and we sample from a dedicated driver thread.
             unsafe { (xlib.XInitThreads)() };
             let display = unsafe { (xlib.XOpenDisplay)(std::ptr::null()) };
             if display.is_null() {
@@ -122,14 +140,7 @@ pub fn cursor_position() -> Option<(f64, f64)> {
         let mut wy = 0i32;
         let mut mask = 0u32;
         let ok = (xlib.XQueryPointer)(
-            display,
-            root,
-            &mut root_ret,
-            &mut child_ret,
-            &mut rx,
-            &mut ry,
-            &mut wx,
-            &mut wy,
+            display, root, &mut root_ret, &mut child_ret, &mut rx, &mut ry, &mut wx, &mut wy,
             &mut mask,
         );
         if ok != 0 {

@@ -469,7 +469,7 @@ impl eframe::App for MouseShareApp {
             let retry_label = t.retry_connect;
             egui::TopBottomPanel::top("startup_error").show(ctx, |ui| {
                 ui.add_space(10.0);
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(Color32::from_rgb(255, 235, 236))
                     .inner_margin(egui::Margin::symmetric(14, 10))
                     .corner_radius(10)
@@ -520,7 +520,7 @@ impl eframe::App for MouseShareApp {
 
         // ---- Central canvas: the virtual desktop ----
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(theme.canvas_bg))
+            .frame(egui::Frame::NONE.fill(theme.canvas_bg))
             .show(ctx, |ui| {
                 // Paint the header into its own measured block so the canvas rectangle below is
                 // exact and does not depend on the fragile cursor state after long hints/legends.
@@ -808,14 +808,6 @@ impl MouseShareApp {
                 let c = self.ctrl.lock().unwrap();
                 let line = if let Some(r) = &c.remote {
                     t.ctrl_remote.replace("{}", &r.name)
-                } else if c.pins > 0
-                    && c.last_pin
-                        .map(|t0| t0.elapsed().as_millis() < crate::PIN_WINDOW_MS)
-                        .unwrap_or(false)
-                {
-                    t.ctrl_pushing
-                        .replace("{n}", &c.pins.to_string())
-                        .replace("{total}", &crate::PIN_THRESHOLD.to_string())
                 } else {
                     t.ctrl_local.to_string()
                 };
@@ -875,7 +867,7 @@ impl MouseShareApp {
 /// A macOS-style inset card: subtle fill, hairline border, 12px radius.
 fn card(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(8.0);
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(ui.visuals().extreme_bg_color)
         .corner_radius(12)
         .inner_margin(egui::Margin::same(14))

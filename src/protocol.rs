@@ -1,8 +1,22 @@
 //! Wire protocol shared between the primary (server) and secondary (client) machines.
 //!
 //! Frames are: `[u32 LE length][JSON(Message)]` sent over a TCP stream.
+//!
+//! ## Coordinate convention
+//!
+//! Mouse motion is forwarded as a **relative delta** (`MouseMotion { dx, dy }`), never as an
+//! absolute position. This is the single most important design decision and the one the old
+//! `rdev::listen`-based build got wrong:
+//!
+//! * Relative deltas need no agreement about screen geometry, DPI or scaling between the two
+//!   machines — the receiver just accumulates them against its own real cursor, so a HiDPI
+//!   primary driving a non-HiDPI secondary (or vice-versa) never drifts.
+//! * The capture side *grabs* the event (macOS `CGEventTap` returning `Drop`) so the delta
+//!   stream keeps flowing even when the physical cursor is pinned against a display edge —
+//!   the OS never clamps a motion that it never receives, which is exactly why the old
+//!   observer-based code needed the treadmill/edge-rest band-aids this protocol makes obsolete.
 
-use crate::layout::Layout;
+use crate::layout::Side;
 use rdev::{Button as RdevButton, Key};
 use serde::{Deserialize, Serialize};
 
@@ -18,8 +32,10 @@ pub enum MsButton {
 /// Everything that can be forwarded as an input event to another machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputEvent {
-    /// Absolute position *inside the target screen* (already translated to the peer's origin).
-    MouseMove { x: f64, y: f64 },
+    /// Relative mouse motion in the receiver's own coordinate space. `dx`/`dy` are signed
+    /// pixel deltas (macOS `kCGMouseEventDeltaX/Y`, which may be fractional); the receiver
+    /// adds them to its current cursor position and clamps to its own screen.
+    MouseMotion { dx: f64, dy: f64 },
     MouseDown { button: MsButton },
     MouseUp { button: MsButton },
     /// Wheel deltas (sign conventions follow rdev: dy > 0 scrolls down).
@@ -34,7 +50,8 @@ pub enum InputEvent {
 pub enum Message {
     /// Sent immediately after connecting so the hub knows the peer's name + screen size.
     Hello { name: String, width: u32, height: u32 },
-    /// An input event destined for a specific screen (routed by the hub / applied by the client).
+    /// An input event destined for the machine that currently has control (routed by the hub
+    /// / applied by the client).
     Input(InputEvent),
     /// Clipboard contents (broadcast, loop-suppressed on the receiving side).
     Clipboard { text: String },
@@ -42,10 +59,13 @@ pub enum Message {
     /// the same map (including the primary's own screen and every peer's position). Without
     /// this a secondary only ever sees its own local `config.layout` and never learns about the
     /// primary's display.
-    Layout { layout: Layout },
-    /// Hint: the cursor just entered a secondary screen.
-    EnterScreen,
-    /// Hint: the cursor just left a secondary screen.
+    Layout { layout: crate::layout::Layout },
+    /// Hint: the cursor just entered a secondary screen. `side` is the edge of the *controlling*
+    /// machine that the secondary sits beyond (so the secondary seeds its own cursor at the
+    /// opposite edge); `fx`/`fy` are the fractional position along that edge where the cursor
+    /// crossed (0..1), used to align entry vertically/horizontally.
+    EnterScreen { side: Side, fx: f64, fy: f64 },
+    /// Hint: the cursor just left a secondary screen and control returned to the primary.
     LeaveScreen,
     /// Keep-alive.
     Ping,

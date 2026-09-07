@@ -94,6 +94,17 @@ impl Net {
         }
     }
 
+    /// Send a targeted (non-input) message to a specific peer. Used by the control plane to tell a
+    /// secondary that the cursor is entering (`EnterScreen`) or leaving (`LeaveScreen`) its screen.
+    /// No-op unless this is a `Primary` hub (only the primary routes to named peers).
+    pub fn send_to(&self, target: &str, msg: Message) {
+        if let Net::Primary { peers } = self {
+            if let Some(tx) = peers.lock().unwrap().get(target) {
+                let _ = tx.send(msg);
+            }
+        }
+    }
+
     pub fn peer_count(&self) -> usize {        match self {
             Net::Primary { peers } => peers.lock().unwrap().len(),
             Net::Secondary { .. } => 1,

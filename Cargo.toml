@@ -1,6 +1,6 @@
 [package]
 name = "mouseshare"
-version = "0.1.0"
+version = "0.3.31"
 edition = "2021"
 description = "Share mouse, keyboard and clipboard across computers over LAN, with a draggable screen-layout. Cross-platform (Windows/Linux/macOS)."
 license = "MIT OR Apache-2.0"
@@ -38,6 +38,8 @@ display-info = "0.5.9"
 # the delta event tap for remote-control motion. Same version as rdev's core-graphics dep,
 # so no extra compilation.
 core-graphics = "0.23"
+# Runloop + mach-port plumbing for the CGEventTap run loop (create_runloop_source / add_source).
+core-foundation = "0.9"
 
 # Linux: XQueryPointer for direct cursor-position sampling (the remote-motion driver's
 # treadmill). rdev already links X11 on Linux, so this adds no new system dependency.

@@ -3,6 +3,31 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Which side of a machine's local bounding box a neighbour screen is attached beyond.
+/// `Right` means "the neighbour sits to the right of this machine", etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Side {
+    Right,
+    Left,
+    Top,
+    Bottom,
+}
+
+impl Side {
+    /// The edge of the *other* machine that this screen's cursor enters from. If a secondary is
+    /// to the `Right` of the primary, the cursor reaches it by crossing the primary's right edge
+    /// and appears on the secondary's `Left` edge — so the secondary seeds its virtual cursor on
+    /// its own opposite side.
+    pub fn opposite(self) -> Side {
+        match self {
+            Side::Right => Side::Left,
+            Side::Left => Side::Right,
+            Side::Top => Side::Bottom,
+            Side::Bottom => Side::Top,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Screen {
     /// Unique machine name (must match that machine's `Config.name`).
