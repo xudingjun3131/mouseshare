@@ -290,6 +290,22 @@ pub fn setup_style(ctx: &egui::Context) {
     style.spacing.combo_width = 240.0;
     style.spacing.scroll.bar_width = 9.0;
 
+    // ---- Typography: a real macOS type scale ----
+    // egui's built-in ramp (Small 9 / Body 12.5 / Button 12.5 / Heading 18) is cramped and isn't
+    // a coherent scale. macOS uses 11pt small, 13pt body/label/button, 15pt section title and
+    // 17pt window title. Everything drawn *without* an explicit `.size()` — buttons, labels,
+    // panels, i.e. most of the chrome — picks these up, so this fixes default typography in one
+    // place instead of hunting through every widget.
+    style.text_styles = [
+        (egui::TextStyle::Small, egui::FontId::new(11.0, egui::FontFamily::Proportional)),
+        (egui::TextStyle::Body, egui::FontId::new(13.0, egui::FontFamily::Proportional)),
+        (egui::TextStyle::Button, egui::FontId::new(13.0, egui::FontFamily::Proportional)),
+        (egui::TextStyle::Heading, egui::FontId::new(17.0, egui::FontFamily::Proportional)),
+        (egui::TextStyle::Monospace, egui::FontId::new(12.5, egui::FontFamily::Monospace)),
+    ]
+    .into_iter()
+    .collect();
+
     // Uniform control rounding — the macOS squircle look.
     for w in [
         &mut style.visuals.widgets.inactive,
