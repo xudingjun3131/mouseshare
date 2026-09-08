@@ -25,6 +25,17 @@ pub fn set_local_layout(layout: &Layout) {
     let _ = LOCAL_LAYOUT.set(layout.clone());
 }
 
+/// UI scale factor of this machine's own coordinate space (2.0 on a Retina Mac, 1.0 on a
+/// DPI-aware Windows/Linux box). Advertised in `Hello` so the primary can normalise the mouse
+/// deltas it forwards. Defaults to 1.0 before the layout is registered.
+pub fn local_scale() -> f32 {
+    LOCAL_LAYOUT
+        .get()
+        .and_then(|l| l.screens.iter().find(|s| s.is_local))
+        .map(|s| s.scale)
+        .unwrap_or(1.0)
+}
+
 /// Apply a forwarded input event on this machine (used by secondaries).
 ///
 /// `MouseMotion` is applied relatively (see module docs); everything else is forwarded verbatim.

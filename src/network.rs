@@ -174,17 +174,25 @@ fn handle_primary_conn(
     // The first frame must be Hello so we learn the peer's name.
     let mut rs = read_stream;
     let hello = read_msg(&mut rs).ok();
-    let (name, width, height) = match hello {
-        Some(Message::Hello { name, width, height }) => (name, width, height),
+    let (name, width, height, scale) = match hello {
+        Some(Message::Hello {
+            name,
+            width,
+            height,
+            scale,
+        }) => (name, width, height, scale),
         _ => {
             log::warn!("peer did not send Hello; dropping");
             return;
         }
     };
-    log::info!("secondary connected: {}", name);
+    log::info!("secondary connected: {} (scale {})", name, scale);
 
     // Register the peer's screen (idempotent) so the layout we push already includes it.
-    layout.lock().unwrap().ensure_screen(&name, width, height, false);
+    layout
+        .lock()
+        .unwrap()
+        .ensure_screen(&name, width, height, false, scale);
 
     let (tx, rx) = channel::<Message>();
     peers.lock().unwrap().insert(name.clone(), tx.clone());

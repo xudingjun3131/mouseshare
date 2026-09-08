@@ -501,6 +501,7 @@ impl MouseShareApp {
                     name: self.my_name.clone(),
                     width: w,
                     height: h,
+                    scale: crate::input::local_scale(),
                 })
                 .ok();
                 self.net = net_inner;

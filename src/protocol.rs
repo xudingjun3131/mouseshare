@@ -20,6 +20,11 @@ use crate::layout::Side;
 use rdev::{Button as RdevButton, Key};
 use serde::{Deserialize, Serialize};
 
+/// Default UI scale for a peer that never reports one (see `Message::Hello`).
+fn default_hello_scale() -> f32 {
+    1.0
+}
+
 /// Our own, serializable mouse-button enum (mirrors `rdev::Button`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MsButton {
@@ -32,9 +37,12 @@ pub enum MsButton {
 /// Everything that can be forwarded as an input event to another machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputEvent {
-    /// Relative mouse motion in the receiver's own coordinate space. `dx`/`dy` are signed
-    /// pixel deltas (macOS `kCGMouseEventDeltaX/Y`, which may be fractional); the receiver
-    /// adds them to its current cursor position and clamps to its own screen.
+    /// Relative mouse motion, **already normalised into the receiver's coordinate space**.
+    /// The primary multiplies its own OS delta by `own_scale / receiver_scale` before sending
+    /// (see `control::enter_forwarding`), so a Retina primary drives a 1x secondary at the same
+    /// physical cursor speed instead of half of it. `dx`/`dy` are signed pixel deltas (macOS
+    /// `kCGMouseEventDeltaX/Y`, which may be fractional); the receiver adds them to its current
+    /// cursor position and clamps to its own screen.
     MouseMotion { dx: f64, dy: f64 },
     MouseDown { button: MsButton },
     MouseUp { button: MsButton },
@@ -49,7 +57,17 @@ pub enum InputEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     /// Sent immediately after connecting so the hub knows the peer's name + screen size.
-    Hello { name: String, width: u32, height: u32 },
+    Hello {
+        name: String,
+        width: u32,
+        height: u32,
+        /// UI scale factor of the reporting machine's **coordinate space** (2.0 on a Retina Mac,
+        /// 1.0 on a DPI-aware Windows/Linux box). The primary needs it to convert its own logical
+        /// mouse deltas into the secondary's units — otherwise a Retina primary drives a 1x
+        /// secondary at half speed. `#[serde(default)]` keeps peers that predate the field working.
+        #[serde(default = "default_hello_scale")]
+        scale: f32,
+    },
     /// An input event destined for the machine that currently has control (routed by the hub
     /// / applied by the client).
     Input(InputEvent),

@@ -140,6 +140,31 @@ impl Layout {
         Some((l, t, r, b))
     }
 
+    /// UI scale factor of the screen named `name` (1.0 when unknown).
+    pub fn scale_of(&self, name: &str) -> f32 {
+        self.screens
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.scale)
+            .unwrap_or(1.0)
+    }
+
+    /// UI scale factor of the *local* screen under `loc`, falling back to the first local screen
+    /// and then to 1.0. Used to normalise forwarded mouse deltas: the cursor may sit on a Retina
+    /// panel (2.0) or on an external 1x monitor, and each needs a different conversion.
+    pub fn local_scale_at(&self, loc: Option<(f64, f64)>) -> f32 {
+        let locals: Vec<&Screen> = self.screens.iter().filter(|s| s.is_local).collect();
+        if locals.is_empty() {
+            return 1.0;
+        }
+        if let Some((x, y)) = loc {
+            if let Some(s) = locals.iter().find(|s| s.contains(x, y)) {
+                return s.scale;
+            }
+        }
+        locals[0].scale
+    }
+
     /// Ensure a screen named `name` exists, adding it (placed *adjacent* to the right of the
     /// current rightmost screen — no gap) only if absent. Returns true when a new screen was
     /// created. Used to auto-register every secondary that connects, so the client count is
@@ -149,8 +174,13 @@ impl Layout {
     /// band) is what makes cursor hand-off possible: the virtual cursor advances continuously and
     /// steps straight from the last local pixel into the first remote pixel, so `screen_at` finds
     /// the remote screen instead of a gap that `clamp` would snap back.
-    pub fn ensure_screen(&mut self, name: &str, w: u32, h: u32, is_local: bool) -> bool {
-        if self.index_of(name).is_some() {
+    pub fn ensure_screen(&mut self, name: &str, w: u32, h: u32, is_local: bool, scale: f32) -> bool {
+        // Already known: refresh the metrics (a peer may reconnect at a different resolution or
+        // after the user changed its display scaling) rather than keeping stale numbers forever.
+        if let Some(s) = self.screens.iter_mut().find(|s| s.name == name) {
+            s.w = w;
+            s.h = h;
+            s.scale = scale;
             return false;
         }
         let max_x = self
@@ -166,7 +196,7 @@ impl Layout {
             w,
             h,
             is_local,
-            scale: 1.0,
+            scale,
         });
         true
     }

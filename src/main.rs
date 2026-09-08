@@ -110,6 +110,18 @@ fn main() -> anyhow::Result<()> {
         config.layout.clone()
     }));
 
+    // This host's own display rectangle(s): used to seed/clamp the virtual cursor while a secondary
+    // is being driven, and as the capture bbox on the primary.
+    let own_layout: Layout = if mode == "primary" {
+        layout.lock().unwrap().clone()
+    } else {
+        detect_primary_layout(&my_name)
+    };
+    input::set_local_layout(&own_layout);
+    // What we advertise to the hub: our local screens' bounding box (logical units) plus the UI
+    // scale of that coordinate space, so the primary can normalise forwarded mouse deltas.
+    let (my_w, my_h, my_scale) = hello_metrics(&own_layout);
+
     let net: Arc<Mutex<Net>> = if mode == "primary" {
         match start_hub(port, inc_tx.clone(), layout.clone()) {
             Ok(n) => n,
@@ -124,11 +136,11 @@ fn main() -> anyhow::Result<()> {
         let n = Net::idle();
         match connect_client(&server_addr, inc_tx.clone(), n.clone()) {
             Ok((net_inner, tx)) => {
-                let (w, h) = rdev::display_size().unwrap_or((1920, 1080));
                 tx.send(Message::Hello {
                     name: my_name.clone(),
-                    width: w as u32,
-                    height: h as u32,
+                    width: my_w,
+                    height: my_h,
+                    scale: my_scale,
                 })
                 .ok();
                 net_inner
@@ -141,15 +153,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
     };
-
-    // This host's own display rectangle(s): used to seed/clamp the virtual cursor while a secondary
-    // is being driven, and as the capture bbox on the primary.
-    let own_layout: Layout = if mode == "primary" {
-        layout.lock().unwrap().clone()
-    } else {
-        detect_primary_layout(&my_name)
-    };
-    input::set_local_layout(&own_layout);
 
     // Control plane.
     let ctrl: Arc<Mutex<Ctrl>> = Arc::new(Mutex::new(Ctrl {
@@ -218,9 +221,13 @@ fn main() -> anyhow::Result<()> {
                             on_secondary_input(&grab_ctx, ev);
                         }
                     }
-                    Message::Hello { name, width, height } => {
+                    Message::Hello { name, width, height, scale } => {
                         if mode2 == "primary" {
-                            if layout.lock().unwrap().ensure_screen(&name, width, height, false) {
+                            if layout
+                                .lock()
+                                .unwrap()
+                                .ensure_screen(&name, width, height, false, scale)
+                            {
                                 info!("auto-registered screen for peer {}", name);
                             }
                         }
@@ -292,11 +299,11 @@ fn main() -> anyhow::Result<()> {
             drop(g);
             match connect_client(&addr, inc_tx_d.clone(), net_d.clone()) {
                 Ok((_net_inner, tx)) => {
-                    let (w, h) = rdev::display_size().unwrap_or((1920, 1080));
                     let _ = tx.send(Message::Hello {
                         name: my_name_d.clone(),
-                        width: w as u32,
-                        height: h as u32,
+                        width: my_w,
+                        height: my_h,
+                        scale: my_scale,
                     });
                     info!("auto-connected to primary {}", addr);
                     *auto_guard.lock().unwrap() = false;
@@ -403,6 +410,24 @@ fn main() -> anyhow::Result<()> {
 /// fires. Shared by the secondary hotkey listener; the primary detects it inside the grab tap.
 fn hotkey_fired(k: rdev::Key, down: bool, st: &mut HotkeyState) -> bool {
     control::hotkey_fired(k, down, st)
+}
+
+/// The metrics this machine advertises in `Message::Hello`: its own local screens' bounding box
+/// (in **logical** units — points on a Retina Mac, physical pixels once a Windows process is DPI
+/// aware) and the UI scale of that coordinate space. The scale is what lets the primary convert
+/// its own mouse deltas into this machine's units so the cursor tracks at the same speed.
+fn hello_metrics(own: &Layout) -> (u32, u32, f32) {
+    let (w, h) = match own.local_bbox() {
+        Some((l, t, r, b)) => ((r - l).max(1.0) as u32, (b - t).max(1.0) as u32),
+        None => (1920, 1080),
+    };
+    let scale = own
+        .screens
+        .iter()
+        .find(|s| s.is_local)
+        .map(|s| s.scale)
+        .unwrap_or(1.0);
+    (w, h, scale)
 }
 
 /// Build the primary's initial layout from the machine's real displays.

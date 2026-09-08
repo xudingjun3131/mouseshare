@@ -51,6 +51,16 @@ pub struct RemoteCtrl {
     pub side: Side,
     pub vx: f64,
     pub vy: f64,
+    /// Multiplier applied to every forwarded mouse delta: `own_scale / remote_scale`.
+    ///
+    /// Mouse deltas arrive in the *source* machine's coordinate units — points on a Retina Mac
+    /// (1 point = 2 physical pixels) but physical pixels on a DPI-aware Windows box. Shipping
+    /// them verbatim makes the cursor crawl on the higher-resolution side: a Retina primary
+    /// crossing to a 1x secondary moved at half speed. Converting to the receiver's units (i.e.
+    /// to physical pixels on both sides) keeps the cursor speed identical across machines.
+    ///
+    /// Captured once when control is handed over so the speed never changes mid-forwarding.
+    pub scale_ratio: f64,
 }
 
 /// Mutable control-plane state shared between the capture thread and the GUI.
@@ -98,6 +108,9 @@ const EDGE_ATTACH: f64 = 240.0;
 const RETURN_COOLDOWN_MS: u64 = 700;
 /// Tolerance (px) for "is the cursor still beyond the shared edge" while forwarding.
 const CROSS_EPS: f64 = 1.0;
+/// Safety bounds for the forwarded-delta scale ratio (see `motion_scale_ratio`).
+const MIN_SCALE_RATIO: f64 = 0.25;
+const MAX_SCALE_RATIO: f64 = 4.0;
 
 /// Switch hotkey: **ScrollLock** (kept for compatibility) or **Ctrl+Alt+Space**.
 ///
@@ -138,7 +151,9 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
                     match predict_cross(&l, loc, (dx, dy), bbox) {
                         Some((side, name)) => {
                             enter_forwarding(ctx, &mut c, &l, side, &name, loc);
-                            forward_motion(ctx, &name, dx, dy);
+                            // Read the ratio *after* the hand-off: that is where it is computed.
+                            let ratio = c.remote.as_ref().map_or(1.0, |r| r.scale_ratio);
+                            forward_motion(ctx, &name, dx * ratio, dy * ratio);
                             true
                         }
                         None => false,
@@ -158,7 +173,8 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
                         leave_forwarding(ctx, &mut c, &l, &name, location);
                         false
                     } else {
-                        forward_motion(ctx, &name, dx, dy);
+                        let ratio = c.remote.as_ref().map_or(1.0, |r| r.scale_ratio);
+                        forward_motion(ctx, &name, dx * ratio, dy * ratio);
                         if let Some(park) = c.parked {
                             crate::capture::park_cursor(park);
                         }
@@ -281,6 +297,21 @@ fn crossing_back(r: &RemoteCtrl, bbox: (f64, f64, f64, f64), dx: f64, dy: f64) -
     }
 }
 
+/// Convert a local mouse delta into the receiving machine's coordinate units.
+///
+/// `kCGMouseEventDeltaX/Y` (and the rdev delta elsewhere) is measured in the *source* machine's
+/// logical space: on a Retina Mac 1 point is 2 physical pixels, while a DPI-aware Windows box
+/// counts physical pixels directly. Without this conversion a Retina primary drives a 1x
+/// secondary at half the physical cursor speed — the mouse "feels slow" on the other screen.
+///
+/// The result is clamped so a peer reporting a bogus scale (0, or a wild value) can never make
+/// the cursor teleport or freeze.
+fn motion_scale_ratio(l: &Layout, remote: &str, loc: Option<(f64, f64)>) -> f64 {
+    let own = l.local_scale_at(loc).max(0.01) as f64;
+    let theirs = l.scale_of(remote).max(0.01) as f64;
+    (own / theirs).clamp(MIN_SCALE_RATIO, MAX_SCALE_RATIO)
+}
+
 /// Begin forwarding control to `name` (attached on `side`). Hides the local cursor, parks it at the
 /// shared edge, and tells the secondary the cursor is entering (so it can seed its own virtual cursor).
 fn enter_forwarding(
@@ -308,6 +339,7 @@ fn enter_forwarding(
         side,
         vx: park.0,
         vy: park.1,
+        scale_ratio: motion_scale_ratio(l, name, Some(loc)),
     });
     c.parked = Some(park);
     c.held_keys.clear();
@@ -324,10 +356,12 @@ fn enter_forwarding(
         },
     );
     log::info!("control handed to {} ({:?})", name, side);
-    crate::diag::log(&format!(
-        "HAND-OFF -> {} side={:?} park=({:.0},{:.0})",
-        name, side, park.0, park.1
-    ));
+    if let Some(r) = c.remote.as_ref() {
+        crate::diag::log(&format!(
+            "HAND-OFF -> {} side={:?} park=({:.0},{:.0}) scale_ratio={:.2}",
+            name, side, r.vx, r.vy, r.scale_ratio
+        ));
+    }
 }
 
 /// Return control to the local machine: release any held keys/buttons on the remote, show the local
@@ -472,6 +506,8 @@ pub fn on_enter_screen(ctx: &GrabCtx, side: Side, fx: f64, fy: f64) {
         side: eside,
         vx,
         vy,
+        // Unused on this side (we receive already-normalised deltas), but keep it valid.
+        scale_ratio: 1.0,
     });
     drop(c);
     crate::capture::hide_cursor();
@@ -630,11 +666,11 @@ mod tests {
     fn crossing_back_left_edge_returns() {
         // Secondary entered on its LEFT edge (primary to its left). Cursor mid-screen moving left
         // must NOT return; only when it reaches the left edge and keeps pushing left.
-        let r = RemoteCtrl { name: "B".into(), side: Side::Left, vx: 500.0, vy: 540.0 };
+        let r = RemoteCtrl { name: "B".into(), side: Side::Left, vx: 500.0, vy: 540.0, scale_ratio: 1.0 };
         assert!(!crossing_back(&r, BBOX, -50.0, 0.0), "mid-screen left move must not return");
         assert!(!crossing_back(&r, BBOX, 50.0, 0.0), "right move must not return");
 
-        let at_edge = RemoteCtrl { name: "B".into(), side: Side::Left, vx: 5.0, vy: 540.0 };
+        let at_edge = RemoteCtrl { name: "B".into(), side: Side::Left, vx: 5.0, vy: 540.0, scale_ratio: 1.0 };
         assert!(crossing_back(&at_edge, BBOX, -10.0, 0.0), "at left edge pushing left must return");
         // At the edge but moving right (into the screen) must NOT return.
         assert!(!crossing_back(&at_edge, BBOX, 10.0, 0.0));
@@ -643,18 +679,18 @@ mod tests {
     #[test]
     fn crossing_back_right_edge_returns() {
         // Secondary entered on its RIGHT edge (primary to its right).
-        let r = RemoteCtrl { name: "B".into(), side: Side::Right, vx: 1915.0, vy: 540.0 };
+        let r = RemoteCtrl { name: "B".into(), side: Side::Right, vx: 1915.0, vy: 540.0, scale_ratio: 1.0 };
         assert!(crossing_back(&r, BBOX, 20.0, 0.0), "at right edge pushing right must return");
         assert!(!crossing_back(&r, BBOX, -20.0, 0.0), "moving left (into screen) must not return");
     }
 
     #[test]
     fn crossing_back_vertical_edges() {
-        let top = RemoteCtrl { name: "U".into(), side: Side::Top, vx: 960.0, vy: 5.0 };
+        let top = RemoteCtrl { name: "U".into(), side: Side::Top, vx: 960.0, vy: 5.0, scale_ratio: 1.0 };
         assert!(crossing_back(&top, BBOX, 0.0, -10.0), "at top edge pushing up must return");
         assert!(!crossing_back(&top, BBOX, 0.0, 10.0));
 
-        let bottom = RemoteCtrl { name: "D".into(), side: Side::Bottom, vx: 960.0, vy: 1075.0 };
+        let bottom = RemoteCtrl { name: "D".into(), side: Side::Bottom, vx: 960.0, vy: 1075.0, scale_ratio: 1.0 };
         assert!(crossing_back(&bottom, BBOX, 0.0, 10.0), "at bottom edge pushing down must return");
         assert!(!crossing_back(&bottom, BBOX, 0.0, -10.0));
     }
@@ -749,6 +785,7 @@ mod integration {
                 name: "B".to_string(),
                 width: 1920,
                 height: 1080,
+                scale: 1.0,
             })
             .expect("send Hello");
 
@@ -1039,5 +1076,181 @@ mod integration {
             p.ctrl.lock().unwrap().remote.as_ref().map(|r| r.name == "B").unwrap_or(false),
             "primary remote should be B"
         );
+    }
+
+    // ---- HiDPI normalisation: forwarded deltas must land in the receiver's units ----
+
+    #[test]
+    fn motion_scale_ratio_converts_between_scales() {
+        let l = Layout {
+            screens: vec![
+                Screen {
+                    name: "A".into(),
+                    ox: 0,
+                    oy: 0,
+                    w: 1470,
+                    h: 956,
+                    is_local: true,
+                    scale: 2.0,
+                },
+                Screen {
+                    name: "B".into(),
+                    ox: 1470,
+                    oy: 0,
+                    w: 3072,
+                    h: 1920,
+                    is_local: false,
+                    scale: 1.0,
+                },
+            ],
+        };
+        // A Retina primary (2.0) driving a 1x secondary must send twice the delta.
+        assert!(
+            (motion_scale_ratio(&l, "B", Some((1460.0, 500.0))) - 2.0).abs() < 1e-6,
+            "retina -> 1x must double the delta"
+        );
+        // No location: fall back to the first local screen (still 2.0 here).
+        assert!((motion_scale_ratio(&l, "B", None) - 2.0).abs() < 1e-6);
+        // Same scale on both sides -> no conversion.
+        assert!((motion_scale_ratio(&l, "A", Some((10.0, 10.0))) - 1.0).abs() < 1e-6);
+        // Unknown peer -> treated as 1x.
+        assert!((motion_scale_ratio(&l, "nope", Some((10.0, 10.0))) - 2.0).abs() < 1e-6);
+        // A bogus 0 scale must be clamped, not blow up into infinity/NaN.
+        let bogus = Layout {
+            screens: vec![Screen {
+                name: "Z".into(),
+                ox: 0,
+                oy: 0,
+                w: 100,
+                h: 100,
+                is_local: false,
+                scale: 0.0,
+            }],
+        };
+        let r = motion_scale_ratio(&bogus, "Z", None);
+        assert!(r.is_finite() && r <= MAX_SCALE_RATIO, "ratio must stay bounded, got {r}");
+    }
+
+    #[test]
+    fn hidpi_primary_doubles_forwarded_delta() {
+        let (p, s, srx, _prx) = setup_hidpi_pair(19216);
+
+        // Cross into B from the Retina primary's right edge.
+        let dropped = on_capture(
+            &p,
+            RawInput::Motion { dx: 100.0, dy: 0.0 },
+            Some((1468.0, 478.0)),
+        );
+        assert!(dropped, "event must be dropped while forwarding");
+
+        let msgs = pump(&s, &srx, Duration::from_millis(500));
+        let fwd = msgs.iter().find_map(|m| match m {
+            Message::Input(InputEvent::MouseMotion { dx, dy }) => Some((*dx, *dy)),
+            _ => None,
+        });
+        let (dx, dy) = fwd.expect("secondary must receive the forwarded MouseMotion");
+        // 100 logical points on a @2x primary = 200 physical pixels = 200 units on a 1x peer.
+        assert!((dx - 200.0).abs() < 0.5, "dx must be scaled by 2.0, got {dx}");
+        assert!((dy - 0.0).abs() < 0.5, "dy={dy}");
+        assert!(
+            (p.ctrl.lock().unwrap().remote.as_ref().unwrap().scale_ratio - 2.0).abs() < 1e-6,
+            "scale_ratio must be captured in the RemoteCtrl"
+        );
+    }
+
+    /// Like `setup_pair`, but the primary's local screen is Retina (scale 2.0) while the
+    /// secondary reports scale 1.0 — the Mac -> Windows case that used to halve cursor speed.
+    fn setup_hidpi_pair(port: u16) -> (GrabCtx, GrabCtx, Receiver<(String, Message)>, Receiver<(String, Message)>) {
+        let primary_layout = Layout {
+            screens: vec![
+                Screen {
+                    name: "A".into(),
+                    ox: 0,
+                    oy: 0,
+                    w: 1470,
+                    h: 956,
+                    is_local: true,
+                    scale: 2.0,
+                },
+                Screen {
+                    name: "B".into(),
+                    ox: 1470,
+                    oy: 0,
+                    w: 3072,
+                    h: 1920,
+                    is_local: false,
+                    scale: 1.0,
+                },
+            ],
+        };
+        let secondary_layout = Layout {
+            screens: vec![Screen {
+                name: "B".into(),
+                ox: 0,
+                oy: 0,
+                w: 3072,
+                h: 1920,
+                is_local: true,
+                scale: 1.0,
+            }],
+        };
+
+        let (ptx, prx) = channel();
+        let (stx, srx) = channel();
+        let pla = Arc::new(Mutex::new(primary_layout));
+        let sla = Arc::new(Mutex::new(secondary_layout));
+
+        let net_primary = network::start_hub(port, ptx, pla.clone()).expect("hub starts");
+        let net_secondary = Net::idle();
+        let (_net_sec, sec_tx) = network::connect_client(
+            &format!("127.0.0.1:{port}"),
+            stx,
+            net_secondary.clone(),
+        )
+        .expect("client connects");
+        sec_tx
+            .send(Message::Hello {
+                name: "B".to_string(),
+                width: 3072,
+                height: 1920,
+                scale: 1.0,
+            })
+            .expect("send Hello");
+
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if net_primary.lock().unwrap().peer_count() > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            net_primary.lock().unwrap().peer_count() > 0,
+            "secondary must be registered with the hub"
+        );
+
+        let primary = GrabCtx {
+            net: net_primary,
+            layout: pla.clone(),
+            ctrl: Arc::new(Mutex::new(Ctrl {
+                local_bbox: pla.lock().unwrap().local_bbox(),
+                ..Default::default()
+            })),
+            mode: Mutex::new(CaptureMode::Local),
+            my_name: "A".to_string(),
+            primary_name: "A".to_string(),
+        };
+        let secondary = GrabCtx {
+            net: net_secondary,
+            layout: sla.clone(),
+            ctrl: Arc::new(Mutex::new(Ctrl {
+                local_bbox: sla.lock().unwrap().local_bbox(),
+                ..Default::default()
+            })),
+            mode: Mutex::new(CaptureMode::Local),
+            my_name: "B".to_string(),
+            primary_name: "A".to_string(),
+        };
+        (primary, secondary, srx, prx)
     }
 }
