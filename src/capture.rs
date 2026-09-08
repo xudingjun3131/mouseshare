@@ -31,7 +31,7 @@ use core_foundation::runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes
 #[cfg(target_os = "macos")]
 use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
-    EventField,
+    CallbackResult, EventField,
 };
 
 // ---- cursor visibility / parking (capture-layer concern) ----
@@ -177,12 +177,12 @@ fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
                 if let Some(&port) = tap_port_cb.get() {
                     unsafe { CGEventTapEnable(port as *mut c_void, true) };
                 }
-                return None;
+                return CallbackResult::Keep;
             }
             // User revoked input monitoring / secure input: stop dropping so we don't eat input.
             if event_type as u32 == CGEventType::TapDisabledByUserInput as u32 {
                 crate::capture::show_cursor();
-                return None;
+                return CallbackResult::Keep;
             }
 
             let loc = cg_ev.location();
@@ -227,13 +227,13 @@ fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
             };
 
             match raw {
-                None => Some(cg_ev.clone()),
+                None => CallbackResult::Keep,
                 Some(r) => {
                     let drop = on_capture(&ctx_cb, r, location);
                     if drop {
-                        None
+                        CallbackResult::Drop
                     } else {
-                        Some(cg_ev.clone())
+                        CallbackResult::Keep
                     }
                 }
             }
@@ -264,9 +264,9 @@ fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
         };
 
         // Stash the raw mach port so the callback can re-enable the tap on timeout.
-        let _ = tap_port.set(tap.mach_port.as_concrete_TypeRef() as usize);
+        let _ = tap_port.set(tap.mach_port().as_concrete_TypeRef() as usize);
 
-        let loop_source: CFRunLoopSource = match tap.mach_port.create_runloop_source(0) {
+        let loop_source: CFRunLoopSource = match tap.mach_port().create_runloop_source(0) {
             Ok(s) => s,
             Err(_) => {
                 log::error!("failed to create runloop source for event tap");

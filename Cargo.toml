@@ -1,6 +1,6 @@
 [package]
 name = "mouseshare"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2021"
 description = "Share mouse, keyboard and clipboard across computers over LAN, with a draggable screen-layout. Cross-platform (Windows/Linux/macOS)."
 license = "MIT OR Apache-2.0"
@@ -35,11 +35,14 @@ local-ip-address = "0.6"
 [target.'cfg(target_os = "macos")'.dependencies]
 display-info = "0.5.9"
 # Core Graphics: cursor position sampling (CGEventGetLocation) for the edge-rest poller and
-# the delta event tap for remote-control motion. Same version as rdev's core-graphics dep,
-# so no extra compilation.
-core-graphics = "0.23"
+# the delta event tap for remote-control motion. 0.25 is the first release whose event-tap
+# callback can actually DROP an event (CallbackResult::Drop); 0.23's `Option<CGEvent>` return
+# mapped `None` back to the original event, so the grab never suppressed input and the Mac
+# kept scrolling/clicking while forwarding.
+core-graphics = "0.25"
 # Runloop + mach-port plumbing for the CGEventTap run loop (create_runloop_source / add_source).
-core-foundation = "0.9"
+# Bumped alongside core-graphics (0.25 depends on core-foundation 0.10).
+core-foundation = "0.10"
 
 # Linux: XQueryPointer for direct cursor-position sampling (the remote-motion driver's
 # treadmill). rdev already links X11 on Linux, so this adds no new system dependency.
