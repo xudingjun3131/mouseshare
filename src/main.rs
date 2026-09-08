@@ -20,6 +20,7 @@
 mod app;
 mod capture;
 mod clipboard;
+mod discovery;
 mod config;
 mod control;
 mod diag;
@@ -250,6 +251,56 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---- LAN discovery ----
+    // The primary broadcasts a UDP beacon so secondaries can find it without the user typing an
+    // IP; a secondary listens and auto-connects whenever it is not already linked. This is what
+    // makes a fresh Windows box "see" the Mac on the network.
+    let discovered: discovery::DiscoveredList = discovery::new_list();
+    if mode == "primary" {
+        discovery::start_beacon(port, my_name.clone());
+        info!("discovery beacon broadcasting on udp/{}", discovery::DISCOVERY_PORT);
+    } else {
+        let net_d = net.clone();
+        let inc_tx_d = inc_tx.clone();
+        let discovered_d = discovered.clone();
+        let my_name_d = my_name.clone();
+        let auto_guard = Arc::new(Mutex::new(false));
+        discovery::start_listener(move |d: discovery::Discovered| {
+            // Record for the UI's "discovered devices" card.
+            {
+                let mut v = discovered_d.lock().unwrap();
+                if !v.iter().any(|x| x.ip == d.ip && x.name == d.name) {
+                    v.push(d.clone());
+                }
+            }
+            // Auto-connect only when we're currently unlinked and not mid-retry.
+            let is_linked = matches!(*net_d.lock().unwrap(), Net::Secondary { .. });
+            let mut g = auto_guard.lock().unwrap();
+            if is_linked || *g {
+                return;
+            }
+            *g = true;
+            let addr = d.addr();
+            drop(g);
+            match connect_client(&addr, inc_tx_d.clone(), net_d.clone()) {
+                Ok((_net_inner, tx)) => {
+                    let (w, h) = rdev::display_size().unwrap_or((1920, 1080));
+                    let _ = tx.send(Message::Hello {
+                        name: my_name_d.clone(),
+                        width: w as u32,
+                        height: h as u32,
+                    });
+                    info!("auto-connected to primary {}", addr);
+                    *auto_guard.lock().unwrap() = false;
+                }
+                Err(e) => {
+                    log::warn!("auto-connect to {} failed: {}", addr, e);
+                    *auto_guard.lock().unwrap() = false;
+                }
+            }
+        });
+    }
+
     // ---- Clipboard monitor (both roles) ----
     {
         let net = net.clone();
@@ -292,6 +343,7 @@ fn main() -> anyhow::Result<()> {
         startup_error,
         inc_tx.clone(),
         ctrl.clone(),
+        discovered,
     );
 
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../resources/mouse-logo.png"))

@@ -11,6 +11,7 @@
 
 use crate::clipboard;
 use crate::config::{save_config, Config};
+use crate::discovery::DiscoveredList;
 use crate::i18n::{tr, Lang, Tr};
 use crate::layout::Layout;
 use crate::network::{connect_client, Net};
@@ -314,6 +315,9 @@ pub struct MouseShareApp {
     /// The capture thread's control-plane state (who has the mouse, edge-push progress).
     /// Shared read-only here so the status card can show live hand-off state.
     pub ctrl: Arc<Mutex<crate::Ctrl>>,
+    /// Primaries seen on the LAN via UDP discovery (secondary only). The listener appends to it;
+    /// the "discovered devices" card reads it so the user can connect with one click.
+    pub discovered: DiscoveredList,
 }
 
 impl MouseShareApp {
@@ -325,6 +329,7 @@ impl MouseShareApp {
         startup_error: Option<String>,
         inc_tx: Sender<(String, Message)>,
         ctrl: Arc<Mutex<crate::Ctrl>>,
+        discovered: DiscoveredList,
     ) -> Self {
         let lang = Lang::from_code(&config.lang);
         Self {
@@ -338,6 +343,7 @@ impl MouseShareApp {
             inc_tx,
             last_layout_push: None,
             ctrl,
+            discovered,
         }
     }
 
@@ -345,13 +351,12 @@ impl MouseShareApp {
         self.toast = Some((Instant::now(), msg.into()));
     }
 
-    /// (Re)connect to the primary from the running app. Used by the "Connect" button on the
-    /// secondary and the "Retry" button on the startup-error banner. Tearing down to `Idle`
-    /// first lets the old reader/writer threads stop, then we open a fresh connection and send
-    /// Hello. No app restart required.
-    fn reconnect(&mut self) {
+    /// (Re)connect to the primary at `addr` from the running app. Tearing down to `Idle` first
+    /// lets the old reader/writer threads stop, then we open a fresh connection and send Hello.
+    /// No app restart required. Returns nothing; connection state is reflected via `self.net`.
+    fn connect_to(&mut self, addr: String) {
         let t = tr(self.lang);
-        let addr = self.config.server_addr.trim().to_string();
+        let addr = addr.trim().to_string();
         if addr.is_empty() {
             self.startup_error = Some(self.lang.connect_fail(&addr, "address is empty"));
             return;
@@ -380,6 +385,13 @@ impl MouseShareApp {
                 self.show_toast(msg);
             }
         }
+    }
+
+    /// (Re)connect using the configured `server_addr`. Used by the "Connect" button and the
+    /// startup-error "Retry" banner.
+    fn reconnect(&mut self) {
+        let addr = self.config.server_addr.trim().to_string();
+        self.connect_to(addr);
     }
 
     /// This machine's real screen size, taken from its own layout entry (falls back to 1080p).
@@ -418,6 +430,12 @@ impl eframe::App for MouseShareApp {
             }
         }
 
+        // Auto-discovery may have linked us in the background (the listener thread flips `net`
+        // to `Secondary`). Clear any stale startup-error banner so the UI reflects the live state.
+        if matches!(&*self.net.lock().unwrap(), Net::Secondary { .. }) && self.startup_error.is_some() {
+            self.startup_error = None;
+        }
+
         let theme = UiTheme::from_ctx(ctx);
 
         // ---- Title bar: app glyph + brand + language toggle ----
@@ -440,6 +458,16 @@ impl eframe::App for MouseShareApp {
                 ui.label(egui::RichText::new(t.tagline).size(12.0).color(ui.visuals().weak_text_color()));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Live connection status: a coloured dot + short label, so the user sees at
+                    // a glance whether sharing is live without opening the status card.
+                    let (dot_color, status_text) = match &*self.net.lock().unwrap() {
+                        Net::Primary { .. } => (COL_ME, t.conn_primary),
+                        Net::Secondary { .. } => (COL_ME, t.conn_connected),
+                        Net::Idle => (Color32::from_rgb(255, 159, 10), t.conn_idle),
+                    };
+                    ui.label(egui::RichText::new(status_text).weak().size(12.5));
+                    ui.label(egui::RichText::new("●").color(dot_color).size(14.0));
+                    ui.add_space(14.0);
                     let pill = egui::Button::new(
                         egui::RichText::new(self.lang.toggle_label()).size(12.5),
                     )
@@ -513,6 +541,9 @@ impl eframe::App for MouseShareApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         self.basic_card(ui, t, theme);
+                        if self.config.mode == "secondary" {
+                            self.discovered_card(ui, t, theme);
+                        }
                         self.screens_card(ui, t);
                         self.status_card(ui, t, theme);
                     });
@@ -859,6 +890,36 @@ impl MouseShareApp {
                     save_config(&self.config);
                 }
                 std::process::exit(0);
+            }
+        });
+    }
+
+    /// "Discovered on LAN" card (secondary only). Lists primaries heard via the UDP beacon and
+    /// lets the user connect with one click — this is the visible half of auto-discovery.
+    fn discovered_card(&mut self, ui: &mut egui::Ui, t: Tr, _theme: UiTheme) {
+        let list = self.discovered.lock().unwrap().clone();
+        card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_header(ui, t.section_discovered);
+            if list.is_empty() {
+                ui.label(egui::RichText::new(t.discovered_empty).weak().size(12.0));
+            } else {
+                for d in &list {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{}  ·  {}", d.name, d.addr()))
+                                .strong()
+                                .size(13.0),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(t.discovered_connect).clicked() {
+                                self.config.server_addr = d.addr();
+                                self.connect_to(d.addr());
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
             }
         });
     }

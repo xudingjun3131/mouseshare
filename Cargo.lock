@@ -2540,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "mouseshare"
-version = "0.3.32"
+version = "0.3.34"
 dependencies = [
  "anyhow",
  "arboard",
