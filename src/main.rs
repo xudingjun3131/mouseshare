@@ -351,8 +351,8 @@ fn main() -> anyhow::Result<()> {
         .ok();
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_inner_size([1120.0, 720.0])
-        .with_min_inner_size([860.0, 560.0]);
+        .with_inner_size([1240.0, 780.0])
+        .with_min_inner_size([940.0, 600.0]);
     // macOS: treat the window as a native "unified toolbar" app — let the content draw edge to
     // edge under the title bar and float the red/yellow/green traffic lights over it. This is
     // what makes MouseShare read as a first-class macOS app instead of a generic GL canvas.

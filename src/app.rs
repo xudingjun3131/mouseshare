@@ -71,13 +71,13 @@ impl UiTheme {
                 text: Color32::from_rgb(245, 245, 247),        // label
                 muted: Color32::from_rgb(152, 152, 157),       // secondaryLabel
                 accent: Color32::from_rgb(10, 132, 255),        // systemBlue (dark)
-                accent_tint: Color32::from_rgba_unmultiplied(10, 132, 255, 46),
+                accent_tint: Color32::from_rgba_unmultiplied(10, 132, 255, 72),
                 hairline: Color32::from_rgba_unmultiplied(255, 255, 255, 18),
                 grid: Color32::from_rgba_unmultiplied(255, 255, 255, 14),
                 shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 130),
                 seg_track: Color32::from_rgb(58, 58, 60),
                 seg_selected: Color32::from_rgb(99, 99, 102),
-                idle_tint: Color32::from_rgba_unmultiplied(255, 159, 10, 40),
+                idle_tint: Color32::from_rgba_unmultiplied(255, 159, 10, 82),
                 btn_bg: Color32::from_rgb(58, 58, 60),
                 btn_hover: Color32::from_rgb(72, 72, 75),
             }
@@ -90,13 +90,13 @@ impl UiTheme {
                 text: Color32::from_rgb(29, 29, 31),            // label
                 muted: Color32::from_rgb(134, 134, 139),        // secondaryLabel
                 accent: Color32::from_rgb(0, 122, 255),         // systemBlue (light)
-                accent_tint: Color32::from_rgba_unmultiplied(0, 122, 255, 28),
+                accent_tint: Color32::from_rgba_unmultiplied(0, 122, 255, 62),
                 hairline: Color32::from_rgba_unmultiplied(0, 0, 0, 10),
                 grid: Color32::from_rgba_unmultiplied(0, 0, 0, 22),
                 shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 42),
                 seg_track: Color32::from_rgb(227, 227, 232),
                 seg_selected: Color32::from_rgb(255, 255, 255),
-                idle_tint: Color32::from_rgba_unmultiplied(255, 159, 10, 32),
+                idle_tint: Color32::from_rgba_unmultiplied(255, 159, 10, 72),
                 btn_bg: Color32::from_rgb(234, 234, 238),
                 btn_hover: Color32::from_rgb(223, 223, 228),
             }
@@ -181,14 +181,15 @@ fn dot_grid(painter: &egui::Painter, rect: Rect, color: Color32) {
 /// Tile gradient pair for a screen role: (top, bottom). macOS systemBlue / systemGreen / gray.
 fn tile_colors(is_primary: bool, is_me: bool) -> (Color32, Color32) {
     if is_primary {
-        // systemBlue display.
-        (Color32::from_rgb(86, 196, 255), Color32::from_rgb(0, 102, 214))
+        // Soft systemBlue — light enough to read, not the heavy saturated blue the previous
+        // palette produced.
+        (Color32::from_rgb(132, 190, 248), Color32::from_rgb(64, 138, 230))
     } else if is_me {
-        // systemGreen — this machine.
-        (Color32::from_rgb(86, 219, 126), Color32::from_rgb(28, 170, 64))
+        // Soft systemGreen — this machine.
+        (Color32::from_rgb(132, 220, 164), Color32::from_rgb(70, 182, 110))
     } else {
-        // neutral gray client.
-        (Color32::from_rgb(168, 168, 178), Color32::from_rgb(96, 96, 106))
+        // Neutral gray client.
+        (Color32::from_rgb(178, 178, 190), Color32::from_rgb(132, 132, 146))
     }
 }
 
@@ -518,6 +519,8 @@ impl eframe::App for MouseShareApp {
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Right padding so the lang toggle isn't glued to the window edge.
+                        ui.add_space(16.0);
                         // Language toggle — refined pill button.
                         let lang_btn = egui::Button::new(
                             egui::RichText::new(self.lang.toggle_label()).size(12.5).color(theme.text),
@@ -893,11 +896,12 @@ impl MouseShareApp {
                 ui.label(egui::RichText::new(t.peers).weak());
                 ui.label(egui::RichText::new(format!("{}", peers)).strong().size(15.0));
             });
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(t.local_name).weak());
                 ui.monospace(&self.my_name);
             });
-            ui.add_space(8.0);
+            ui.add_space(4.0);
             // Connection state (primary = serving; secondary = linked to host; idle = not connected).
             let conn_label = match &*self.net.lock().unwrap() {
                 Net::Primary { .. } => t.conn_primary,
@@ -908,6 +912,7 @@ impl MouseShareApp {
                 ui.label(egui::RichText::new(t.conn_status).weak());
                 ui.label(egui::RichText::new(conn_label).strong().size(15.0));
             });
+            ui.add_space(4.0);
             // Live control-plane state (primary only): who has the mouse right now, and —
             // while the cursor is pinned against a shared edge — how many pushes are in.
             if self.config.mode == "primary" {
@@ -1330,81 +1335,94 @@ fn paint_tile(
     top: Color32,
     bottom: Color32,
 ) {
-    const R: f32 = 16.0;
+    const R: f32 = 14.0;
+    // 1. Body: a soft vertical gradient. The previous palette was too saturated — these
+    //    mid-tones read as a display card, not a glowing button.
     fill_gradient(painter, rect, R, top, bottom);
 
-    // Inset "glass" panel — the part that reads as the actual display.
-    let inset = rect.shrink(9.0);
-    if inset.width() > 4.0 && inset.height() > 4.0 {
-        painter.rect_filled(
-            inset,
-            egui::CornerRadius::same(9),
-            Color32::from_white_alpha(if hover { 30 } else { 18 }),
-        );
-    }
-
-    // Specular highlight along the top edge.
-    let sheen = Rect::from_min_size(rect.min, vec2(rect.width(), rect.height().min(3.0)));
+    // 2. A thin specular sheen along the very top edge — gives the surface a glassy hint.
+    let sheen_h = rect.height().min(2.5);
     painter.rect_filled(
-        sheen,
+        Rect::from_min_size(rect.min, vec2(rect.width(), sheen_h)),
         egui::CornerRadius { nw: R as u8, ne: R as u8, sw: 0, se: 0 },
-        Color32::from_white_alpha(55),
+        Color32::from_white_alpha(38),
     );
 
-    // Border: subtle normally, a bright accent halo while hovered/dragged.
-    let stroke = if hover {
-        (2.5, Color32::from_white_alpha(235))
-    } else {
-        (1.0, Color32::from_white_alpha(70))
-    };
-    painter.rect_stroke(rect, egui::CornerRadius::same(R as u8), stroke, egui::StrokeKind::Inside);
-    if hover {
-        painter.rect_stroke(
-            rect.expand(4.0),
-            egui::CornerRadius::same((R + 4.0) as u8),
-            (2.0, Color32::from_rgba_unmultiplied(theme.accent.r(), theme.accent.g(), theme.accent.b(), 150)),
-            egui::StrokeKind::Outside,
+    // 3. Clean 1px bezel.
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(R as u8),
+        (1.0, Color32::from_white_alpha(60)),
+        egui::StrokeKind::Inside,
+    );
+
+    // 4. Bottom label scrim (Apple/Music-card pattern): a translucent dark panel so the
+    //    name + resolution are always legible regardless of the underlying gradient.
+    if rect.width() > 56.0 && rect.height() > 44.0 {
+        let scrim_h = (rect.height() * 0.40).clamp(30.0, 58.0);
+        let scrim_rect = Rect::from_min_max(
+            pos2(rect.min.x, rect.max.y - scrim_h),
+            rect.max,
+        );
+        painter.rect_filled(
+            scrim_rect,
+            egui::CornerRadius { nw: 0, ne: 0, sw: R as u8, se: R as u8 },
+            Color32::from_black_alpha(110),
+        );
+        // A hairline along the top of the scrim so it reads as a separate panel.
+        painter.line_segment(
+            [scrim_rect.left_top(), scrim_rect.right_top()],
+            (1.0, Color32::from_white_alpha(40)),
+        );
+
+        let title = if is_primary { format!("★ {name}") } else { name.to_string() };
+        let base_y = scrim_rect.min.y;
+        painter.text(
+            pos2(rect.center().x, base_y + 8.0),
+            Align2::CENTER_TOP,
+            title,
+            FontId::proportional(13.5),
+            Color32::WHITE,
+        );
+        let res = if phys != (rect.width() as u32, rect.height() as u32) && scale != 1.0 {
+            format!("{}×{}  @{}x", phys.0, phys.1, scale)
+        } else {
+            format!("{}×{}", phys.0, phys.1)
+        };
+        painter.text(
+            pos2(rect.center().x, base_y + 27.0),
+            Align2::CENTER_TOP,
+            res,
+            FontId::proportional(11.0),
+            Color32::from_white_alpha(205),
         );
     }
 
-    // Label: name (with a star on the primary's own displays) + resolution.
-    if rect.width() > 56.0 && rect.height() > 40.0 {
-        let title = if is_primary {
-            format!("★ {name}")
-        } else {
-            name.to_string()
-        };
-        let cy = rect.center().y;
-        let two_line = rect.height() > 76.0;
-        painter.text(
-            pos2(rect.center().x, if two_line { cy - 11.0 } else { cy }),
-            Align2::CENTER_CENTER,
-            title,
-            FontId::proportional(15.5),
-            Color32::WHITE,
+    // 5. "本机" badge — a small white pill in the top-left corner. Cleaner than the old
+    //    bottom-of-tile text and works at any tile size that fits the badge.
+    if is_me && rect.width() > 72.0 && rect.height() > 36.0 {
+        let pill_rect = Rect::from_min_size(
+            pos2(rect.min.x + 10.0, rect.min.y + 10.0),
+            vec2(36.0, 19.0),
         );
-        if two_line {
-            painter.text(
-                pos2(rect.center().x, cy + 11.0),
-                Align2::CENTER_CENTER,
-                if phys != (rect.width() as u32, rect.height() as u32) && scale != 1.0 {
-                    format!("{}×{}  @{}x", phys.0, phys.1, scale)
-                } else {
-                    format!("{}×{}", phys.0, phys.1)
-                },
-                FontId::proportional(12.0),
-                Color32::from_white_alpha(215),
-            );
-        }
-        if is_me && rect.height() > 110.0 {
-            painter.text(
-                pos2(rect.center().x, rect.max.y - 16.0),
-                Align2::CENTER_CENTER,
-                "本机",
-                FontId::proportional(11.0),
-                Color32::from_white_alpha(190),
-            );
-        }
+        painter.rect_filled(pill_rect, egui::CornerRadius::same(10), Color32::from_white_alpha(225));
+        painter.text(
+            pill_rect.center(),
+            Align2::CENTER_CENTER,
+            "本机",
+            FontId::proportional(10.5),
+            Color32::from_black_alpha(225),
+        );
+    }
+
+    // 6. Hover halo — a soft accent ring outside the tile.
+    if hover {
+        painter.rect_stroke(
+            rect.expand(5.0),
+            egui::CornerRadius::same((R + 5.0) as u8),
+            (2.5, Color32::from_rgba_unmultiplied(theme.accent.r(), theme.accent.g(), theme.accent.b(), 170)),
+            egui::StrokeKind::Outside,
+        );
     }
 }
 
