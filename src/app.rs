@@ -1018,48 +1018,44 @@ fn legend_chip(ui: &mut egui::Ui, color: Color32, text: &str, theme: UiTheme) {
 /// A live connection-status pill: a coloured dot followed by a short label, on a tinted
 /// background — the macOS "status chip" look in the toolbar.
 fn status_pill(ui: &mut egui::Ui, dot: Color32, tint: Color32, text: &str, theme: UiTheme) {
-    let h = 24.0;
-    let dot_r = 4.5;
-    let pad_x = 10.0;
-    let text_w = ui.fonts(|f| f.glyph_width(&egui::FontId::proportional(12.5), 'M')) * text.chars().count() as f32;
-    let w = pad_x * 2.0 + dot_r * 2.0 + 6.0 + text_w.max(40.0);
-    let rect = ui.allocate_rect(
-        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, h)),
-        egui::Sense::hover(),
-    );
-    ui.painter().rect_filled(rect.rect, egui::CornerRadius::same(h as u8 / 2), tint);
-    let dot_c = egui::pos2(rect.rect.min.x + pad_x + dot_r, rect.rect.center().y);
-    ui.painter().circle_filled(dot_c, dot_r, dot);
-    ui.painter().text(
-        egui::pos2(rect.rect.min.x + pad_x + dot_r * 2.0 + 6.0, rect.rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        text,
-        egui::FontId::proportional(12.5),
-        theme.muted,
-    );
+    // Deliberately built from standard egui widgets instead of a hand-allocated rect. The toolbar
+    // lays this out right-to-left beside the language button, and `allocate_rect` ignores the
+    // layout direction — it painted the pill straight over the language button. Letting egui
+    // place it also auto-fits the width to the text in every language (a fixed estimate based on
+    // 'M' width x char count is badly wrong for CJK).
+    egui::Frame::NONE
+        .fill(tint)
+        .corner_radius(12)
+        .inner_margin(egui::Margin::symmetric(10, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                // A real circle, not a "●" glyph, so it looks identical in every font.
+                let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot_rect.center(), 4.5, dot);
+                ui.label(egui::RichText::new(text).size(12.5).color(theme.muted));
+            });
+        });
 }
 
 /// A macOS "bordered" secondary button — rounded, surface-tinted fill, hairline border. Returns
 /// the `Response` so callers can test `.clicked()`.
 fn secondary_btn(ui: &mut egui::Ui, label: &str, theme: UiTheme) -> egui::Response {
-    let h = 32.0;
-    let w = ui.available_width();
-    let rect = ui.allocate_rect(
-        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, h)),
-        egui::Sense::click(),
-    );
-    let hover = rect.hovered();
-    let fill = if hover { theme.btn_hover } else { theme.btn_bg };
-    ui.painter().rect_filled(rect.rect, egui::CornerRadius::same(9), fill);
-    ui.painter().rect_stroke(rect.rect, egui::CornerRadius::same(9), egui::Stroke::new(1.0_f32, theme.hairline), egui::StrokeKind::Inside);
+    // `allocate_exact_size` rather than `allocate_rect`: it honours the layout direction and
+    // advances the cursor, so stacked buttons can never overlap each other.
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
+    let fill = if resp.hovered() { theme.btn_hover } else { theme.btn_bg };
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(9), fill);
+    ui.painter().rect_stroke(rect, egui::CornerRadius::same(9), egui::Stroke::new(1.0_f32, theme.hairline), egui::StrokeKind::Inside);
     ui.painter().text(
-        rect.rect.center(),
+        rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(13.0),
         theme.text,
     );
-    rect
+    resp
 }
 
 /// An NSSegmentedControl-style two-state toggle: a rounded track with a selected-segment "thumb"
