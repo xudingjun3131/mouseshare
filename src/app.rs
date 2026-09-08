@@ -28,18 +28,35 @@ const COL_CLIENT: Color32 = Color32::from_rgb(120, 120, 128); // iOS gray (label
 
 /// Theme-derived palette. Everything outside the canvas uses the egui theme directly; the canvas
 /// and its tiles need explicit colors so they stay legible in both light and dark modes.
+///
+/// The palette follows macOS system colours (Apple's "systemBlue", "label"/"secondaryLabel",
+/// "windowBackground"/"sidebarBackground", "secondarySystemFill" …) so the chrome reads as a native
+/// app in both light and dark appearances.
 #[derive(Clone, Copy)]
 struct UiTheme {
+    sidebar_bg: Color32,
     canvas_bg: Color32,
-    canvas_text: Color32,
-    canvas_muted: Color32,
+    card_bg: Color32,
+    toolbar_bg: Color32,
+    text: Color32,
+    muted: Color32,
     accent: Color32,
+    /// Translucent accent used for selected/active fills (segmented thumb, focus rings).
+    accent_tint: Color32,
     hairline: Color32,
     /// Canvas dot-grid colour — barely-there texture so the virtual desktop does not read as
     /// one flat slab of colour.
     grid: Color32,
     /// Shadow cast by a screen tile, plus the halo drawn around it while hovering/dragging.
     shadow: Color32,
+    /// Segmented-control track + selected-segment (NSSegmentedControl) colours.
+    seg_track: Color32,
+    seg_selected: Color32,
+    /// Status pill background (idle = amber tint).
+    idle_tint: Color32,
+    /// Secondary ("bordered") button surfaces — flat fill + hover lift.
+    btn_bg: Color32,
+    btn_hover: Color32,
 }
 
 impl UiTheme {
@@ -47,23 +64,41 @@ impl UiTheme {
         let dark = ctx.style().visuals.dark_mode;
         if dark {
             UiTheme {
-                canvas_bg: Color32::from_rgb(30, 30, 36),
-                canvas_text: Color32::from_rgb(235, 235, 240),
-                canvas_muted: Color32::from_rgb(150, 150, 157),
-                accent: Color32::from_rgb(10, 132, 255),
-                hairline: Color32::from_rgba_unmultiplied(255, 255, 255, 22),
-                grid: Color32::from_rgba_unmultiplied(255, 255, 255, 16),
-                shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 96),
+                sidebar_bg: Color32::from_rgb(36, 36, 38),     // sidebarBackground
+                canvas_bg: Color32::from_rgb(28, 28, 30),      // windowBackground
+                card_bg: Color32::from_rgb(44, 44, 46),        // secondarySystemFill
+                toolbar_bg: Color32::from_rgb(28, 28, 30),
+                text: Color32::from_rgb(245, 245, 247),        // label
+                muted: Color32::from_rgb(152, 152, 157),       // secondaryLabel
+                accent: Color32::from_rgb(10, 132, 255),        // systemBlue (dark)
+                accent_tint: Color32::from_rgba_unmultiplied(10, 132, 255, 46),
+                hairline: Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+                grid: Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+                shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 130),
+                seg_track: Color32::from_rgb(58, 58, 60),
+                seg_selected: Color32::from_rgb(99, 99, 102),
+                idle_tint: Color32::from_rgba_unmultiplied(255, 159, 10, 40),
+                btn_bg: Color32::from_rgb(58, 58, 60),
+                btn_hover: Color32::from_rgb(72, 72, 75),
             }
         } else {
             UiTheme {
-                canvas_bg: Color32::from_rgb(243, 243, 248), // systemGray6
-                canvas_text: Color32::from_rgb(60, 60, 67),  // label
-                canvas_muted: Color32::from_rgb(142, 142, 147),
-                accent: Color32::from_rgb(0, 122, 255),
-                hairline: Color32::from_rgba_unmultiplied(0, 0, 0, 12),
-                grid: Color32::from_rgba_unmultiplied(0, 0, 0, 26),
-                shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 40),
+                sidebar_bg: Color32::from_rgb(236, 236, 239),  // sidebarBackground
+                canvas_bg: Color32::from_rgb(246, 246, 249),   // windowBackground
+                card_bg: Color32::from_rgb(255, 255, 255),      // tertiarySystemFill
+                toolbar_bg: Color32::from_rgb(246, 246, 249),
+                text: Color32::from_rgb(29, 29, 31),            // label
+                muted: Color32::from_rgb(134, 134, 139),        // secondaryLabel
+                accent: Color32::from_rgb(0, 122, 255),         // systemBlue (light)
+                accent_tint: Color32::from_rgba_unmultiplied(0, 122, 255, 28),
+                hairline: Color32::from_rgba_unmultiplied(0, 0, 0, 10),
+                grid: Color32::from_rgba_unmultiplied(0, 0, 0, 22),
+                shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 42),
+                seg_track: Color32::from_rgb(227, 227, 232),
+                seg_selected: Color32::from_rgb(255, 255, 255),
+                idle_tint: Color32::from_rgba_unmultiplied(255, 159, 10, 32),
+                btn_bg: Color32::from_rgb(234, 234, 238),
+                btn_hover: Color32::from_rgb(223, 223, 228),
             }
         }
     }
@@ -143,120 +178,117 @@ fn dot_grid(painter: &egui::Painter, rect: Rect, color: Color32) {
     }
 }
 
-/// Tile gradient pair for a screen role: (top, bottom).
+/// Tile gradient pair for a screen role: (top, bottom). macOS systemBlue / systemGreen / gray.
 fn tile_colors(is_primary: bool, is_me: bool) -> (Color32, Color32) {
     if is_primary {
-        (Color32::from_rgb(90, 165, 255), Color32::from_rgb(0, 92, 214))
+        // systemBlue display.
+        (Color32::from_rgb(86, 196, 255), Color32::from_rgb(0, 102, 214))
     } else if is_me {
-        (Color32::from_rgb(96, 219, 130), Color32::from_rgb(24, 160, 74))
+        // systemGreen — this machine.
+        (Color32::from_rgb(86, 219, 126), Color32::from_rgb(28, 170, 64))
     } else {
-        (Color32::from_rgb(158, 158, 167), Color32::from_rgb(88, 88, 98))
+        // neutral gray client.
+        (Color32::from_rgb(168, 168, 178), Color32::from_rgb(96, 96, 106))
     }
 }
 
-/// Install a CJK-capable font and make it the **primary** typeface for every language.
+/// Install the typefaces.
 ///
-/// egui's default font (ProggyClean/Ubuntu) is ASCII-only. Without a CJK font, every non-Latin
-/// character shows as ▢▢▢. But if we only add the CJK font as a *fallback* (at the end of the
-/// family list), the two UI languages end up looking different: English renders in egui's default
-/// sans while Chinese falls through to Noto Sans SC. Pushing the CJK font to the **front** of each
-/// family makes Latin and CJK glyphs share ONE typeface, so the Chinese and English layouts look
-/// identical. Noto Sans SC ships full Latin glyphs, so English is unaffected apart from the
-/// consistent look. egui's default font stays behind it as a safety net for any rare missing glyph.
+/// On macOS we lead each family with **San Francisco** (`/System/Library/Fonts/SFNS.ttf`) so Latin
+/// text renders in the exact same UI font as the rest of the OS, then keep the bundled Noto Sans SC
+/// *behind* it as the CJK fallback. ab_glyph picks the first family that owns a glyph, so Latin uses
+/// SF and Chinese/Japanese/Korean fall through to Noto — one consistent, native-looking face per
+/// language. On Windows/Linux (no SF) we keep Noto Sans SC first so CJK always works, and Noto's own
+/// Latin glyphs keep the two languages visually matched.
 ///
-/// Strategy: prefer an **embedded** Noto Sans SC OTF (the only thing we can guarantee across
-/// every user's machine, including CI containers, Windows boxes without East Asian language
-/// packs, and Linux distros with no CJK package installed). If loading the embedded font fails
-/// for some reason, fall back to common system fonts.
+/// The embedded Noto OTF is the only thing guaranteed across every machine (CI, Windows without
+/// East-Asian packs, headless Linux), so it is always registered; the system scan below only adds
+/// fallbacks for machines where the embedded file is somehow missing.
 pub fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // Put the CJK font first in every family so both languages share one typeface.
-    let prefer_cjk = |fonts: &mut egui::FontDefinitions| {
-        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            let list = fonts.families.entry(fam).or_default();
-            if !list.iter().any(|f| f == "cjk") {
-                list.insert(0, "cjk".into());
-            }
-        }
-    };
+    // macOS system UI font (San Francisco). Read once; reused for every family.
+    #[cfg(target_os = "macos")]
+    let sf_bytes: Option<Vec<u8>> = std::fs::read("/System/Library/Fonts/SFNS.ttf").ok();
+    #[cfg(not(target_os = "macos"))]
+    let sf_bytes: Option<Vec<u8>> = None;
 
-    // First try: the bundled OTF (always present, identical on every machine, no surprises).
+    // Bundled Noto Sans SC — the guaranteed CJK face.
     let embedded: &[u8] = include_bytes!("../resources/NotoSansSC-Regular.otf");
-    if !embedded.is_empty() {
-        log::info!("using bundled Noto Sans SC ({} KB)", embedded.len() / 1024);
+    let has_cjk = !embedded.is_empty();
+    if has_cjk {
         fonts
             .font_data
             .insert("cjk".into(), std::sync::Arc::new(egui::FontData::from_owned(embedded.to_vec())));
-        prefer_cjk(&mut fonts);
-        ctx.set_fonts(fonts);
-        return;
+        log::info!("using bundled Noto Sans SC ({} KB)", embedded.len() / 1024);
     }
 
-    // Fallback: scan well-known system locations for any CJK-capable font. Note that
-    // ab_glyph can only read single-file TTF/OTF — TTC collections (Hiragino Sans GB.ttc,
-    // msyh.ttc, …) do NOT parse their faces, so they are listed last.
-    let candidates: &[&str] = &[
-        // macOS
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/System/Library/Fonts/STHeiti Medium.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-        "/System/Library/Fonts/CJKSymbolsFallback.ttc",
-        // Windows
-        "C:/Windows/Fonts/msyh.ttf",
-        "C:/Windows/Fonts/msyhbd.ttf",
-        "C:/Windows/Fonts/simhei.ttf",
-        "C:/Windows/Fonts/simsun.ttf",
-        "C:/Windows/Fonts/simfang.ttf",
-        "C:/Windows/Fonts/simkai.ttf",
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/simsun.ttc",
-        // Linux
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttf",
-        "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/TTF/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    ];
+    if let Some(b) = &sf_bytes {
+        fonts
+            .font_data
+            .insert("sf".into(), std::sync::Arc::new(egui::FontData::from_owned(b.clone())));
+    }
 
-    for path in candidates {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                log::info!("loaded CJK font from {} ({} KB)", path, bytes.len() / 1024);
-                fonts
-                    .font_data
-                    .insert("cjk".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-                prefer_cjk(&mut fonts);
-                break;
+    // Build each family: system UI font (macOS) first, then CJK fallback, then any discovered
+    // system CJK as a last resort.
+    let mut cjk_fallback_paths: &[&str] = &[];
+    if !has_cjk {
+        cjk_fallback_paths = &[
+            // macOS
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/PingFang.ttc",
+            // Windows
+            "C:/Windows/Fonts/msyh.ttf",
+            "C:/Windows/Fonts/simhei.ttf",
+            // Linux
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttf",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        ];
+    }
+
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let list = fonts.families.entry(fam).or_default();
+        if sf_bytes.is_some() && !list.iter().any(|f| f == "sf") {
+            list.insert(0, "sf".into());
+        }
+        if has_cjk && !list.iter().any(|f| f == "cjk") {
+            list.push("cjk".into());
+        }
+        if !has_cjk {
+            for p in cjk_fallback_paths {
+                if let Ok(bytes) = std::fs::read(p) {
+                    fonts.font_data.insert(
+                        "cjk".into(),
+                        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                    );
+                    if !list.iter().any(|f| f == "cjk") {
+                        list.push("cjk".into());
+                    }
+                    break;
+                }
             }
-            Err(_) => continue,
         }
     }
 
     ctx.set_fonts(fonts);
 }
 
-/// Global look & feel: macOS-flavored metrics — consistent 8px control rounding, roomy spacing.
-/// Colors stay theme-driven; the canvas derives its own palette in `UiTheme`.
+/// Global look & feel: macOS-flavored metrics — squircle control rounding, roomy spacing, soft
+/// scrollbars. Colors stay theme-driven; the canvas derives its own palette in `UiTheme`.
 pub fn setup_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     let dark = style.visuals.dark_mode;
 
     // Rhythm: generous, consistent spacing is most of what makes a UI feel designed.
     style.spacing.item_spacing = vec2(10.0, 11.0);
-    style.spacing.button_padding = vec2(15.0, 8.0);
+    style.spacing.button_padding = vec2(16.0, 8.0);
     style.spacing.menu_margin = egui::Margin::same(8);
     style.spacing.indent = 16.0;
     style.spacing.window_margin = egui::Margin::same(0);
     // Text never gets cramped inside a field.
-    style.spacing.text_edit_width = 220.0;
-    style.spacing.combo_width = 220.0;
-    style.spacing.scroll.bar_width = 8.0;
+    style.spacing.text_edit_width = 240.0;
+    style.spacing.combo_width = 240.0;
+    style.spacing.scroll.bar_width = 9.0;
 
     // Uniform control rounding — the macOS squircle look.
     for w in [
@@ -266,29 +298,26 @@ pub fn setup_style(ctx: &egui::Context) {
         &mut style.visuals.widgets.open,
         &mut style.visuals.widgets.noninteractive,
     ] {
-        w.corner_radius = egui::CornerRadius::same(10);
+        w.corner_radius = egui::CornerRadius::same(9);
         // A hairline on every control keeps the panel from looking like a wall of flat fills.
         w.bg_stroke = egui::Stroke::new(
             1.0_f32,
             if dark {
                 Color32::from_white_alpha(26)
             } else {
-                Color32::from_black_alpha(20)
+                Color32::from_black_alpha(18)
             },
         );
     }
     style.visuals.widgets.hovered.expansion = 0.0;
     style.visuals.widgets.active.expansion = 0.0;
 
-    // Slightly tinted panel background so the sidebar reads as a distinct surface from the
-    // central canvas instead of merging into it.
-    style.visuals.panel_fill = if dark {
-        Color32::from_rgb(24, 24, 29)
-    } else {
-        Color32::from_rgb(249, 249, 252)
-    };
-    style.visuals.window_fill = style.visuals.panel_fill;
+    let theme = UiTheme::from_ctx(ctx);
+    // Window + panel share the canvas/sidebar material so egui's popups and scroll areas match.
+    style.visuals.window_fill = theme.canvas_bg;
+    style.visuals.panel_fill = theme.canvas_bg;
     style.visuals.window_stroke = egui::Stroke::NONE;
+    style.visuals.override_text_color = Some(theme.text);
 
     // Softer scrollbar that fades rather than shouts.
     style.visuals.handle_shape = egui::style::HandleShape::Circle;
@@ -438,56 +467,71 @@ impl eframe::App for MouseShareApp {
 
         let theme = UiTheme::from_ctx(ctx);
 
-        // ---- Title bar: app glyph + brand + language toggle ----
-        egui::TopBottomPanel::top("titlebar").show(ctx, |ui| {
-            let panel_rect = ui.max_rect();
-            ui.add_space(11.0);
-            ui.horizontal(|ui| {
-                // App glyph (mouse) drawn in the accent color.
-                let (_, icon_rect) = ui.allocate_space(vec2(24.0, 24.0));
-                draw_mouse_icon(ui.painter(), icon_rect, theme.accent);
+        // ---- Unified toolbar: app glyph + brand + live status + language toggle ----
+        // With the macOS full-size content view, this panel sits *under* the native title bar, so
+        // we clear the traffic-light zone on the left and let the red/yellow/green buttons float
+        // above the toolbar — the standard Big Sur+ "unified" window look.
+        egui::TopBottomPanel::top("titlebar")
+            .frame(egui::Frame::NONE.fill(theme.toolbar_bg))
+            .show(ctx, |ui| {
+                let panel_rect = ui.max_rect();
+                ui.add_space(13.0);
+                ui.horizontal(|ui| {
+                    // Clear the macOS traffic-light cluster (≈70px) so the brand doesn't collide
+                    // with the red/yellow/green buttons. No-op on Windows/Linux.
+                    #[cfg(target_os = "macos")]
+                    ui.add_space(70.0);
 
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("MouseShare")
-                        .size(17.0)
-                        .strong()
-                        .color(ui.visuals().strong_text_color()),
-                );
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new(t.tagline).size(12.0).color(ui.visuals().weak_text_color()));
+                    // App glyph (mouse) drawn in the accent color.
+                    let (_, icon_rect) = ui.allocate_space(vec2(26.0, 26.0));
+                    draw_mouse_icon(ui.painter(), icon_rect, theme.accent);
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Live connection status: a coloured dot + short label, so the user sees at
-                    // a glance whether sharing is live without opening the status card.
-                    let (dot_color, status_text) = match &*self.net.lock().unwrap() {
-                        Net::Primary { .. } => (COL_ME, t.conn_primary),
-                        Net::Secondary { .. } => (COL_ME, t.conn_connected),
-                        Net::Idle => (Color32::from_rgb(255, 159, 10), t.conn_idle),
-                    };
-                    ui.label(egui::RichText::new(status_text).weak().size(12.5));
-                    ui.label(egui::RichText::new("●").color(dot_color).size(14.0));
-                    ui.add_space(14.0);
-                    let pill = egui::Button::new(
-                        egui::RichText::new(self.lang.toggle_label()).size(12.5),
-                    )
-                    .corner_radius(8)
-                    .fill(ui.visuals().widgets.inactive.bg_fill)
-                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke);
-                    if ui.add(pill).clicked() {
-                        self.lang = self.lang.toggled();
-                        self.config.lang = self.lang.code().to_string();
-                        save_config(&self.config); // persist immediately
-                    }
+                    ui.add_space(9.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("MouseShare")
+                                .size(16.0)
+                                .strong()
+                                .color(theme.text),
+                        );
+                        ui.label(
+                            egui::RichText::new(t.tagline)
+                                .size(11.5)
+                                .color(theme.muted),
+                        );
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Language toggle — refined pill button.
+                        let lang_btn = egui::Button::new(
+                            egui::RichText::new(self.lang.toggle_label()).size(12.5).color(theme.text),
+                        )
+                        .corner_radius(8)
+                        .fill(theme.card_bg)
+                        .stroke(egui::Stroke::new(1.0, theme.hairline));
+                        if ui.add(lang_btn).clicked() {
+                            self.lang = self.lang.toggled();
+                            self.config.lang = self.lang.code().to_string();
+                            save_config(&self.config); // persist immediately
+                        }
+                        ui.add_space(14.0);
+
+                        // Live connection status pill: coloured dot + short label.
+                        let (dot_color, status_text, tint) = match &*self.net.lock().unwrap() {
+                            Net::Primary { .. } => (COL_ME, t.conn_primary, theme.accent_tint),
+                            Net::Secondary { .. } => (COL_ME, t.conn_connected, theme.accent_tint),
+                            Net::Idle => (Color32::from_rgb(255, 159, 10), t.conn_idle, theme.idle_tint),
+                        };
+                        status_pill(ui, dot_color, tint, status_text, theme);
+                    });
                 });
+                ui.add_space(13.0);
+                // Hairline under the toolbar.
+                ui.painter().line_segment(
+                    [pos2(panel_rect.left(), panel_rect.bottom()), pos2(panel_rect.right(), panel_rect.bottom())],
+                    (1.0, theme.hairline),
+                );
             });
-            ui.add_space(11.0);
-            // Hairline under the toolbar.
-            ui.painter().line_segment(
-                [pos2(panel_rect.left(), panel_rect.bottom()), pos2(panel_rect.right(), panel_rect.bottom())],
-                (1.0, theme.hairline),
-            );
-        });
 
         // ---- Startup failure banner (network error at boot) ----
         let mut retry_clicked = false;
@@ -532,10 +576,11 @@ impl eframe::App for MouseShareApp {
             self.reconnect();
         }
 
-        // ---- Left sidebar: grouped setting cards ----
+        // ---- Left sidebar: grouped setting cards on the macOS sidebar material ----
         egui::SidePanel::left("config")
             .default_width(360.0)
             .resizable(true)
+            .frame(egui::Frame::NONE.fill(theme.sidebar_bg))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -553,6 +598,12 @@ impl eframe::App for MouseShareApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme.canvas_bg))
             .show(ctx, |ui| {
+                // Hairline separating the sidebar material from the canvas.
+                let pr = ui.max_rect();
+                ui.painter().line_segment(
+                    [pos2(pr.min.x, pr.min.y), pos2(pr.min.x, pr.max.y)],
+                    (1.0, theme.hairline),
+                );
                 // Paint the header into its own measured block so the canvas rectangle below is
                 // exact and does not depend on the fragile cursor state after long hints/legends.
                 let header = ui.vertical(|ui| {
@@ -563,7 +614,7 @@ impl eframe::App for MouseShareApp {
                             egui::RichText::new(t.layout_title)
                                 .size(15.0)
                                 .strong()
-                                .color(theme.canvas_text),
+                                .color(theme.text),
                         );
                     });
                     ui.horizontal(|ui| {
@@ -574,7 +625,7 @@ impl eframe::App for MouseShareApp {
                             egui::Label::new(
                                 egui::RichText::new(t.layout_hint)
                                     .size(12.5)
-                                    .color(theme.canvas_muted),
+                                    .color(theme.muted),
                             )
                             .wrap(),
                         );
@@ -593,7 +644,7 @@ impl eframe::App for MouseShareApp {
                                 egui::Label::new(
                                     egui::RichText::new(t.layout_tip)
                                         .size(12.0)
-                                        .color(theme.canvas_muted),
+                                        .color(theme.muted),
                                 )
                                 .wrap(),
                             );
@@ -675,30 +726,36 @@ impl MouseShareApp {
                     .desired_width(f32::INFINITY),
             );
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             field_label(ui, t.role, theme);
-            ui.radio_value(&mut self.config.mode, "primary".to_string(), t.role_primary);
-            ui.radio_value(&mut self.config.mode, "secondary".to_string(), t.role_secondary);
+            // NSSegmentedControl-style role switch.
+            segmented(
+                ui,
+                &mut self.config.mode,
+                &[("primary", t.role_primary_short), ("secondary", t.role_secondary_short)],
+                theme,
+            );
 
             if self.config.mode == "secondary" {
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 field_label(ui, t.server_addr, theme);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.config.server_addr)
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Monospace),
                 );
-                ui.add_space(8.0);
-                if ui.button(t.connect_host).clicked() {
+                ui.add_space(10.0);
+                if secondary_btn(ui, t.connect_host, theme).clicked() {
                     self.reconnect();
                 }
             } else {
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     field_label(ui, t.listen_port, theme);
                     ui.add(egui::DragValue::new(&mut self.config.port).speed(1));
                 });
-                if ui.button(t.detect_ip).clicked() {
+                ui.add_space(8.0);
+                if secondary_btn(ui, t.detect_ip, theme).clicked() {
                     if let Ok(ip) = local_ip_address::local_ip() {
                         self.config.server_addr = format!("{}:{}", ip, self.config.port);
                     }
@@ -707,23 +764,24 @@ impl MouseShareApp {
                     ui.label(egui::RichText::new(t.address).weak().size(12.0));
                     ui.monospace(&self.config.server_addr);
                 });
-                if ui.button(t.copy_addr).clicked() {
+                ui.add_space(8.0);
+                if secondary_btn(ui, t.copy_addr, theme).clicked() {
                     clipboard::set_clipboard(&self.config.server_addr);
                     self.show_toast(t.copied);
                 }
             }
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             ui.separator();
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             field_label(ui, t.primary_name, theme);
             ui.add(
                 egui::TextEdit::singleline(&mut self.config.primary_name)
                     .desired_width(f32::INFINITY),
             );
 
-            ui.add_space(14.0);
-            // Primary action — filled accent button.
+            ui.add_space(16.0);
+            // Primary action — filled accent button (full width).
             let save = egui::Button::new(
                 egui::RichText::new(t.save).strong().color(Color32::WHITE),
             )
@@ -746,6 +804,7 @@ impl MouseShareApp {
         });
     }
 
+    /// A macOS "bordered" secondary button — rounded, tinted fill, hairline border.
     fn screens_card(&mut self, ui: &mut egui::Ui, t: Tr) {
         card(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -925,33 +984,123 @@ impl MouseShareApp {
     }
 }
 
-/// A macOS-style inset card: subtle fill, hairline border, 12px radius.
+/// A macOS "group" card: white (light) / secondary-fill (dark) surface, hairline border, 12px
+/// radius. The fill is read from the theme so it tracks the system appearance.
 fn card(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(8.0);
+    let theme = UiTheme::from_ctx(ui.ctx());
+    ui.add_space(10.0);
     egui::Frame::NONE
-        .fill(ui.visuals().extreme_bg_color)
+        .fill(theme.card_bg)
         .corner_radius(12)
         .inner_margin(egui::Margin::same(14))
-        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .stroke(egui::Stroke::new(1.0, theme.hairline))
         .show(ui, body);
 }
 
-/// Section title inside a card.
+/// Section title inside a card — the macOS form-label look (semibold, small caps feel via size).
 fn section_header(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(13.0).strong().color(ui.visuals().strong_text_color()));
+    ui.label(egui::RichText::new(text).size(13.0).strong().color(UiTheme::from_ctx(ui.ctx()).text));
     ui.add_space(8.0);
 }
 
 /// Small caption above an input field.
 fn field_label(ui: &mut egui::Ui, text: &str, _theme: UiTheme) {
-    ui.label(egui::RichText::new(text).size(12.0).color(ui.visuals().weak_text_color()));
-    ui.add_space(4.0);
+    ui.label(egui::RichText::new(text).size(12.0).color(UiTheme::from_ctx(ui.ctx()).muted));
+    ui.add_space(5.0);
 }
 
 fn legend_chip(ui: &mut egui::Ui, color: Color32, text: &str, theme: UiTheme) {
     let (_, r) = ui.allocate_space(vec2(11.0, 11.0));
     ui.painter().rect_filled(r, 3.0, color);
-    ui.label(egui::RichText::new(text).size(12.0).color(theme.canvas_muted));
+    ui.label(egui::RichText::new(text).size(12.0).color(theme.muted));
+}
+
+/// A live connection-status pill: a coloured dot followed by a short label, on a tinted
+/// background — the macOS "status chip" look in the toolbar.
+fn status_pill(ui: &mut egui::Ui, dot: Color32, tint: Color32, text: &str, theme: UiTheme) {
+    let h = 24.0;
+    let dot_r = 4.5;
+    let pad_x = 10.0;
+    let text_w = ui.fonts(|f| f.glyph_width(&egui::FontId::proportional(12.5), 'M')) * text.chars().count() as f32;
+    let w = pad_x * 2.0 + dot_r * 2.0 + 6.0 + text_w.max(40.0);
+    let rect = ui.allocate_rect(
+        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, h)),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect.rect, egui::CornerRadius::same(h as u8 / 2), tint);
+    let dot_c = egui::pos2(rect.rect.min.x + pad_x + dot_r, rect.rect.center().y);
+    ui.painter().circle_filled(dot_c, dot_r, dot);
+    ui.painter().text(
+        egui::pos2(rect.rect.min.x + pad_x + dot_r * 2.0 + 6.0, rect.rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(12.5),
+        theme.muted,
+    );
+}
+
+/// A macOS "bordered" secondary button — rounded, surface-tinted fill, hairline border. Returns
+/// the `Response` so callers can test `.clicked()`.
+fn secondary_btn(ui: &mut egui::Ui, label: &str, theme: UiTheme) -> egui::Response {
+    let h = 32.0;
+    let w = ui.available_width();
+    let rect = ui.allocate_rect(
+        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, h)),
+        egui::Sense::click(),
+    );
+    let hover = rect.hovered();
+    let fill = if hover { theme.btn_hover } else { theme.btn_bg };
+    ui.painter().rect_filled(rect.rect, egui::CornerRadius::same(9), fill);
+    ui.painter().rect_stroke(rect.rect, egui::CornerRadius::same(9), egui::Stroke::new(1.0_f32, theme.hairline), egui::StrokeKind::Inside);
+    ui.painter().text(
+        rect.rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        theme.text,
+    );
+    rect
+}
+
+/// An NSSegmentedControl-style two-state toggle: a rounded track with a selected-segment "thumb"
+/// (white in light mode, tertiary-gray in dark) that carries a soft shadow. Used for the
+/// Primary / Secondary role switch.
+fn segmented(ui: &mut egui::Ui, value: &mut String, options: &[(&str, &str)], theme: UiTheme) {
+    let n = options.len() as f32;
+    let h = 30.0;
+    let gap = 2.0;
+    let total_w = ui.available_width();
+    let seg_w = (total_w - gap * (n - 1.0)) / n;
+    let track = ui.allocate_rect(
+        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total_w, h)),
+        egui::Sense::hover(),
+    );
+    ui.painter()
+        .rect_filled(track.rect, egui::CornerRadius::same(8), theme.seg_track);
+    let mut clicked: Option<usize> = None;
+    for (i, (val, label)) in options.iter().enumerate() {
+        let x = track.rect.min.x + i as f32 * (seg_w + gap);
+        let r = egui::Rect::from_min_size(egui::pos2(x, track.rect.min.y), egui::vec2(seg_w, h));
+        let selected = *value == *val;
+        let resp = ui.interact(r, egui::Id::new(("seg", i)), egui::Sense::click());
+        if resp.clicked() {
+            clicked = Some(i);
+        }
+        if selected {
+            soft_shadow(ui.painter(), r, 8.0, theme.shadow, 0.6);
+            ui.painter().rect_filled(r, egui::CornerRadius::same(8), theme.seg_selected);
+        }
+        ui.painter().text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            *label,
+            egui::FontId::proportional(13.0),
+            if selected { theme.text } else { theme.muted },
+        );
+    }
+    if let Some(i) = clicked {
+        *value = options[i].0.to_string();
+    }
 }
 
 /// Draw a small mouse glyph (the app icon) in the given color.
@@ -1148,7 +1297,7 @@ fn draw_layout(
         Align2::CENTER_CENTER,
         t.layout_tip,
         FontId::proportional(12.0),
-        theme.canvas_muted,
+        theme.muted,
     );
     changed
 }
