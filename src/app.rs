@@ -674,7 +674,7 @@ impl eframe::App for MouseShareApp {
         // above — the standard Big Sur+ "unified" window look. The old toolbar also carried the
         // product tagline here; it crowded the brand and is now the page subtitle instead.
         egui::TopBottomPanel::top("titlebar")
-            .frame(egui::Frame::NONE.fill(theme.toolbar_bg).inner_margin(egui::Margin { left: 0, right: 16, top: 14, bottom: 14 }))
+            .frame(egui::Frame::NONE.fill(theme.toolbar_bg).inner_margin(egui::Margin { left: 0, right: 22, top: 14, bottom: 14 }))
             .show(ctx, |ui| {
                 let panel_rect = ui.max_rect();
                 ui.horizontal(|ui| {
@@ -692,14 +692,19 @@ impl eframe::App for MouseShareApp {
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Extra padding from the window edge so the rightmost chip is never clipped
+                        // by macOS full-size-content-view title-bar insets / rounded corners.
+                        ui.add_space(6.0);
+
                         // Language toggle — a small bordered chip (macOS toolbar-item look).
+                        // Width is driven by the label text so "中/En" / "En/中" is never truncated.
                         let lang_btn = egui::Button::new(
                             egui::RichText::new(self.lang.toggle_label())
                                 .size(11.0)
                                 .strong()
                                 .color(theme.text),
                         )
-                        .min_size(vec2(38.0, 30.0))
+                        .min_size(vec2(0.0, 30.0))
                         .corner_radius(8)
                         .fill(theme.btn_bg)
                         .stroke(egui::Stroke::new(1.0, theme.hairline));
