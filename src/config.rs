@@ -22,10 +22,21 @@ pub struct Config {
     /// UI language: "zh" (default) or "en".
     #[serde(default = "default_lang")]
     pub lang: String,
+    /// Extra multiplier applied on top of the **automatically derived** forwarded-delta ratio
+    /// (see `control::motion_scale_ratio`). `1.0` = pure auto (the two machines' OS scale
+    /// factors decide). Because a scale factor is only a proxy for real pixel density, the
+    /// auto value can feel off on mismatched monitors — this lets the user trim it without
+    /// a rebuild. Clamped to a sane range on use.
+    #[serde(default = "default_motion_scale")]
+    pub motion_scale: f32,
 }
 
 fn default_lang() -> String {
     "zh".to_string()
+}
+
+fn default_motion_scale() -> f32 {
+    1.0
 }
 
 impl Default for Config {
@@ -49,6 +60,7 @@ impl Default for Config {
             },
             primary_name: host,
             lang: default_lang(),
+            motion_scale: default_motion_scale(),
         }
     }
 }

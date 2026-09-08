@@ -1062,6 +1062,54 @@ impl MouseShareApp {
                     save = primary_btn(ui, theme, t.save);
                 });
             });
+
+            // ---- Cross-screen pointer speed ----
+            // The ratio itself is computed per hand-off from both machines' scale factors; this
+            // card only exposes a manual trim on top of it (and shows the resulting value).
+            card(ui, theme, |ui| {
+                card_header(ui, theme, t.card_speed, t.card_speed_sub, |_ui| {});
+                card_body(ui, |ui| {
+                    form_row(ui, theme, t.speed_multiplier, true, |ui| {
+                        let before = self.config.motion_scale;
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.motion_scale)
+                                .speed(0.05)
+                                .range(0.25..=4.0)
+                                .suffix("×"),
+                        );
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(t.speed_hint)
+                                .size(11.5)
+                                .color(theme.faint),
+                        );
+                        if (self.config.motion_scale - before).abs() > f32::EPSILON {
+                            crate::control::set_motion_scale(self.config.motion_scale);
+                            save_config(&self.config);
+                        }
+                    });
+                    // Live readout: auto ratio × manual trim, for the first connected peer.
+                    let auto = {
+                        let l = self.shared_layout.lock().unwrap();
+                        l.screens
+                            .iter()
+                            .find(|s| !s.is_local)
+                            .map(|s| crate::control::motion_scale_ratio(&l, &s.name, None))
+                    };
+                    form_row(ui, theme, t.speed_effective, false, |ui| {
+                        let txt = match auto {
+                            Some(r) => format!("{:.2} ×", r),
+                            None => t.speed_no_peer.to_string(),
+                        };
+                        ui.label(
+                            egui::RichText::new(txt)
+                                .size(12.5)
+                                .strong()
+                                .color(theme.accent),
+                        );
+                    });
+                });
+            });
             if detect {
                 if let Ok(ip) = local_ip_address::local_ip() {
                     self.config.server_addr = format!("{}:{}", ip, self.config.port);

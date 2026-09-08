@@ -118,6 +118,9 @@ fn main() -> anyhow::Result<()> {
         detect_primary_layout(&my_name)
     };
     input::set_local_layout(&own_layout);
+    // Forwarded-delta speed: the ratio itself is derived per hand-off from both machines' scale
+    // factors; this only seeds the user's manual trim from the saved config.
+    control::set_motion_scale(config.motion_scale);
     // What we advertise to the hub: our local screens' bounding box (logical units) plus the UI
     // scale of that coordinate space, so the primary can normalise forwarded mouse deltas.
     let (my_w, my_h, my_scale) = hello_metrics(&own_layout);

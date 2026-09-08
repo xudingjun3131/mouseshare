@@ -111,6 +111,24 @@ const CROSS_EPS: f64 = 1.0;
 /// Safety bounds for the forwarded-delta scale ratio (see `motion_scale_ratio`).
 const MIN_SCALE_RATIO: f64 = 0.25;
 const MAX_SCALE_RATIO: f64 = 4.0;
+/// Bounds for the combined ratio once the user's manual multiplier is applied.
+const MIN_EFFECTIVE_RATIO: f64 = 0.1;
+const MAX_EFFECTIVE_RATIO: f64 = 8.0;
+
+/// User override multiplied on top of the auto-derived ratio (`Config::motion_scale`, default
+/// 1.0). Stored as raw `f32` bits so it can be updated from the GUI without a lock.
+static MOTION_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1.0f32.to_bits());
+
+/// Set the user's manual speed multiplier (1.0 = leave the automatic ratio untouched).
+pub fn set_motion_scale(v: f32) {
+    let v = if v.is_finite() { v.clamp(0.1, 8.0) } else { 1.0 };
+    MOTION_SCALE.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The user's manual speed multiplier.
+pub fn motion_scale() -> f32 {
+    f32::from_bits(MOTION_SCALE.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 /// Switch hotkey: **ScrollLock** (kept for compatibility) or **Ctrl+Alt+Space**.
 ///
@@ -306,10 +324,21 @@ fn crossing_back(r: &RemoteCtrl, bbox: (f64, f64, f64, f64), dx: f64, dy: f64) -
 ///
 /// The result is clamped so a peer reporting a bogus scale (0, or a wild value) can never make
 /// the cursor teleport or freeze.
-fn motion_scale_ratio(l: &Layout, remote: &str, loc: Option<(f64, f64)>) -> f64 {
+pub fn motion_scale_ratio(l: &Layout, remote: &str, loc: Option<(f64, f64)>) -> f64 {
     let own = l.local_scale_at(loc).max(0.01) as f64;
     let theirs = l.scale_of(remote).max(0.01) as f64;
-    (own / theirs).clamp(MIN_SCALE_RATIO, MAX_SCALE_RATIO)
+    let auto = (own / theirs).clamp(MIN_SCALE_RATIO, MAX_SCALE_RATIO);
+    effective_ratio(auto, motion_scale())
+}
+
+/// Combine the automatic ratio with the user's manual trim. Pure (no globals) so tests can
+/// exercise the clamping without racing other tests over `MOTION_SCALE`.
+fn effective_ratio(auto: f64, manual: f32) -> f64 {
+    // The manual multiplier is a trim on top of the automatic value, not a replacement: the
+    // machines' densities can change (new monitor, different Windows scaling) and the auto
+    // part keeps tracking that, while the user only corrects the residual "feel".
+    let m = if manual.is_finite() { manual as f64 } else { 1.0 };
+    (auto * m).clamp(MIN_EFFECTIVE_RATIO, MAX_EFFECTIVE_RATIO)
 }
 
 /// Begin forwarding control to `name` (attached on `side`). Hides the local cursor, parks it at the
@@ -1129,6 +1158,19 @@ mod integration {
         };
         let r = motion_scale_ratio(&bogus, "Z", None);
         assert!(r.is_finite() && r <= MAX_SCALE_RATIO, "ratio must stay bounded, got {r}");
+    }
+
+    #[test]
+    fn manual_trim_scales_and_stays_bounded() {
+        // Default trim leaves the automatic ratio untouched.
+        assert!((effective_ratio(2.0, 1.0) - 2.0).abs() < 1e-6);
+        // Halve / double the auto value.
+        assert!((effective_ratio(2.0, 0.5) - 1.0).abs() < 1e-6);
+        assert!((effective_ratio(2.0, 1.5) - 3.0).abs() < 1e-6);
+        // Absurd input must be clamped instead of teleporting the cursor.
+        assert_eq!(effective_ratio(2.0, 100.0), MAX_EFFECTIVE_RATIO);
+        assert_eq!(effective_ratio(2.0, 0.0), MIN_EFFECTIVE_RATIO);
+        assert_eq!(effective_ratio(2.0, f32::NAN), 2.0, "NaN must fall back to 1.0");
     }
 
     #[test]
