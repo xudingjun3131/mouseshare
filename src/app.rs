@@ -323,15 +323,15 @@ pub fn setup_style(ctx: &egui::Context) {
     let dark = style.visuals.dark_mode;
 
     // Rhythm: generous, consistent spacing is most of what makes a UI feel designed.
-    style.spacing.item_spacing = vec2(10.0, 11.0);
-    style.spacing.button_padding = vec2(16.0, 8.0);
-    style.spacing.menu_margin = egui::Margin::same(8);
-    style.spacing.indent = 16.0;
+    style.spacing.item_spacing = vec2(12.0, 14.0);
+    style.spacing.button_padding = vec2(18.0, 9.0);
+    style.spacing.menu_margin = egui::Margin::same(10);
+    style.spacing.indent = 20.0;
     style.spacing.window_margin = egui::Margin::same(0);
     // Text never gets cramped inside a field.
-    style.spacing.text_edit_width = 240.0;
-    style.spacing.combo_width = 240.0;
-    style.spacing.scroll.bar_width = 9.0;
+    style.spacing.text_edit_width = 260.0;
+    style.spacing.combo_width = 260.0;
+    style.spacing.scroll.bar_width = 10.0;
 
     // ---- Typography: a real macOS type scale ----
     // egui's built-in ramp (Small 9 / Body 12.5 / Button 12.5 / Heading 18) is cramped and isn't
@@ -552,34 +552,33 @@ impl eframe::App for MouseShareApp {
         // above — the standard Big Sur+ "unified" window look. The old toolbar also carried the
         // product tagline here; it crowded the brand and is now the page subtitle instead.
         egui::TopBottomPanel::top("titlebar")
-            .frame(egui::Frame::NONE.fill(theme.toolbar_bg))
+            .frame(egui::Frame::NONE.fill(theme.toolbar_bg).inner_margin(egui::Margin { left: 0, right: 16, top: 14, bottom: 14 }))
             .show(ctx, |ui| {
                 let panel_rect = ui.max_rect();
-                ui.add_space(11.0);
                 ui.horizontal(|ui| {
                     // Clear the macOS traffic-light cluster (≈78px) so the brand doesn't collide
                     // with the red/yellow/green buttons. No-op on Windows/Linux.
                     #[cfg(target_os = "macos")]
-                    ui.add_space(78.0);
+                    ui.add_space(82.0);
 
+                    ui.add_space(2.0);
                     ui.label(
                         egui::RichText::new("MouseShare")
-                            .size(13.0)
+                            .size(13.5)
                             .strong()
                             .color(theme.text),
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(14.0);
                         // Language toggle — a small bordered chip (macOS toolbar-item look).
                         let lang_btn = egui::Button::new(
                             egui::RichText::new(self.lang.toggle_label())
-                                .size(10.5)
+                                .size(11.0)
                                 .strong()
                                 .color(theme.text),
                         )
-                        .min_size(vec2(36.0, 28.0))
-                        .corner_radius(7)
+                        .min_size(vec2(38.0, 30.0))
+                        .corner_radius(8)
                         .fill(theme.btn_bg)
                         .stroke(egui::Stroke::new(1.0, theme.hairline));
                         if ui.add(lang_btn).clicked() {
@@ -587,7 +586,7 @@ impl eframe::App for MouseShareApp {
                             self.config.lang = self.lang.code().to_string();
                             save_config(&self.config); // persist immediately
                         }
-                        ui.add_space(8.0);
+                        ui.add_space(10.0);
 
                         // Live connection status pill: coloured dot + short label on a tint.
                         let (dot_color, status_text, tint) = match &*self.net.lock().unwrap() {
@@ -598,7 +597,6 @@ impl eframe::App for MouseShareApp {
                         status_pill(ui, dot_color, tint, status_text);
                     });
                 });
-                ui.add_space(11.0);
                 // Hairline under the toolbar.
                 ui.painter().line_segment(
                     [pos2(panel_rect.left(), panel_rect.bottom()), pos2(panel_rect.right(), panel_rect.bottom())],
@@ -660,24 +658,29 @@ impl eframe::App for MouseShareApp {
         // into the content area is what frees room for large page titles and full-width cards —
         // the stacked-card sidebar had space for neither.
         egui::SidePanel::left("nav")
-            .default_width(220.0)
+            .default_width(232.0)
             .resizable(false)
-            .frame(egui::Frame::NONE.fill(theme.sidebar_bg))
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme.sidebar_bg)
+                    .inner_margin(egui::Margin { left: 14, right: 14, top: 16, bottom: 14 }),
+            )
             .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
                 // Hairline separating the sidebar material from the content.
                 let pr = ui.max_rect();
                 ui.painter().line_segment(
                     [pos2(pr.right(), pr.min.y), pos2(pr.right(), pr.max.y)],
                     (1.0, theme.hairline),
                 );
-                ui.add_space(12.0);
                 brand_block(ui, theme);
-                ui.add_space(6.0);
+                ui.add_space(14.0);
 
                 let peer_count = self.net.lock().unwrap().peer_count();
                 let disc_count = self.discovered.lock().unwrap().len();
 
                 nav_group_label(ui, t.nav_group_config, theme);
+                ui.add_space(2.0);
                 if nav_item(
                     ui,
                     theme,
@@ -722,7 +725,8 @@ impl eframe::App for MouseShareApp {
 
                 // Bottom-anchored: keep "Quit" pinned to the foot of the rail on tall windows.
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.add_space(12.0);
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.add_space(6.0);
                     if nav_item(ui, theme, false, t.exit_app, NavIcon::Power, None) {
                         if self.config.mode == "primary" {
                             self.config.layout = self.shared_layout.lock().unwrap().clone();
@@ -741,7 +745,7 @@ impl eframe::App for MouseShareApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         egui::Frame::NONE
-                            .inner_margin(egui::Margin { left: 40, right: 40, top: 28, bottom: 24 })
+                            .inner_margin(egui::Margin { left: 48, right: 48, top: 36, bottom: 32 })
                             .show(ui, |ui| match self.page {
                                 Page::Connection => self.page_connection(ui, t, theme),
                                 Page::Layout => self.page_layout(ui, t, theme),
@@ -1312,9 +1316,15 @@ fn draw_nav_icon(p: &egui::Painter, rect: Rect, icon: NavIcon, color: Color32) {
 
 /// Small uppercase group heading in the sidebar.
 fn nav_group_label(ui: &mut egui::Ui, text: &str, theme: UiTheme) {
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new(text).size(10.5).strong().color(theme.faint));
-    ui.add_space(3.0);
+    ui.add_space(16.0);
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(text)
+            .size(10.5)
+            .strong()
+            .color(theme.faint),
+    );
+    ui.add_space(2.0);
 }
 
 /// A sidebar row: 18px stroke icon, 13px label, optional right-aligned count badge.
@@ -1328,13 +1338,13 @@ fn nav_item(
     badge: Option<&(String, Color32)>,
 ) -> bool {
     let (rect, resp) =
-        ui.allocate_exact_size(vec2(ui.available_width(), 32.0), egui::Sense::click());
+        ui.allocate_exact_size(vec2(ui.available_width(), 36.0), egui::Sense::click());
     if selected {
         ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(7), theme.nav_active);
+            .rect_filled(rect, egui::CornerRadius::same(8), theme.nav_active);
     } else if resp.hovered() {
         ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(7), theme.nav_hover);
+            .rect_filled(rect, egui::CornerRadius::same(8), theme.nav_hover);
     }
     let icon_rect = Rect::from_min_size(
         pos2(rect.min.x + 10.0, rect.center().y - 9.0),
@@ -1377,12 +1387,12 @@ fn nav_item(
 /// Sidebar brand block: gradient mark + wordmark + version line.
 fn brand_block(ui: &mut egui::Ui, theme: UiTheme) {
     ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        let (mark, _) = ui.allocate_exact_size(vec2(34.0, 34.0), egui::Sense::hover());
+        ui.spacing_mut().item_spacing.x = 12.0;
+        let (mark, _) = ui.allocate_exact_size(vec2(38.0, 38.0), egui::Sense::hover());
         fill_gradient(
             ui.painter(),
             mark,
-            8.0,
+            9.0,
             Color32::from_rgb(79, 157, 255),
             Color32::from_rgb(88, 86, 214),
         );
@@ -1390,11 +1400,11 @@ fn brand_block(ui: &mut egui::Ui, theme: UiTheme) {
             mark.center(),
             Align2::CENTER_CENTER,
             "M",
-            FontId::proportional(17.0),
+            FontId::proportional(18.0),
             Color32::WHITE,
         );
-        ui.add_space(10.0);
         ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
             ui.label(
                 egui::RichText::new("MouseShare")
                     .size(15.5)
@@ -1403,7 +1413,7 @@ fn brand_block(ui: &mut egui::Ui, theme: UiTheme) {
             );
             ui.label(
                 egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                    .size(10.5)
+                    .size(11.0)
                     .color(theme.muted),
             );
         });
@@ -1415,14 +1425,14 @@ fn brand_block(ui: &mut egui::Ui, theme: UiTheme) {
 /// Page title (28pt semibold) + one-line subtitle — the macOS System Settings heading.
 fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str, theme: UiTheme) {
     ui.label(egui::RichText::new(title).size(28.0).strong().color(theme.text));
-    ui.add_space(1.0);
+    ui.add_space(4.0);
     ui.label(egui::RichText::new(subtitle).size(13.5).color(theme.muted));
-    ui.add_space(18.0);
+    ui.add_space(24.0);
 }
 
 /// A grouped card: white (light) / secondarySystemFill (dark), hairline border, 12pt radius.
 fn card(ui: &mut egui::Ui, theme: UiTheme, body: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(9.0);
+    ui.add_space(14.0);
     egui::Frame::NONE
         .fill(theme.card_bg)
         .corner_radius(12)
@@ -1439,11 +1449,11 @@ fn card_header(
     action: impl FnOnce(&mut egui::Ui),
 ) {
     egui::Frame::NONE
-        .inner_margin(egui::Margin { left: 20, right: 20, top: 14, bottom: 6 })
+        .inner_margin(egui::Margin { left: 24, right: 24, top: 18, bottom: 8 })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.spacing_mut().item_spacing.y = 2.0;
                     ui.label(
                         egui::RichText::new(title).size(14.0).strong().color(theme.text),
                     );
@@ -1460,17 +1470,17 @@ fn card_header(
         });
 }
 
-/// Card body: standard 20px horizontal padding.
+/// Card body: standard 24px horizontal padding, more vertical breathing room.
 fn card_body(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::NONE
-        .inner_margin(egui::Margin { left: 20, right: 20, top: 8, bottom: 18 })
+        .inner_margin(egui::Margin { left: 24, right: 24, top: 12, bottom: 22 })
         .show(ui, body);
 }
 
 /// Card footer for the action buttons, separated from the body by the row rhythm.
 fn card_footer(ui: &mut egui::Ui, theme: UiTheme, body: impl FnOnce(&mut egui::Ui)) {
     let r = egui::Frame::NONE
-        .inner_margin(egui::Margin { left: 20, right: 20, top: 4, bottom: 16 })
+        .inner_margin(egui::Margin { left: 24, right: 24, top: 4, bottom: 18 })
         .show(ui, |ui| {
             ui.horizontal(body);
         })
@@ -1491,9 +1501,9 @@ fn form_row(
     control: impl FnOnce(&mut egui::Ui),
 ) {
     let r = egui::Frame::NONE
-        .inner_margin(egui::Margin::symmetric(0, 11))
+        .inner_margin(egui::Margin::symmetric(0, 14))
         .show(ui, |ui| {
-            let (lr, _) = ui.allocate_exact_size(vec2(110.0, 20.0), egui::Sense::hover());
+            let (lr, _) = ui.allocate_exact_size(vec2(130.0, 22.0), egui::Sense::hover());
             let cp = ui.painter().with_clip_rect(lr.expand2(vec2(4.0, 0.0)));
             cp.text(
                 lr.left_center(),
@@ -1502,7 +1512,7 @@ fn form_row(
                 FontId::proportional(13.0),
                 theme.text,
             );
-            ui.add_space(16.0);
+            ui.add_space(18.0);
             control(ui);
         })
         .response
