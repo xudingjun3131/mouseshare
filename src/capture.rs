@@ -24,7 +24,17 @@ use std::sync::{Arc, OnceLock};
 
 // ---- cursor visibility / parking (capture-layer concern) ----
 
-#[cfg(target_os = "macos")]
+// In tests we never touch the real display server (which may be absent in a headless agent or
+// CI), so cursor show/hide/park are no-ops. This lets the control-plane integration tests run
+// without a GUI session.
+#[cfg(test)]
+mod cursor {
+    pub fn hide_cursor() {}
+    pub fn show_cursor() {}
+    pub fn park_cursor(_p: (f64, f64)) {}
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
 mod cursor {
     use core_graphics::display::CGDisplay;
     pub fn hide_cursor() {
@@ -37,7 +47,7 @@ mod cursor {
     pub fn park_cursor(_p: (f64, f64)) {}
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(test), not(target_os = "macos")))]
 mod cursor {
     pub fn hide_cursor() {}
     pub fn show_cursor() {}

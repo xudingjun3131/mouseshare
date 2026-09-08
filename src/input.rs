@@ -10,7 +10,11 @@
 
 use crate::layout::Layout;
 use crate::protocol::{InputEvent, MsButton};
-use rdev::{simulate, Button as RdevButton, EventType};
+use rdev::Button as RdevButton;
+// `simulate` and `EventType` are only used by the real (non-test) injection paths; under
+// `cfg(test)` injection is a no-op so they would be unused.
+#[cfg(not(test))]
+use rdev::{simulate, EventType};
 use std::sync::OnceLock;
 
 /// The receiver's own screens, used to clamp injected cursor positions. Set once at startup on
@@ -24,6 +28,7 @@ pub fn set_local_layout(layout: &Layout) {
 /// Apply a forwarded input event on this machine (used by secondaries).
 ///
 /// `MouseMotion` is applied relatively (see module docs); everything else is forwarded verbatim.
+#[cfg(not(test))]
 pub fn apply_input(ev: &InputEvent) {
     let result = match ev {
         InputEvent::MouseMotion { dx, dy } => inject_relative(*dx, *dy),
@@ -41,8 +46,13 @@ pub fn apply_input(ev: &InputEvent) {
     }
 }
 
+/// Under test, injection is a no-op so the headless control-plane tests never touch the device.
+#[cfg(test)]
+pub fn apply_input(_ev: &InputEvent) {}
+
 /// Relative motion: read the current cursor, add the delta, clamp to this machine's own screen,
 /// and inject the absolute result.
+#[cfg(not(test))]
 fn inject_relative(dx: f64, dy: f64) -> Result<(), rdev::SimulateError> {
     let Some((cx, cy)) = cursor_position() else {
         // No OS sampler (shouldn't happen on a real secondary) — fall back to a raw absolute
@@ -61,9 +71,14 @@ fn inject_relative(dx: f64, dy: f64) -> Result<(), rdev::SimulateError> {
 
 /// Warp the local cursor to an absolute position — used by the capture layer to keep the (hidden)
 /// cursor parked against the shared edge while a secondary has control, so the OS never clamps it.
+#[cfg(not(test))]
 pub fn warp_cursor(x: f64, y: f64) {
     let _ = simulate(&EventType::MouseMove { x, y });
 }
+
+/// Under test, warping is a no-op (headless agent has no cursor to move).
+#[cfg(test)]
+pub fn warp_cursor(_x: f64, _y: f64) {}
 
 /// Read the cursor position directly from the OS, *not* from the event stream.
 ///

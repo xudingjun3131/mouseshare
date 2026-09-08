@@ -614,3 +614,299 @@ mod tests {
         assert!(!hotkey_fired(Key::Space, false, &mut st));
     }
 }
+
+/// End-to-end control-plane tests that run the *real* cross-screen state machine over a *real* TCP
+/// loopback link (primary hub + secondary client), without any GUI or input device. Injection and
+/// cursor show/hide are no-ops under `cfg(test)` (see `input.rs` / `capture.rs` seams), so this
+/// exercises the full message flow and state transitions headlessly.
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use crate::network::{self, Net};
+    use crate::protocol::{InputEvent, Message};
+    use rdev::Key;
+    use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Connect a primary hub (local screen A + remote B to its right) and a secondary client
+    /// (local screen B) over loopback, and return the two `GrabCtx` plus the secondary's incoming
+    /// channel so the test can observe every message the secondary receives.
+    fn setup_pair(port: u16) -> (GrabCtx, GrabCtx, Receiver<(String, Message)>) {
+        let primary_layout = Layout {
+            screens: vec![
+                Screen {
+                    name: "A".into(),
+                    ox: 0,
+                    oy: 0,
+                    w: 1920,
+                    h: 1080,
+                    is_local: true,
+                    scale: 1.0,
+                },
+                Screen {
+                    name: "B".into(),
+                    ox: 1920,
+                    oy: 0,
+                    w: 1920,
+                    h: 1080,
+                    is_local: false,
+                    scale: 1.0,
+                },
+            ],
+        };
+        let secondary_layout = Layout {
+            screens: vec![Screen {
+                name: "B".into(),
+                ox: 0,
+                oy: 0,
+                w: 1920,
+                h: 1080,
+                is_local: true,
+                scale: 1.0,
+            }],
+        };
+
+        let (ptx, _prx) = channel();
+        let (stx, srx) = channel();
+        let pla = Arc::new(Mutex::new(primary_layout));
+        let sla = Arc::new(Mutex::new(secondary_layout));
+
+        let net_primary = network::start_hub(port, ptx, pla.clone()).expect("hub starts");
+        let net_secondary = Net::idle();
+        let (_net_sec, sec_tx) = network::connect_client(
+            &format!("127.0.0.1:{port}"),
+            stx,
+            net_secondary.clone(),
+        )
+        .expect("client connects");
+        // The real secondary app sends Hello immediately after connecting; replicate that so the
+        // hub learns our name and registers the peer (otherwise no messages can be routed).
+        sec_tx
+            .send(Message::Hello {
+                name: "B".to_string(),
+                width: 1920,
+                height: 1080,
+            })
+            .expect("send Hello");
+
+        // Wait until the hub has registered the secondary (handshake + peer insert).
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if net_primary.lock().unwrap().peer_count() > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            net_primary.lock().unwrap().peer_count() > 0,
+            "secondary must be registered with the hub"
+        );
+
+        let primary = GrabCtx {
+            net: net_primary,
+            layout: pla.clone(),
+            ctrl: Arc::new(Mutex::new(Ctrl {
+                local_bbox: pla.lock().unwrap().local_bbox(),
+                ..Default::default()
+            })),
+            mode: Mutex::new(CaptureMode::Local),
+            my_name: "A".to_string(),
+            primary_name: "A".to_string(),
+        };
+        let secondary = GrabCtx {
+            net: net_secondary,
+            layout: sla.clone(),
+            ctrl: Arc::new(Mutex::new(Ctrl {
+                // The real app seeds the secondary's Ctrl.local_bbox from its own layout
+                // (main.rs); without it on_enter_screen early-returns and the secondary never
+                // receives control. Replicate that here.
+                local_bbox: sla.lock().unwrap().local_bbox(),
+                ..Default::default()
+            })),
+            mode: Mutex::new(CaptureMode::Local),
+            my_name: "B".to_string(),
+            primary_name: "A".to_string(),
+        };
+        (primary, secondary, srx)
+    }
+
+    /// Drain the secondary's incoming channel for `dur`, applying whatever the primary sent
+    /// (EnterScreen / LeaveScreen / Input) to the secondary's own control plane, and return every
+    /// message that arrived (Layout snapshots are skipped).
+    fn pump(sec: &GrabCtx, rx: &Receiver<(String, Message)>, dur: Duration) -> Vec<Message> {
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + dur;
+        loop {
+            let remain = deadline.saturating_duration_since(std::time::Instant::now());
+            if remain.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remain) {
+                Ok((_, msg)) => match msg {
+                    Message::Layout { .. } => continue,
+                    Message::EnterScreen { side, fx, fy } => {
+                        on_enter_screen(sec, side, fx, fy);
+                        got.push(Message::EnterScreen { side, fx, fy });
+                    }
+                    Message::LeaveScreen => {
+                        on_leave_screen(sec);
+                        got.push(Message::LeaveScreen);
+                    }
+                    Message::Input(ev) => {
+                        on_secondary_input(sec, ev.clone());
+                        got.push(Message::Input(ev));
+                    }
+                    other => got.push(other),
+                },
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(_) => break,
+            }
+        }
+        got
+    }
+
+    #[test]
+    fn handoff_over_tcp() {
+        let (p, s, srx) = setup_pair(19211);
+
+        // Primary cursor near the right edge moving right -> predict crossing into B.
+        let dropped = on_capture(
+            &p,
+            RawInput::Motion { dx: 100.0, dy: 0.0 },
+            Some((1918.0, 540.0)),
+        );
+        assert!(dropped, "event must be dropped while forwarding");
+
+        let msgs = pump(&s, &srx, Duration::from_millis(500));
+        assert!(
+            msgs.iter().any(|m| matches!(m, Message::EnterScreen { .. })),
+            "secondary must receive EnterScreen"
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(m, Message::Input(InputEvent::MouseMotion { dx, dy }) if *dx == 100.0 && *dy == 0.0)),
+            "secondary must receive the forwarded MouseMotion"
+        );
+
+        // Secondary seeds its virtual cursor on the OPPOSITE edge of the primary's side. The
+        // primary crossed its Right edge into B, so B receives it on its Left edge (x = bl + 2).
+        {
+            let c = s.ctrl.lock().unwrap();
+            let r = c.remote.as_ref().expect("secondary should be driven");
+            assert_eq!(r.side, Side::Left, "secondary enters on its Left edge");
+            // seed vx = bl + 2 = 2; +100 -> 102 (no clamp; br - 1 = 1919)
+            assert!((r.vx - 102.0).abs() < 0.5, "vx={}", r.vx);
+            // fy = 540/1080 = 0.5 -> seed vy = bt + 0.5*(bb-bt) = 540; +0 -> 540
+            assert!((r.vy - 540.0).abs() < 0.5, "vy={}", r.vy);
+        }
+
+        // Cursor returns across the edge -> control comes back to the primary.
+        let dropped2 = on_capture(
+            &p,
+            RawInput::Motion { dx: -50.0, dy: 0.0 },
+            Some((1919.0, 540.0)),
+        );
+        assert!(!dropped2, "returning event must NOT be dropped");
+
+        let msgs2 = pump(&s, &srx, Duration::from_millis(500));
+        assert!(
+            msgs2.iter().any(|m| matches!(m, Message::LeaveScreen)),
+            "secondary must receive LeaveScreen"
+        );
+        assert!(p.ctrl.lock().unwrap().remote.is_none(), "primary remote cleared");
+        assert!(s.ctrl.lock().unwrap().remote.is_none(), "secondary remote cleared");
+        assert!(
+            p.ctrl.lock().unwrap().cooldown_until.is_some(),
+            "primary cooldown must be armed on return"
+        );
+    }
+
+    #[test]
+    fn cooldown_blocks_recross() {
+        let (p, s, srx) = setup_pair(19212);
+
+        on_capture(
+            &p,
+            RawInput::Motion { dx: 100.0, dy: 0.0 },
+            Some((1918.0, 540.0)),
+        );
+        pump(&s, &srx, Duration::from_millis(300));
+        on_capture(
+            &p,
+            RawInput::Motion { dx: -50.0, dy: 0.0 },
+            Some((1919.0, 540.0)),
+        );
+        pump(&s, &srx, Duration::from_millis(300));
+        assert!(
+            p.ctrl.lock().unwrap().cooldown_until.is_some(),
+            "cooldown armed after return"
+        );
+
+        // Immediate re-cross attempt must be suppressed by the cooldown.
+        let dropped = on_capture(
+            &p,
+            RawInput::Motion { dx: 100.0, dy: 0.0 },
+            Some((1918.0, 540.0)),
+        );
+        assert!(!dropped, "cooldown must suppress immediate re-handoff");
+        assert!(
+            p.ctrl.lock().unwrap().remote.is_none(),
+            "still local during cooldown"
+        );
+        let msgs = pump(&s, &srx, Duration::from_millis(300));
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Message::EnterScreen { .. })),
+            "no re-enter during cooldown"
+        );
+    }
+
+    #[test]
+    fn held_keys_released_on_leave() {
+        let (p, s, srx) = setup_pair(19213);
+
+        on_capture(
+            &p,
+            RawInput::Motion { dx: 100.0, dy: 0.0 },
+            Some((1918.0, 540.0)),
+        );
+        pump(&s, &srx, Duration::from_millis(300));
+
+        // Hold a key while forwarding.
+        on_capture(&p, RawInput::KeyDown(Key::KeyA), None);
+
+        // Return across the edge -> leave_forwarding should release the held key first.
+        on_capture(
+            &p,
+            RawInput::Motion { dx: -50.0, dy: 0.0 },
+            Some((1919.0, 540.0)),
+        );
+        let msgs = pump(&s, &srx, Duration::from_millis(300));
+
+        let keyup_idx = msgs
+            .iter()
+            .position(|m| matches!(m, Message::Input(InputEvent::KeyUp { key: Key::KeyA })));
+        let leave_idx = msgs.iter().position(|m| matches!(m, Message::LeaveScreen));
+        assert!(keyup_idx.is_some(), "remote key must be released");
+        assert!(leave_idx.is_some(), "LeaveScreen must be sent");
+        assert!(
+            keyup_idx.unwrap() < leave_idx.unwrap(),
+            "held key must be released BEFORE control leaves"
+        );
+    }
+
+    #[test]
+    fn hotkey_enters_first_remote() {
+        let (p, _s, _srx) = setup_pair(19214);
+
+        // ScrollLock in Local mode must rotate control into the first secondary (B).
+        on_capture(&p, RawInput::KeyDown(Key::ScrollLock), None);
+        assert!(
+            matches!(&*p.mode.lock().unwrap(), CaptureMode::Forwarding(n) if n.as_str() == "B"),
+            "first hotkey must hand control to B"
+        );
+        assert!(
+            p.ctrl.lock().unwrap().remote.as_ref().map(|r| r.name == "B").unwrap_or(false),
+            "primary remote should be B"
+        );
+    }
+}

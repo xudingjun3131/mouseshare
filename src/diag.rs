@@ -7,14 +7,21 @@
 //! config file. The log is deliberately small: only decision points and throttled samples
 //! are written, never the raw event flood.
 
+// These are only used by the real (non-test) diagnostic writer.
+#[cfg(not(test))]
 use std::fs::OpenOptions;
+#[cfg(not(test))]
 use std::io::Write;
+#[cfg(not(test))]
 use std::sync::Mutex;
+#[cfg(not(test))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(not(test))]
 static DIAG_LOCK: Mutex<()> = Mutex::new(());
 
 /// Append one line to the diagnostic log. Never panics: logging must not take the app down.
+#[cfg(not(test))]
 pub fn log(msg: &str) {
     let _guard = DIAG_LOCK.lock();
     let path = crate::config::config_dir().join("mouseshare.log");
@@ -27,6 +34,11 @@ pub fn log(msg: &str) {
         .unwrap_or(0);
     let _ = writeln!(f, "{} {}", now, msg);
 }
+
+/// Under test we never want to append to the user's real diagnostic log (and there is no GUI
+/// session to diagnose anyway), so `log` is a no-op.
+#[cfg(test)]
+pub fn log(_msg: &str) {}
 
 /// Where the log lives (shown in the GUI so users can find and paste it).
 pub fn log_path() -> std::path::PathBuf {
