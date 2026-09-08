@@ -5,3 +5,4 @@ MouseShare.app/
 *.deb
 MouseShare-Setup.exe
 .DS_Store
+dmgstage/
