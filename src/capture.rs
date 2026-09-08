@@ -10,7 +10,7 @@
 //! **Other platforms** currently fall back to `rdev::listen` (an observer). Their native grab rewrite
 //! is deferred; cross-screen there still needs the same treatment (see crate memory).
 
-use crate::control::{on_capture, GrabCtx, RawInput};
+use crate::control::{on_capture, CaptureMode, GrabCtx, RawInput};
 use crate::protocol::MsButton;
 use rdev::Key;
 use std::os::raw::c_void;
@@ -67,6 +67,15 @@ mod cursor {
 }
 
 pub use cursor::{hide_cursor, park_cursor, show_cursor};
+
+/// Whether this machine grabs input (macOS event tap) rather than merely observing it.
+///
+/// The control plane uses this to decide whether it may teleport the real cursor: while a grab
+/// tap is active the local cursor is frozen by dropping events, and any synthetic move we
+/// inject would loop straight back through the tap as a large delta.
+pub fn grab_active() -> bool {
+    cfg!(all(not(test), target_os = "macos"))
+}
 
 /// Start the global input capture. Blocks its own thread running the OS event loop.
 ///
@@ -172,8 +181,16 @@ fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
         let callback = move |_proxy: core_graphics::event::CGEventTapProxy,
                              event_type: CGEventType,
                              cg_ev: &CGEvent| {
-            // Re-enable a tap the OS disabled for running too long in one callback (load / App Nap).
+            // Re-enable a tap the OS disabled (the callback ran too long, or App Nap kicked in).
             if event_type as u32 == CGEventType::TapDisabledByTimeout as u32 {
+                // Order matters: hand control back **before** re-arming the tap. While the tap is
+                // disabled our `Drop` verdicts are ignored, so local events leak through *and*
+                // keep being forwarded — both cursors move at once. Returning control stops that
+                // the moment it happens; the user simply crosses again.
+                if matches!(&*ctx_cb.mode.lock().unwrap(), CaptureMode::Forwarding(_)) {
+                    crate::diag::log("TAP DISABLED mid-forward — control returned to local");
+                    crate::control::return_control(&ctx_cb);
+                }
                 if let Some(&port) = tap_port_cb.get() {
                     unsafe { CGEventTapEnable(port as *mut c_void, true) };
                 }

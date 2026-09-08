@@ -7,30 +7,109 @@
 use crate::layout::Layout;
 use crate::protocol::{InputEvent, Message};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// `(peer name, message)` delivered from any connection's reader thread to the app.
 pub type Incoming = Sender<(String, Message)>;
 
-fn write_msg(stream: &mut TcpStream, msg: &Message) -> std::io::Result<()> {
-    let buf = serde_json::to_vec(msg).expect("serialize Message");
-    let len = buf.len() as u32;
-    stream.write_all(&len.to_le_bytes())?;
-    stream.write_all(&buf)?;
-    stream.flush()
+/// How many queued messages the writer will coalesce into one `write` before flushing.
+/// Mouse motion arrives at 120+ Hz on a trackpad; merging a burst into a single syscall is
+/// what keeps the remote cursor smooth instead of stuttering on per-event write overhead.
+const WRITE_BATCH: usize = 64;
+
+/// Compose one length-prefixed frame into `out` (reused across calls to avoid re-allocating).
+fn encode_into(out: &mut Vec<u8>, msg: &Message) {
+    let start = out.len();
+    out.extend_from_slice(&[0u8; 4]);
+    serde_json::to_writer(&mut *out, msg).expect("serialize Message");
+    let len = (out.len() - start - 4) as u32;
+    out[start..start + 4].copy_from_slice(&len.to_le_bytes());
 }
 
-fn read_msg(stream: &mut TcpStream) -> std::io::Result<Message> {
+/// Read one length-prefixed frame.
+fn read_msg(stream: &mut impl Read) -> std::io::Result<Message> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame too large: {} bytes", len),
+        ));
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf)?;
     serde_json::from_slice(&buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Upper bound on a single frame. File chunks are 256 KB (≈350 KB base64), so this leaves
+/// plenty of headroom while still rejecting a corrupted length prefix that would otherwise
+/// make us allocate gigabytes.
+const MAX_FRAME: usize = 8 << 20;
+
+/// Drain `rx` into a single batched write.
+///
+/// Two things happen here, both purely about latency:
+/// * every queued message goes out in **one** `write` syscall instead of one per message;
+/// * *adjacent* `MouseMotion` frames are summed into one frame. Motion is additive, so
+///   merging is lossless — and when the link (or the receiver) hiccups it stops a backlog
+///   of hundreds of tiny moves from arriving late as a visible stutter.
+///
+/// Non-motion events are never reordered relative to motion: only runs of consecutive
+/// motion collapse, so a click still lands where the preceding moves put the cursor.
+fn pump_writes(mut ws: TcpStream, rx: Receiver<Message>) {
+    let mut batch: Vec<Message> = Vec::with_capacity(WRITE_BATCH);
+    let mut merged: Vec<Message> = Vec::with_capacity(WRITE_BATCH);
+    let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
+    while let Ok(first) = rx.recv() {
+        batch.clear();
+        batch.push(first);
+        while batch.len() < WRITE_BATCH {
+            match rx.try_recv() {
+                Ok(m) => batch.push(m),
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        // Collapse runs of consecutive MouseMotion into a single additive frame.
+        merged.clear();
+        for m in batch.drain(..) {
+            let merge = match (merged.last_mut(), &m) {
+                (
+                    Some(Message::Input(InputEvent::MouseMotion { dx, dy })),
+                    Message::Input(InputEvent::MouseMotion { dx: ddx, dy: ddy }),
+                ) => {
+                    *dx += *ddx;
+                    *dy += *ddy;
+                    true
+                }
+                _ => false,
+            };
+            if !merge {
+                merged.push(m);
+            }
+        }
+        // One syscall for the whole burst.
+        out.clear();
+        for m in &merged {
+            encode_into(&mut out, m);
+        }
+        if ws.write_all(&out).is_err() {
+            break;
+        }
+    }
+}
+
+/// Disable Nagle on a freshly opened stream.
+///
+/// Every forwarded mouse move is its own ~40 byte frame. With Nagle enabled the kernel holds
+/// a small frame until the previous one is ACKed (up to ~40 ms of extra latency on a busy
+/// LAN), which is exactly what makes a remote cursor feel "steppy" instead of smooth.
+fn tune(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
 }
 
 /// Shared network handle, used from both the capture thread and the clipboard thread.
@@ -83,6 +162,22 @@ impl Net {
                 let _ = tx.send(msg);
             }
             Net::Idle => { /* not connected: nothing to broadcast */ }
+        }
+    }
+
+    /// Send to every peer (primary) or to the primary (secondary). Used for whole-fabric
+    /// messages such as clipboard and file transfers that are not addressed to one machine.
+    pub fn broadcast_all(&self, msg: Message) {
+        match self {
+            Net::Primary { peers } => {
+                for (_, tx) in peers.lock().unwrap().iter() {
+                    let _ = tx.send(msg.clone());
+                }
+            }
+            Net::Secondary { tx } => {
+                let _ = tx.send(msg);
+            }
+            Net::Idle => { /* not connected */ }
         }
     }
 
@@ -164,6 +259,7 @@ fn handle_primary_conn(
     incoming: Incoming,
     layout: Arc<Mutex<Layout>>,
 ) {
+    tune(&stream);
     let read_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -172,7 +268,7 @@ fn handle_primary_conn(
         }
     };
     // The first frame must be Hello so we learn the peer's name.
-    let mut rs = read_stream;
+    let mut rs = BufReader::new(read_stream);
     let hello = read_msg(&mut rs).ok();
     let (name, width, height, scale) = match hello {
         Some(Message::Hello {
@@ -202,15 +298,8 @@ fn handle_primary_conn(
     let snapshot = layout.lock().unwrap().clone();
     let _ = tx.send(Message::Layout { layout: snapshot });
 
-    // Writer thread: drains the per-peer channel into the socket.
-    std::thread::spawn(move || {
-        let mut ws = stream;
-        while let Ok(msg) = rx.recv() {
-            if write_msg(&mut ws, &msg).is_err() {
-                break;
-            }
-        }
-    });
+    // Writer thread: drains the per-peer channel into the socket (batched + coalesced).
+    std::thread::spawn(move || pump_writes(stream, rx));
 
     // Reader thread: forwards everything the peer sends to the app.
     let peers2 = peers.clone();
@@ -268,22 +357,16 @@ pub fn connect_client(
     net: Arc<Mutex<Net>>,
 ) -> anyhow::Result<(Arc<Mutex<Net>>, Sender<Message>)> {
     let stream = connect_with_timeout(addr, Duration::from_secs(3))?;
+    tune(&stream);
     log::info!("connected to primary at {}", addr);
     let read_stream = stream.try_clone()?;
     let (tx, rx) = channel::<Message>();
 
-    std::thread::spawn(move || {
-        let mut ws = stream;
-        while let Ok(msg) = rx.recv() {
-            if write_msg(&mut ws, &msg).is_err() {
-                break;
-            }
-        }
-    });
+    std::thread::spawn(move || pump_writes(stream, rx));
 
     let net_for_reader = net.clone();
     std::thread::spawn(move || {
-        let mut rs = read_stream;
+        let mut rs = BufReader::new(read_stream);
         let server = "server".to_string();
         loop {
             match read_msg(&mut rs) {

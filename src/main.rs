@@ -17,9 +17,17 @@
 // On Windows, build a GUI-subsystem executable (no black console window).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+// `objc::msg_send!` expands into a private helper macro that is not `#[macro_export]`-ed, so we
+// have to bring all of its macros into scope with `#[macro_use]` before clipfile.rs (macOS only)
+// can use them. The Windows / Linux builds don't pull objc in, so gate the extern crate to macOS.
+#[cfg(target_os = "macos")]
+#[macro_use]
+extern crate objc;
+
 mod app;
 mod capture;
 mod clipboard;
+mod clipfile;
 mod discovery;
 mod config;
 mod control;
@@ -30,6 +38,7 @@ mod layout;
 mod network;
 mod protocol;
 mod single_instance;
+mod transfer;
 #[cfg(target_os = "windows")]
 mod tray;
 
@@ -47,6 +56,7 @@ use crate::protocol::Message;
 use std::sync::mpsc::channel;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
     // Windows: declare per-monitor DPI awareness BEFORE anything queries display metrics, so
@@ -80,6 +90,9 @@ fn main() -> anyhow::Result<()> {
 
     let mut config: Config = load_config();
     let my_name = config.name.clone();
+    // Background threads (file transfer) need a language for their notifications; mirror the
+    // configured one once here so they never have to touch the GUI.
+    crate::i18n::set_lang(Lang::from_code(&config.lang));
 
     #[cfg(target_os = "windows")]
     tray::init(Lang::from_code(&config.lang));
@@ -160,6 +173,8 @@ fn main() -> anyhow::Result<()> {
     // Control plane.
     let ctrl: Arc<Mutex<Ctrl>> = Arc::new(Mutex::new(Ctrl {
         local_bbox: own_layout.local_bbox(),
+        local_screens: own_layout.screens.iter().filter(|s| s.is_local).cloned().collect(),
+        layout_snap: Arc::new(layout.lock().unwrap().clone()),
         ..Default::default()
     }));
     let grab_ctx: Arc<GrabCtx> = Arc::new(GrabCtx {
@@ -170,6 +185,30 @@ fn main() -> anyhow::Result<()> {
         my_name: my_name.clone(),
         primary_name: primary_name.clone(),
     });
+
+    // Shared clipboard state. It records the last value *we* put on the local clipboard (from
+    // a remote machine or from a local write) so the monitor can tell a genuine new copy from
+    // our own echo — without it the two machines bounce one clipboard update back and forth
+    // forever.
+    let clip_state: Arc<Mutex<clipboard::ClipState>> =
+        Arc::new(Mutex::new(clipboard::ClipState::default()));
+
+    // Reassembly state for incoming file transfers (one per machine).
+    let file_rx: Arc<Mutex<transfer::Receiver>> = Arc::new(Mutex::new(transfer::Receiver::default()));
+
+    // The event-tap callback runs inside macOS's input pipeline and must never block on a mutex
+    // the GUI thread might be holding — a stalled tap is silently disabled, and a disabled tap
+    // stops dropping events (both cursors move at once). So the control plane reads a snapshot
+    // of the layout that this thread refreshes a few times a second.
+    {
+        let layout = layout.clone();
+        let ctrl = ctrl.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(400));
+            let snap = Arc::new(layout.lock().unwrap().clone());
+            ctrl.lock().unwrap().layout_snap = snap;
+        });
+    }
 
     // ---- Startup diagnostics dump (file-based; stderr is invisible when launched from Finder) ----
     {
@@ -207,15 +246,30 @@ fn main() -> anyhow::Result<()> {
         let layout = layout.clone();
         let grab_ctx = grab_ctx.clone();
         let mode2 = mode.clone();
+        let clip_state = clip_state.clone();
+        let file_rx = file_rx.clone();
         std::thread::spawn(move || {
             for (from, msg) in inc_rx {
                 match msg {
                     Message::Clipboard { text } => {
                         if mode2 == "secondary" {
-                            clipboard::set_clipboard(&text);
+                            clipboard::apply_remote_text(&clip_state, &text);
                         } else {
-                            clipboard::set_clipboard(&text);
-                            net.lock().unwrap().broadcast_clipboard(&text, Some(&from));
+                            // Hub: mirror it locally and pass it on to every other peer.
+                            clipboard::relay(&clip_state, &net, &text, &from);
+                        }
+                    }
+                    // A file copy arriving from another machine: reassemble, then put the paths
+                    // on the local pasteboard so Cmd/Ctrl+V pastes them.
+                    Message::ClipboardFiles { .. }
+                    | Message::FileChunk { .. }
+                    | Message::FileEnd { .. } => {
+                        let finished = file_rx.lock().unwrap().handle(msg);
+                        if let Some(paths) = finished {
+                            let n = paths.len();
+                            if clipboard::apply_remote_files(&clip_state, &paths) {
+                                crate::app::notify(crate::i18n::tr_file_received(n));
+                            }
                         }
                     }
                     Message::Input(ev) => {
@@ -321,10 +375,10 @@ fn main() -> anyhow::Result<()> {
 
     // ---- Clipboard monitor (both roles) ----
     {
-        let net = net.clone();
-        clipboard::start_monitor(Arc::new(Mutex::new(String::new())), move |text: String| {
-            net.lock().unwrap().broadcast_clipboard(&text, None);
-        });
+        // The monitor owns the shared clipboard state: every "fresh" copy (text or files) it sees
+        // is pushed to the peers and recorded, so a value that came from the other machine — or
+        // that we just wrote ourselves — is not echoed back.
+        clipboard::start_monitor(clip_state.clone(), net.clone());
     }
 
     // ---- Capture ----

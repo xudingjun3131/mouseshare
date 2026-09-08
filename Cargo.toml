@@ -1,6 +1,6 @@
 [package]
 name = "mouseshare"
-version = "0.4.9"
+version = "0.5.0"
 edition = "2021"
 description = "Share mouse, keyboard and clipboard across computers over LAN, with a draggable screen-layout. Cross-platform (Windows/Linux/macOS)."
 license = "MIT OR Apache-2.0"
@@ -43,6 +43,9 @@ core-graphics = "0.25"
 # Runloop + mach-port plumbing for the CGEventTap run loop (create_runloop_source / add_source).
 # Bumped alongside core-graphics (0.25 depends on core-foundation 0.10).
 core-foundation = "0.10"
+# Native pasteboard access for the file-clipboard path (Finder / Explorer copy): the
+# `public.file-url` type is read via NSPasteboard, which means going through ObjC.
+objc = "0.2"
 
 # Linux: XQueryPointer for direct cursor-position sampling (the remote-motion driver's
 # treadmill). rdev already links X11 on Linux, so this adds no new system dependency.

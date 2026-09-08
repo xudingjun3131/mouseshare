@@ -11,6 +11,39 @@ pub enum Lang {
     En,
 }
 
+/// The language background threads should use for notifications. The GUI thread has the real
+/// `Lang`; workers (file transfer) only need "whichever the user picked", so we mirror it here
+/// once at startup.
+static WORKER_LANG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_lang(l: Lang) {
+    WORKER_LANG.store(l as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn current_lang() -> Lang {
+    if WORKER_LANG.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        Lang::En
+    } else {
+        Lang::Zh
+    }
+}
+
+/// A file copy exceeded the safety cap and was skipped.
+pub fn tr_file_too_big() -> String {
+    match current_lang() {
+        Lang::Zh => "复制的文件超过 512 MB 上限，已跳过。".to_string(),
+        Lang::En => "The copied files exceed the 512 MB limit and were skipped.".to_string(),
+    }
+}
+
+/// A file copy finished arriving from another machine.
+pub fn tr_file_received(n: usize) -> String {
+    match current_lang() {
+        Lang::Zh => format!("已接收 {} 个文件，可直接粘贴。", n),
+        Lang::En => format!("Received {} file(s) — ready to paste.", n),
+    }
+}
+
 impl Lang {
     pub fn from_code(s: &str) -> Lang {
         if s.eq_ignore_ascii_case("en") {

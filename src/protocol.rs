@@ -53,6 +53,26 @@ pub enum InputEvent {
     KeyUp { key: Key },
 }
 
+/// One file inside a cross-machine clipboard copy.
+///
+/// `path` is relative to the copy root so nested folders survive the trip
+/// (e.g. `report.pdf`, `assets/logo.png`). Directories are implicit: they are recreated on
+/// the receiving side from the files they contain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub path: String,
+    pub size: u64,
+}
+
+/// Payload chunk size for file transfer: 256 KiB of raw bytes (≈350 KB once base64-encoded).
+/// Large enough that a 10 MB copy is only 40 frames, small enough that a chunk never blocks
+/// the input stream for a noticeable time.
+pub const FILE_CHUNK: usize = 256 * 1024;
+
+/// Hard cap on one file copy (files + total bytes). Anything larger is skipped with a
+/// warning rather than buffering hundreds of megabytes in memory on both machines.
+pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Top-level message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
@@ -95,6 +115,18 @@ pub enum Message {
     /// the shared edge toward the primary. The primary leaves forwarding and resumes local control
     /// (unlike `Hotkey`, this always returns to the primary, never rotates to another machine).
     ReturnControl,
+    /// The sender just copied one or more **files**. `entries` is the manifest (relative path +
+    /// size); the bytes follow as a stream of `FileChunk` frames and the copy is closed by
+    /// `FileEnd`. `token` ties the three together so two machines copying at the same time
+    /// cannot interleave into one corrupted transfer.
+    ClipboardFiles {
+        token: u64,
+        entries: Vec<FileEntry>,
+    },
+    /// A base64 chunk of file data for `token`.
+    FileChunk { token: u64, seq: u64, data: String },
+    /// End of the file transfer for `token`.
+    FileEnd { token: u64 },
 }
 
 impl MsButton {

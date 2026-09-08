@@ -20,8 +20,29 @@ use crate::protocol::Message;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Rect, Sense};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Notifications queued by background threads (file transfers) for the GUI to toast.
+/// The GUI can only be touched from its own thread, so workers push strings here instead.
+static NOTIFICATIONS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+/// Queue a transient message for the GUI. Safe to call from any thread.
+pub fn notify(msg: impl Into<String>) {
+    let q = NOTIFICATIONS.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut v) = q.lock() {
+        // Never let a stalled GUI accumulate messages unbounded.
+        if v.len() < 8 {
+            v.push(msg.into());
+        }
+    }
+}
+
+/// Take everything queued since the last call (called once per frame).
+fn take_notifications() -> Vec<String> {
+    let q = NOTIFICATIONS.get_or_init(|| Mutex::new(Vec::new()));
+    std::mem::take(&mut *q.lock().unwrap_or_else(|e| e.into_inner()))
+}
 
 /// The sidebar page currently shown in the main area.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -479,6 +500,14 @@ impl MouseShareApp {
         self.toast = Some((Instant::now(), msg.into()));
     }
 
+    /// Drain notifications queued from background threads (file transfers, transfer errors).
+    /// Background threads cannot touch the GUI, so they push strings here instead.
+    fn drain_notifications(&mut self) {
+        for msg in take_notifications() {
+            self.show_toast(msg);
+        }
+    }
+
     /// (Re)connect to the primary at `addr` from the running app. Tearing down to `Idle` first
     /// lets the old reader/writer threads stop, then we open a fresh connection and send Hello.
     /// No app restart required. Returns nothing; connection state is reflected via `self.net`.
@@ -660,6 +689,7 @@ impl eframe::App for MouseShareApp {
                 self.toast = None;
             }
         }
+        self.drain_notifications();
 
         // Auto-discovery may have linked us in the background (the listener thread flips `net`
         // to `Secondary`). Clear any stale startup-error banner so the UI reflects the live state.

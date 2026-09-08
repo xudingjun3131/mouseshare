@@ -81,6 +81,15 @@ pub struct Ctrl {
     /// Keys/buttons held while forwarding, so we can release them on the remote when control returns.
     pub held_keys: Vec<Key>,
     pub held_buttons: Vec<MsButton>,
+    /// A snapshot of the layout, refreshed by a background thread. The capture callback runs
+    /// inside the macOS event tap, where blocking on the GUI's layout mutex can stall long
+    /// enough for the OS to disable the tap (`TapDisabledByTimeout`) — and while the tap is
+    /// disabled events are no longer dropped, so **both** machines' cursors move at once.
+    /// Reading an `Arc` snapshot keeps the hot path lock-free.
+    pub layout_snap: Arc<Layout>,
+    /// This machine's own displays. A secondary may have more than one, and the virtual cursor
+    /// has to roam between them (and only hand control back at the outermost one).
+    pub local_screens: Vec<Screen>,
 }
 
 #[derive(Debug, Default)]
@@ -108,6 +117,8 @@ const EDGE_ATTACH: f64 = 240.0;
 const RETURN_COOLDOWN_MS: u64 = 700;
 /// Tolerance (px) for "is the cursor still beyond the shared edge" while forwarding.
 const CROSS_EPS: f64 = 1.0;
+/// How far outside a display's own rectangle the cursor may sit and still count as "on" it.
+const ON_SCREEN_TOL: f64 = 2.0;
 /// Safety bounds for the forwarded-delta scale ratio (see `motion_scale_ratio`).
 const MIN_SCALE_RATIO: f64 = 0.25;
 const MAX_SCALE_RATIO: f64 = 4.0;
@@ -153,7 +164,10 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
     match raw {
         RawInput::Motion { dx, dy } => {
             let mut c = ctx.ctrl.lock().unwrap();
-            let l = ctx.layout.lock().unwrap();
+            // Snapshot instead of `ctx.layout.lock()`: the event-tap callback must never block
+            // on a lock the GUI thread might be holding (see `Ctrl::layout_snap`).
+            let snap = c.layout_snap.clone();
+            let l: &Layout = &snap;
             match mode {
                 CaptureMode::Local => {
                     if let Some(t) = c.cooldown_until {
@@ -161,14 +175,13 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
                             return false;
                         }
                     }
-                    let Some(bbox) = l.local_bbox() else { return false };
                     let Some(loc) = location else { return false };
-                    if l.screens.len() <= 1 {
+                    if !l.screens.iter().any(|s| !s.is_local) {
                         return false;
                     }
-                    match predict_cross(&l, loc, (dx, dy), bbox) {
+                    match predict_cross(l, loc, (dx, dy)) {
                         Some((side, name)) => {
-                            enter_forwarding(ctx, &mut c, &l, side, &name, loc);
+                            enter_forwarding(ctx, &mut c, l, side, &name, loc);
                             // Read the ratio *after* the hand-off: that is where it is computed.
                             let ratio = c.remote.as_ref().map_or(1.0, |r| r.scale_ratio);
                             forward_motion(ctx, &name, dx * ratio, dy * ratio);
@@ -267,35 +280,80 @@ fn forward_motion(ctx: &GrabCtx, name: &str, dx: f64, dy: f64) {
     ctx.net.lock().unwrap().send_input(name, InputEvent::MouseMotion { dx, dy });
 }
 
-/// Predict a crossing: is `location + delta` beyond a local-bbox edge that has a neighbour attached
-/// just beyond it? Returns that side and the neighbour's name.
-fn predict_cross(
-    l: &Layout,
-    loc: (f64, f64),
-    delta: (f64, f64),
-    bbox: (f64, f64, f64, f64),
-) -> Option<(Side, String)> {
-    let (bl, bt, br, bb) = bbox;
+fn screen_rect(s: &Screen) -> (f64, f64, f64, f64) {
+    (
+        s.ox as f64,
+        s.oy as f64,
+        s.ox as f64 + s.w as f64,
+        s.oy as f64 + s.h as f64,
+    )
+}
+
+/// The local display the point sits on (within a pixel or two), falling back to the nearest one.
+pub fn local_screen_at<'a>(l: &'a Layout, x: f64, y: f64) -> Option<&'a Screen> {
+    l.screens
+        .iter()
+        .filter(|s| s.is_local)
+        .find(|s| {
+            let (a, b, c, d) = screen_rect(s);
+            x >= a - ON_SCREEN_TOL && x <= c + ON_SCREEN_TOL && y >= b - ON_SCREEN_TOL && y <= d + ON_SCREEN_TOL
+        })
+        .or_else(|| {
+            let mut best: Option<&Screen> = None;
+            let mut best_d = f64::MAX;
+            for s in l.screens.iter().filter(|s| s.is_local) {
+                let (a, b, c, d) = screen_rect(s);
+                // Distance to the rectangle (0 when inside).
+                let dx = (a - x).max(0.0).max(x - c);
+                let dy = (b - y).max(0.0).max(y - d);
+                let dist = dx * dx + dy * dy;
+                if dist < best_d {
+                    best_d = dist;
+                    best = Some(s);
+                }
+            }
+            best
+        })
+}
+
+/// Predict a crossing: is `location + delta` leaving **the display the cursor is actually on**,
+/// toward a neighbour that sits immediately beyond that display's edge?
+///
+/// This is deliberately per-display rather than per-machine. Using the union bounding box of a
+/// multi-monitor Mac lets the cursor "leave" from a dead corner of the bbox, or jump straight
+/// from the far display to a remote machine that is only attached to the near one — both show
+/// up as the hand-off firing while the cursor is still in the middle of the desktop, which is
+/// exactly what makes two cursors move at once.
+fn predict_cross(l: &Layout, loc: (f64, f64), delta: (f64, f64)) -> Option<(Side, String)> {
+    // The cursor must be on one of *our* displays for it to leave that display.
+    let ls = local_screen_at(l, loc.0, loc.1)?;
+    let (ll, lt, lr, lb) = screen_rect(ls);
+    if loc.0 < ll - ON_SCREEN_TOL
+        || loc.0 > lr + ON_SCREEN_TOL
+        || loc.1 < lt - ON_SCREEN_TOL
+        || loc.1 > lb + ON_SCREEN_TOL
+    {
+        return None;
+    }
     let px = loc.0 + delta.0;
     let py = loc.1 + delta.1;
-    for s in l.screens.iter().filter(|s| !s.is_local) {
-        let sl = s.ox as f64;
-        let st = s.oy as f64;
-        let sr = sl + s.w as f64;
-        let sb = st + s.h as f64;
-        let overlap_v = st < bb && sb > bt;
-        let overlap_h = sl < br && sr > bl;
-        if px >= br && sl >= br - EDGE_ATTACH && overlap_v {
-            return Some((Side::Right, s.name.clone()));
+    for rs in l.screens.iter().filter(|s| !s.is_local) {
+        let (sl, st, sr, sb) = screen_rect(rs);
+        // The neighbour must be *flush* against this display's edge (within EDGE_ATTACH) and
+        // overlap it along the crossing axis — otherwise it is not the screen we'd land on.
+        let overlaps_v = sb > lt && st < lb;
+        let overlaps_h = sr > ll && sl < lr;
+        if px >= lr && sl >= lr - EDGE_ATTACH && sl < lr + EDGE_ATTACH && overlaps_v {
+            return Some((Side::Right, rs.name.clone()));
         }
-        if px <= bl && sr <= bl + EDGE_ATTACH && overlap_v {
-            return Some((Side::Left, s.name.clone()));
+        if px <= ll && sr <= ll + EDGE_ATTACH && sr > ll - EDGE_ATTACH && overlaps_v {
+            return Some((Side::Left, rs.name.clone()));
         }
-        if py >= bb && st >= bb - EDGE_ATTACH && overlap_h {
-            return Some((Side::Bottom, s.name.clone()));
+        if py >= lb && st >= lb - EDGE_ATTACH && st < lb + EDGE_ATTACH && overlaps_h {
+            return Some((Side::Bottom, rs.name.clone()));
         }
-        if py <= bt && sb <= bt + EDGE_ATTACH && overlap_h {
-            return Some((Side::Top, s.name.clone()));
+        if py <= lt && sb <= lt + EDGE_ATTACH && sb > lt - EDGE_ATTACH && overlaps_h {
+            return Some((Side::Top, rs.name.clone()));
         }
     }
     None
@@ -351,9 +409,16 @@ fn enter_forwarding(
     name: &str,
     loc: (f64, f64),
 ) {
-    let (bl, bt, br, bb) = match l.local_bbox() {
-        Some(b) => b,
-        None => return,
+    // Park on the *display the cursor is leaving*, not on the union bounding box: on a
+    // multi-monitor Mac the bbox can be much taller than the screen you crossed from, and
+    // parking by bbox fraction drops the cursor into dead space (or onto another display)
+    // when control comes back.
+    let (bl, bt, br, bb) = match local_screen_at(l, loc.0, loc.1) {
+        Some(s) => screen_rect(s),
+        None => match l.local_bbox() {
+            Some(b) => b,
+            None => return,
+        },
     };
     let fx = ((loc.0 - bl) / (br - bl)).clamp(0.0, 1.0);
     let fy = ((loc.1 - bt) / (bb - bt)).clamp(0.0, 1.0);
@@ -432,7 +497,13 @@ fn leave_forwarding(
             Side::Bottom => (bl + fx * (br - bl), bb - 12.0),
             Side::Top => (bl + fx * (br - bl), bt + 12.0),
         };
-        crate::input::warp_cursor(target.0, target.1);
+        // Only teleport the *real* cursor when we are not grabbing. With a grab tap the local
+        // cursor never moved (events were dropped), so it is already sitting on the shared edge
+        // — and injecting a synthetic move here would come straight back through the tap as a
+        // huge delta, which can re-trigger a hand-off or shove the remote cursor.
+        if !crate::capture::grab_active() {
+            crate::input::warp_cursor(target.0, target.1);
+        }
         c.last_real = target;
     }
     ctx.net.lock().unwrap().send_to(name, Message::LeaveScreen);
@@ -518,18 +589,91 @@ pub fn cycle_control(ctx: &GrabCtx) {
 
 // ---- Secondary side: receiving control ----
 
-/// The primary says the cursor is entering our screen. Seed our virtual cursor at the edge facing
-/// the primary and hide our real cursor.
-pub fn on_enter_screen(ctx: &GrabCtx, side: Side, fx: f64, fy: f64) {
-    let mut c = ctx.ctrl.lock().unwrap();
-    let Some((bl, bt, br, bb)) = c.local_bbox else { return };
-    let eside = side.opposite();
-    let (vx, vy) = match eside {
+/// Where a secondary seeds its virtual cursor when control arrives: on the display that faces
+/// the primary, at the same fraction along the shared edge.
+///
+/// With several local displays the entry edge belongs to the *outermost* one on that side, so
+/// seeding from the union bounding box alone could drop the cursor into dead space between two
+/// panels, or onto the wrong one.
+fn seed_position(
+    screens: &[Screen],
+    bbox: Option<(f64, f64, f64, f64)>,
+    side: Side,
+    fx: f64,
+    fy: f64,
+) -> (f64, f64) {
+    let Some((bl, bt, br, bb)) = bbox else { return (0.0, 0.0) };
+    let (tx, ty) = match side {
         Side::Right => (br - 2.0, bt + fy * (bb - bt)),
         Side::Left => (bl + 2.0, bt + fy * (bb - bt)),
         Side::Bottom => (bl + fx * (br - bl), bb - 2.0),
         Side::Top => (bl + fx * (br - bl), bt + 2.0),
     };
+    clamp_to_screens(screens, tx, ty)
+}
+
+/// Pull `(x, y)` into the nearest local display (or leave it alone when we know of none).
+fn clamp_to_screens(screens: &[Screen], x: f64, y: f64) -> (f64, f64) {
+    let mut best: Option<&Screen> = None;
+    let mut best_d = f64::MAX;
+    for s in screens {
+        let (a, b, c, d) = screen_rect(s);
+        let dx = (a - x).max(0.0).max(x - c);
+        let dy = (b - y).max(0.0).max(y - d);
+        let dist = dx * dx + dy * dy;
+        if dist < best_d {
+            best_d = dist;
+            best = Some(s);
+        }
+    }
+    match best {
+        Some(s) => {
+            let (a, b, c, d) = screen_rect(s);
+            (x.clamp(a, c - 1.0), y.clamp(b, d - 1.0))
+        }
+        None => (x, y),
+    }
+}
+
+/// Advance the secondary's virtual cursor by `(dx, dy)`.
+///
+/// Inside a display the motion is free; when it would leave that display we land on whichever
+/// *other* local display is closest — that is what lets a secondary with several monitors be
+/// driven across all of them. Handing control back is a separate decision: it only happens at
+/// the outermost edge facing the primary (see `crossing_back`).
+fn step_local(
+    screens: &[Screen],
+    bbox: Option<(f64, f64, f64, f64)>,
+    vx: f64,
+    vy: f64,
+    dx: f64,
+    dy: f64,
+) -> (f64, f64) {
+    let (nx, ny) = (vx + dx, vy + dy);
+    if !screens.is_empty() {
+        if let Some(s) = screens.iter().find(|s| s.contains(vx, vy)) {
+            let (a, b, c, d) = screen_rect(s);
+            let cx = nx.clamp(a, c - 1.0);
+            let cy = ny.clamp(b, d - 1.0);
+            if (nx - cx).abs() < 0.5 && (ny - cy).abs() < 0.5 {
+                return (cx, cy);
+            }
+        }
+        return clamp_to_screens(screens, nx, ny);
+    }
+    if let Some((a, b, c, d)) = bbox {
+        return (nx.clamp(a, c - 1.0), ny.clamp(b, d - 1.0));
+    }
+    (nx, ny)
+}
+
+/// The primary says the cursor is entering our screen. Seed our virtual cursor at the edge facing
+/// the primary and hide our real cursor.
+pub fn on_enter_screen(ctx: &GrabCtx, side: Side, fx: f64, fy: f64) {
+    let mut c = ctx.ctrl.lock().unwrap();
+    let Some(bbox) = c.local_bbox else { return };
+    let eside = side.opposite();
+    let (vx, vy) = seed_position(&c.local_screens, Some(bbox), eside, fx, fy);
     c.remote = Some(RemoteCtrl {
         name: ctx.primary_name.clone(),
         side: eside,
@@ -562,6 +706,9 @@ pub fn on_leave_screen(ctx: &GrabCtx) {
 pub fn on_secondary_input(ctx: &GrabCtx, ev: InputEvent) {
     let mut c = ctx.ctrl.lock().unwrap();
     let bbox = c.local_bbox;
+    // Snapshot the display list before borrowing `remote` mutably (the compiler cannot split
+    // the borrow through the `Option`). It is one or two small structs per event.
+    let screens: Vec<Screen> = c.local_screens.clone();
     let Some(r) = c.remote.as_mut() else {
         return; // not being driven — ignore stray events
     };
@@ -582,12 +729,9 @@ pub fn on_secondary_input(ctx: &GrabCtx, ev: InputEvent) {
                     return;
                 }
             }
-            r.vx += dx;
-            r.vy += dy;
-            if let Some((bl, bt, br, bb)) = bbox {
-                r.vx = r.vx.clamp(bl, br - 1.0);
-                r.vy = r.vy.clamp(bt, bb - 1.0);
-            }
+            let (nx, ny) = step_local(&screens, bbox, r.vx, r.vy, dx, dy);
+            r.vx = nx;
+            r.vy = ny;
             crate::input::warp_cursor(r.vx, r.vy);
         }
         other => crate::input::apply_input(&other),
@@ -631,13 +775,13 @@ mod tests {
         };
         // Cursor at the right edge moving right -> cross into B.
         assert_eq!(
-            predict_cross(&l, (1918.0, 540.0), (10.0, 0.0), BBOX),
+            predict_cross(&l, (1918.0, 540.0), (10.0, 0.0)),
             Some((Side::Right, "B".to_string()))
         );
         // Not reaching the edge -> no cross.
-        assert_eq!(predict_cross(&l, (1000.0, 540.0), (10.0, 0.0), BBOX), None);
+        assert_eq!(predict_cross(&l, (1000.0, 540.0), (10.0, 0.0)), None);
         // Moving back inside -> no cross.
-        assert_eq!(predict_cross(&l, (1918.0, 540.0), (-10.0, 0.0), BBOX), None);
+        assert_eq!(predict_cross(&l, (1918.0, 540.0), (-10.0, 0.0)), None);
     }
 
     #[test]
@@ -646,7 +790,7 @@ mod tests {
             screens: vec![local(), remote("L", -1920, 0, 1920, 1080)],
         };
         assert_eq!(
-            predict_cross(&l, (5.0, 540.0), (-10.0, 0.0), BBOX),
+            predict_cross(&l, (5.0, 540.0), (-10.0, 0.0)),
             Some((Side::Left, "L".to_string()))
         );
     }
@@ -657,7 +801,7 @@ mod tests {
             screens: vec![local(), remote("D", 0, 1080, 1920, 1080)],
         };
         assert_eq!(
-            predict_cross(&l, (960.0, 1075.0), (0.0, 10.0), BBOX),
+            predict_cross(&l, (960.0, 1075.0), (0.0, 10.0)),
             Some((Side::Bottom, "D".to_string()))
         );
     }
@@ -668,7 +812,7 @@ mod tests {
             screens: vec![local(), remote("U", 0, -1080, 1920, 1080)],
         };
         assert_eq!(
-            predict_cross(&l, (960.0, 5.0), (0.0, -10.0), BBOX),
+            predict_cross(&l, (960.0, 5.0), (0.0, -10.0)),
             Some((Side::Top, "U".to_string()))
         );
     }
@@ -677,16 +821,52 @@ mod tests {
     fn predict_cross_only_remote_neighbours() {
         // No remote screen attached -> never cross, even at the edge.
         let l = Layout { screens: vec![local()] };
-        assert_eq!(predict_cross(&l, (1918.0, 540.0), (10.0, 0.0), BBOX), None);
+        assert_eq!(predict_cross(&l, (1918.0, 540.0), (10.0, 0.0)), None);
     }
 
     #[test]
     fn predict_cross_no_vertical_overlap() {
-        // A right-hand remote that does NOT vertically overlap the local bbox must not cross.
+        // A right-hand remote that does NOT vertically overlap the local screen must not cross.
         let l = Layout {
             screens: vec![local(), remote("B", 1920, 2000, 1920, 1080)],
         };
-        assert_eq!(predict_cross(&l, (1918.0, 540.0), (10.0, 0.0), BBOX), None);
+        assert_eq!(predict_cross(&l, (1918.0, 540.0), (10.0, 0.0)), None);
+    }
+
+    // ---- multi-display primary: which screen the cursor leaves decides which neighbour ----
+
+    #[test]
+    fn predict_cross_multidisplay_left_screen_to_left_remote() {
+        // Local screens: a wide one at (-1920..0) plus a wide one at (0..1920). A remote attached
+        // to the LEFT side of the left screen (L). Cursor on the LEFT screen near its left edge.
+        let l = Layout {
+            screens: vec![
+                Screen { name: "L".into(), ox: -1920, oy: 0, w: 1920, h: 1080, is_local: true, scale: 1.0 },
+                Screen { name: "R".into(), ox: 0,     oy: 0, w: 1920, h: 1080, is_local: true, scale: 1.0 },
+                remote("L-remote", -3840, 0, 1920, 1080),
+            ],
+        };
+        assert_eq!(
+            predict_cross(&l, (-1918.0, 540.0), (-10.0, 0.0)),
+            Some((Side::Left, "L-remote".to_string())),
+            "must cross from the left screen, not from the right one"
+        );
+    }
+
+    #[test]
+    fn predict_cross_multidisplay_right_screen_to_right_remote() {
+        let l = Layout {
+            screens: vec![
+                Screen { name: "L".into(), ox: -1920, oy: 0, w: 1920, h: 1080, is_local: true, scale: 1.0 },
+                Screen { name: "R".into(), ox: 0,     oy: 0, w: 1920, h: 1080, is_local: true, scale: 1.0 },
+                remote("R-remote", 1920, 0, 1920, 1080),
+            ],
+        };
+        assert_eq!(
+            predict_cross(&l, (1918.0, 540.0), (10.0, 0.0)),
+            Some((Side::Right, "R-remote".to_string())),
+            "must cross from the right screen to the right-attached remote"
+        );
     }
 
     // ---- crossing_back: the return decision lives on the secondary ----
@@ -817,6 +997,11 @@ mod integration {
                 scale: 1.0,
             })
             .expect("send Hello");
+        std::fs::write("/tmp/mstep.txt", "after send Hello").ok();
+        // Give the system a moment to settle so the secondary's writer thread has a chance to
+        // spin up (otherwise it can race with our subsequent layout locks in subtle ways on
+        // some platforms).
+        std::thread::sleep(Duration::from_millis(50));
 
         // Wait until the hub has registered the secondary (handshake + peer insert).
         let start = std::time::Instant::now();
@@ -830,32 +1015,58 @@ mod integration {
             net_primary.lock().unwrap().peer_count() > 0,
             "secondary must be registered with the hub"
         );
+        // The hub reader briefly locks the layout while it sends the initial Layout frame;
+        // give it a moment to finish before we touch layout ourselves so the two threads
+        // never race on the same mutex (without this, on some platforms the test deadlocks
+        // here). The drain window below also waits for that Layout frame to arrive.
+        std::thread::sleep(Duration::from_millis(50));
 
         let primary = GrabCtx {
             net: net_primary,
             layout: pla.clone(),
             ctrl: Arc::new(Mutex::new(Ctrl {
-                local_bbox: pla.lock().unwrap().local_bbox(),
+                local_bbox: {
+                    let g = pla.lock();
+                    eprintln!("[setup_pair] got primary layout lock 1");
+                    let b = g.unwrap().local_bbox();
+                    b
+                },
+                layout_snap: {
+                    let g = pla.lock();
+                    eprintln!("[setup_pair] got primary layout lock 2");
+                    let s = g.unwrap().clone();
+                    Arc::new(s)
+                },
                 ..Default::default()
             })),
             mode: Mutex::new(CaptureMode::Local),
             my_name: "A".to_string(),
             primary_name: "A".to_string(),
         };
+        std::fs::write("/tmp/mstep.txt", "made primary").ok();
         let secondary = GrabCtx {
             net: net_secondary,
             layout: sla.clone(),
             ctrl: Arc::new(Mutex::new(Ctrl {
-                // The real app seeds the secondary's Ctrl.local_bbox from its own layout
-                // (main.rs); without it on_enter_screen early-returns and the secondary never
-                // receives control. Replicate that here.
-                local_bbox: sla.lock().unwrap().local_bbox(),
+                local_bbox: {
+                    let g = sla.lock();
+                    eprintln!("[setup_pair] got secondary layout lock 1");
+                    let b = g.unwrap().local_bbox();
+                    b
+                },
+                layout_snap: {
+                    let g = sla.lock();
+                    eprintln!("[setup_pair] got secondary layout lock 2");
+                    let s = g.unwrap().clone();
+                    Arc::new(s)
+                },
                 ..Default::default()
             })),
             mode: Mutex::new(CaptureMode::Local),
             my_name: "B".to_string(),
             primary_name: "A".to_string(),
         };
+        std::fs::write("/tmp/mstep.txt", "made secondary").ok();
         (primary, secondary, srx, prx)
     }
 
@@ -894,9 +1105,31 @@ mod integration {
         got
     }
 
+    /// Copy the current layout into `Ctrl::layout_snap` (and seed `local_screens` for both sides)
+    /// so the capture callback can read it without contending on the layout mutex. The
+    /// production app's background thread keeps this fresh; tests just take a one-shot
+    /// snapshot after setup so they don't race with the hub reader's own layout locks.
+    fn seed_layout_snap(primary: &GrabCtx, secondary: &GrabCtx) {
+        let snap = primary.layout.lock().unwrap().clone();
+        let screens: Vec<_> = snap.screens.iter().filter(|s| s.is_local).cloned().collect();
+        {
+            let mut c = primary.ctrl.lock().unwrap();
+            c.layout_snap = Arc::new(snap.clone());
+            c.local_screens = screens;
+        }
+        let snap2 = secondary.layout.lock().unwrap().clone();
+        let screens: Vec<_> = snap2.screens.iter().filter(|s| s.is_local).cloned().collect();
+        {
+            let mut c = secondary.ctrl.lock().unwrap();
+            c.layout_snap = Arc::new(snap2);
+            c.local_screens = screens;
+        }
+    }
+
     #[test]
     fn handoff_over_tcp() {
         let (p, s, srx, _prx) = setup_pair(19211);
+        seed_layout_snap(&p, &s);
 
         // Primary cursor near the right edge moving right -> predict crossing into B.
         let dropped = on_capture(
@@ -971,6 +1204,7 @@ mod integration {
     #[test]
     fn edge_return_roundtrip() {
         let (p, s, srx, prx) = setup_pair(19215);
+        seed_layout_snap(&p, &s);
 
         // Cross over right.
         on_capture(
@@ -1029,6 +1263,7 @@ mod integration {
     #[test]
     fn cooldown_blocks_recross() {
         let (p, s, srx, _prx) = setup_pair(19212);
+        seed_layout_snap(&p, &s);
 
         on_capture(
             &p,
@@ -1064,6 +1299,7 @@ mod integration {
     #[test]
     fn held_keys_released_on_leave() {
         let (p, s, srx, _prx) = setup_pair(19213);
+        seed_layout_snap(&p, &s);
 
         on_capture(
             &p,
@@ -1093,7 +1329,8 @@ mod integration {
 
     #[test]
     fn hotkey_enters_first_remote() {
-        let (p, _s, _srx, _prx) = setup_pair(19214);
+        let (p, s, _srx, _prx) = setup_pair(19214);
+        seed_layout_snap(&p, &s);
 
         // ScrollLock in Local mode must rotate control into the first secondary (B).
         on_capture(&p, RawInput::KeyDown(Key::ScrollLock), None);
@@ -1175,7 +1412,8 @@ mod integration {
 
     #[test]
     fn hidpi_primary_doubles_forwarded_delta() {
-        let (p, s, srx, _prx) = setup_hidpi_pair(19216);
+        let (p, s, srx, _prx) = setup_hidpi_pair(19217);
+        seed_layout_snap(&p, &s);
 
         // Cross into B from the Retina primary's right edge.
         let dropped = on_capture(
@@ -1270,12 +1508,20 @@ mod integration {
             net_primary.lock().unwrap().peer_count() > 0,
             "secondary must be registered with the hub"
         );
+        // The hub reader briefly locks the layout while it sends the initial Layout frame;
+        // give it a moment to finish before we touch layout ourselves so the two threads
+        // never race on the same mutex (without this, on some platforms the test deadlocks
+        // here). The drain window below also waits for that Layout frame to arrive.
+        std::thread::sleep(Duration::from_millis(50));
 
         let primary = GrabCtx {
             net: net_primary,
             layout: pla.clone(),
             ctrl: Arc::new(Mutex::new(Ctrl {
                 local_bbox: pla.lock().unwrap().local_bbox(),
+                // layout_snap and local_screens are seeded lazily by `seed_layout_snap` after
+                // setup, so creating the control plane never contends on the layout lock with
+                // the hub reader (which is briefly locking it during handle_primary_conn).
                 ..Default::default()
             })),
             mode: Mutex::new(CaptureMode::Local),
