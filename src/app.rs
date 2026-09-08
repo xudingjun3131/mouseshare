@@ -2039,6 +2039,7 @@ fn draw_layout(
     dot_grid(ui.painter(), canvas_rect, theme.grid);
 
     // The tile currently being dragged, painted last so it floats above the others.
+    // We store the *logical* resolution (w, h) so the label matches the connected-clients list.
     let mut dragged: Option<(Rect, bool, bool, String, (u32, u32), f32)> = None;
 
     for s in layout.screens.iter_mut() {
@@ -2097,7 +2098,7 @@ fn draw_layout(
                 is_primary,
                 is_me,
                 s.name.clone(),
-                s.physical_size(),
+                (s.w, s.h),
                 s.scale,
             ));
             continue;
@@ -2113,7 +2114,7 @@ fn draw_layout(
             ui.painter(),
             rect,
             &s.name,
-            s.physical_size(),
+            (s.w, s.h),
             s.scale,
             is_primary,
             is_me,
@@ -2126,14 +2127,14 @@ fn draw_layout(
     }
 
     // The actively dragged tile, painted on top of everything.
-    if let Some((rect, is_primary, is_me, name, phys, sc)) = dragged {
+    if let Some((rect, is_primary, is_me, name, logical, sc)) = dragged {
         let (top, bottom) = tile_colors(is_primary, is_me);
         soft_shadow(ui.painter(), rect, 16.0, theme.shadow, 2.0);
         paint_tile(
             ui.painter(),
             rect,
             &name,
-            phys,
+            logical,
             sc,
             is_primary,
             is_me,
@@ -2185,12 +2186,16 @@ fn draw_layout(
 ///
 /// `top`/`bottom` only colour the preview strip now, so a tile stays legible at any size and
 /// the accent is reserved for "this machine".
+///
+/// `logical` is the screen size in OS logical points (the same space used for layout and
+/// crossing). We intentionally display logical resolution so the canvas labels match the
+/// "connected clients" list and macOS System Settings.
 #[allow(clippy::too_many_arguments)]
 fn paint_tile(
     painter: &egui::Painter,
     rect: Rect,
     name: &str,
-    phys: (u32, u32),
+    logical: (u32, u32),
     scale: f32,
     is_primary: bool,
     is_me: bool,
@@ -2266,10 +2271,12 @@ fn paint_tile(
             FontId::proportional(13.0),
             theme.text,
         );
-        let res = if phys != (rect.width() as u32, rect.height() as u32) && scale != 1.0 {
-            format!("{} × {} · @{:.0}x", phys.0, phys.1, scale)
+        // Show logical resolution (matches the connected-clients list and macOS System Settings).
+        // The tile's visual size is already scaled by `scale`; the label should not double it.
+        let res = if scale != 1.0 {
+            format!("{} × {} · @{:.0}x", logical.0, logical.1, scale)
         } else {
-            format!("{} × {}", phys.0, phys.1)
+            format!("{} × {}", logical.0, logical.1)
         };
         if text_y + 20.0 < rect.max.y {
             cp.text(
