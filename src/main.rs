@@ -45,6 +45,7 @@ use crate::layout::Layout;
 use crate::network::{connect_client, start_hub, Net};
 use crate::protocol::Message;
 use std::sync::mpsc::channel;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 fn main() -> anyhow::Result<()> {
@@ -310,9 +311,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ---- Capture ----
+    // Shared "permission denied" flag: set by the capture thread when it cannot create the event
+    // tap, polled by the GUI so it can pop the native prompt + a guidance dialog with re-check.
+    let capture_failed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     if mode == "primary" {
         // Native grab: CGEventTap on macOS; rdev observer (legacy) elsewhere.
-        capture::start_capture(grab_ctx.clone());
+        capture::start_capture(grab_ctx.clone(), capture_failed.clone());
     } else {
         info!("running as secondary; waiting for input from {}", server_addr);
         // Lightweight hotkey listener so the user can hand control back from the Windows/Mac side.
@@ -344,6 +348,8 @@ fn main() -> anyhow::Result<()> {
         inc_tx.clone(),
         ctrl.clone(),
         discovered,
+        grab_ctx.clone(),
+        capture_failed,
     );
 
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../resources/mouse-logo.png"))

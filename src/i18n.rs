@@ -183,6 +183,13 @@ pub struct Tr {
     pub stat_conn: &'static str,
     pub stat_ctrl: &'static str,
     pub activity_empty: &'static str,
+    // ---- Permission guidance dialog ----
+    pub perm_title: &'static str,
+    pub perm_body: &'static str,
+    pub perm_open_input: &'static str,
+    pub perm_open_accessibility: &'static str,
+    pub perm_recheck: &'static str,
+    pub perm_dismiss: &'static str,
 }
 
 pub const ZH: Tr = Tr {
@@ -294,6 +301,13 @@ pub const ZH: Tr = Tr {
     stat_conn: "连接状态",
     stat_ctrl: "鼠标控制权",
     activity_empty: "还没有记录。开始跨屏后，这里的决策日志会实时更新。",
+    // ---- 权限引导弹窗 ----
+    perm_title: "需要输入监控与辅助功能权限",
+    perm_body: "MouseShare 需要两项系统权限才能抓取鼠标/键盘并跨屏：\n① 输入监控 —— 读取键盘与鼠标事件\n② 辅助功能 —— 注入光标位置\n若 macOS 未自动弹出授权提示、或此前被拒绝了，请点下方按钮到系统设置，把 MouseShare 的开关打开，然后回到这里点「重新检测」。",
+    perm_open_input: "打开系统设置 · 输入监控",
+    perm_open_accessibility: "打开系统设置 · 辅助功能",
+    perm_recheck: "我已授权，重新检测",
+    perm_dismiss: "稍后再说",
 };
 
 pub const EN: Tr = Tr {
@@ -408,6 +422,13 @@ pub const EN: Tr = Tr {
     stat_ctrl: "Mouse control",
     activity_empty:
         "Nothing logged yet. Once you start crossing, decisions appear here in real time.",
+    // ---- Permission guidance dialog ----
+    perm_title: "Input permission required",
+    perm_body: "MouseShare needs two permissions to capture and route input:\n① Input Monitoring — read keyboard & mouse events\n② Accessibility — control the cursor\nIf macOS didn't prompt, or you denied it earlier, use the buttons below to open System Settings, enable MouseShare, then click \"Re-check\".",
+    perm_open_input: "Open System Settings · Input Monitoring",
+    perm_open_accessibility: "Open System Settings · Accessibility",
+    perm_recheck: "I've enabled it — re-check",
+    perm_dismiss: "Later",
 };
 
 /// Look up the string table for a language.

@@ -11,12 +11,14 @@
 
 use crate::clipboard;
 use crate::config::{save_config, Config};
+use crate::control::GrabCtx;
 use crate::discovery::DiscoveredList;
 use crate::i18n::{tr, Lang, Tr};
 use crate::layout::Layout;
 use crate::network::{connect_client, Net};
 use crate::protocol::Message;
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Rect, Sense};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -423,6 +425,18 @@ pub struct MouseShareApp {
     /// Primaries seen on the LAN via UDP discovery (secondary only). The listener appends to it;
     /// the "discovered devices" card reads it so the user can connect with one click.
     pub discovered: DiscoveredList,
+    /// Control-plane context kept so the "re-check" button can restart the capture thread after
+    /// the user grants the missing permission.
+    pub grab_ctx: Arc<GrabCtx>,
+    /// Set by the capture thread when it cannot create the event tap (missing permission). Polled
+    /// each frame; drives the permission guidance dialog.
+    pub capture_failed: Arc<AtomicBool>,
+    /// Once the user dismisses the permission dialog we stop nagging until the next app start
+    /// (the capture has already failed and won't retry on its own).
+    pub perm_dismissed: bool,
+    /// Guards the native permission prompt so we only trigger it once per failure (not every
+    /// frame while the dialog is up). Reset when the user clicks "re-check".
+    pub perm_prompt_sent: bool,
 }
 
 impl MouseShareApp {
@@ -435,6 +449,8 @@ impl MouseShareApp {
         inc_tx: Sender<(String, Message)>,
         ctrl: Arc<Mutex<crate::Ctrl>>,
         discovered: DiscoveredList,
+        grab_ctx: Arc<GrabCtx>,
+        capture_failed: Arc<AtomicBool>,
     ) -> Self {
         let lang = Lang::from_code(&config.lang);
         Self {
@@ -452,6 +468,10 @@ impl MouseShareApp {
             activity_poll: None,
             ctrl,
             discovered,
+            grab_ctx,
+            capture_failed,
+            perm_dismissed: false,
+            perm_prompt_sent: false,
         }
     }
 
@@ -510,6 +530,108 @@ impl MouseShareApp {
             .find(|s| s.name == self.my_name)
             .map(|s| (s.w, s.h))
             .unwrap_or((1920, 1080))
+    }
+
+    /// Render the "missing input permission" guidance dialog. Shown when the capture thread flags
+    /// that it could not create the event tap (macOS primary). Handles its own buttons: open the
+    /// two System Settings panes, re-run the capture, or dismiss until next launch.
+    fn show_permission_dialog(&mut self, ctx: &egui::Context, t: Tr, theme: UiTheme) {
+        if !self.capture_failed.load(Ordering::SeqCst) || self.perm_dismissed {
+            return;
+        }
+
+        // Trigger the native macOS permission prompts exactly once per failure. Done here (on the
+        // UI/main thread) rather than in the capture thread, which is where macOS most reliably
+        // presents the "allow accessibility / input monitoring" dialog.
+        if !self.perm_prompt_sent {
+            self.perm_prompt_sent = true;
+            crate::capture::trigger_permission_prompts();
+        }
+
+        let mut recheck = false;
+        let mut dismiss = false;
+        let mut open_input = false;
+        let mut open_accessibility = false;
+
+        egui::Window::new("perm_dialog")
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .order(egui::Order::Foreground)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme.card_bg)
+                    .corner_radius(12)
+                    .stroke(egui::Stroke::new(1.0, theme.card_stroke))
+                    .inner_margin(egui::Margin::symmetric(24, 22)),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(470.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⚠").size(22.0).color(theme.orange));
+                    ui.label(
+                        egui::RichText::new(t.perm_title)
+                            .size(16.0)
+                            .strong()
+                            .color(theme.text),
+                    );
+                });
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(t.perm_body).size(13.0).color(theme.muted));
+                ui.add_space(16.0);
+
+                // Two "open System Settings" buttons, then the primary re-check + dismiss row.
+                ui.horizontal_wrapped(|ui| {
+                    if secondary_btn(ui, theme, t.perm_open_input) {
+                        open_input = true;
+                    }
+                    ui.add_space(8.0);
+                    if secondary_btn(ui, theme, t.perm_open_accessibility) {
+                        open_accessibility = true;
+                    }
+                });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if primary_btn(ui, theme, t.perm_recheck) {
+                        recheck = true;
+                    }
+                    ui.add_space(8.0);
+                    if link_btn(ui, theme, t.perm_dismiss) {
+                        dismiss = true;
+                    }
+                });
+            });
+
+        if open_input {
+            open_permission_pane("Privacy_ListenEvent");
+        }
+        if open_accessibility {
+            open_permission_pane("Privacy_Accessibility");
+        }
+        if dismiss {
+            self.perm_dismissed = true;
+        }
+        if recheck {
+            // Re-start the capture. Success clears `capture_failed`; failure re-sets it so this
+            // dialog stays up until the user actually grants the permission.
+            self.perm_dismissed = false;
+            self.perm_prompt_sent = false;
+            crate::capture::start_capture(self.grab_ctx.clone(), self.capture_failed.clone());
+        }
+    }
+}
+
+/// Open a specific System Settings privacy pane (macOS). No-op on other platforms.
+fn open_permission_pane(pane: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let url = format!("x-apple.systempreferences:com.apple.preference.security?{}", pane);
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pane;
     }
 }
 
@@ -646,6 +768,10 @@ impl eframe::App for MouseShareApp {
         if retry_clicked {
             self.reconnect();
         }
+
+        // ---- Missing-permission guidance dialog (macOS primary capture tap failed) ----
+        // Rendered as a floating modal over the whole window; it polls the capture thread's flag.
+        self.show_permission_dialog(ctx, t, theme);
 
         // The discovery page only makes sense for a secondary (a primary *is* the host); if the
         // role was switched while that page was open, fall back to the connection page.

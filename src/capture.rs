@@ -14,7 +14,12 @@ use crate::control::{on_capture, GrabCtx, RawInput};
 use crate::protocol::MsButton;
 use rdev::Key;
 use std::os::raw::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+
+/// True while a capture thread has been started and is (or was) running. Guards against a second
+/// grab thread racing the first when the user clicks "re-check" before the previous attempt exits.
+static CAPTURE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 // `core-foundation` / `core-graphics` are macOS-only dependencies (declared under
 // `[target.'cfg(target_os = "macos")'.dependencies]`). Importing them unconditionally breaks the
@@ -64,21 +69,81 @@ mod cursor {
 pub use cursor::{hide_cursor, park_cursor, show_cursor};
 
 /// Start the global input capture. Blocks its own thread running the OS event loop.
-pub fn start_capture(ctx: Arc<GrabCtx>) {
+///
+/// `failed` is a shared flag the UI polls: it is set when the capture layer cannot obtain the
+/// required OS permission (so the GUI can pop the native permission prompt + guidance dialog),
+/// and cleared again each time capture is (re)started.
+pub fn start_capture(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
+    // Idempotent: only one grab thread may exist. If the previous attempt is still winding down the
+    // user clicked "re-check" too fast — drop this request rather than spawn a second event tap.
+    if CAPTURE_RUNNING.swap(true, Ordering::SeqCst) {
+        log::warn!("input capture already running; ignoring duplicate start");
+        return;
+    }
+    failed.store(false, Ordering::SeqCst);
     #[cfg(target_os = "macos")]
     {
-        start_capture_macos(ctx);
+        start_capture_macos(ctx, failed);
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = failed;
         start_capture_observer(ctx);
     }
 }
 
+// ---- macOS: permission prompting (Accessibility + Input Monitoring) ----
+
+/// Ask macOS to present the *native* permission dialogs for the two entitlements MouseShare needs:
+/// **Input Monitoring** (listening for the event tap, macOS 10.15+) and **Accessibility** (posting
+/// synthesized events, both roles). Calling these is what makes the system prompt appear; without
+/// them macOS stays silent and the tap just fails. Each prompt shows at most once per install — if
+/// the user previously dismissed it they must grant access in System Settings manually, which the
+/// GUI's guidance dialog links to.
+#[cfg(target_os = "macos")]
+pub fn trigger_permission_prompts() {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGPreflightListenEventAccess() -> bool;
+        fn CGRequestListenEventAccess() -> bool;
+        fn CGPreflightPostEventAccess() -> bool;
+        fn CGRequestPostEventAccess() -> bool;
+    }
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        // `kAXTrustedCheckOptionPrompt = true` makes this present the "allow accessibility" sheet.
+        fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+    }
+
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::CFString;
+
+    unsafe {
+        // Input Monitoring: only prompt if not already granted (prompting again is a no-op anyway,
+        // but avoid the pointless call when we're already trusted).
+        if !CGPreflightListenEventAccess() {
+            let _ = CGRequestListenEventAccess();
+        }
+        if !CGPreflightPostEventAccess() {
+            let _ = CGRequestPostEventAccess();
+        }
+        // Accessibility: prompt (kAXTrustedCheckOptionPrompt = true) so the user can approve.
+        let key = CFString::new("AXTrustedCheckOptionPrompt");
+        let value = CFBoolean::true_value();
+        let dict = CFDictionary::<CFString, CFBoolean>::from_CFType_pairs(&[(key, value)]);
+        let _ = AXIsProcessTrustedWithOptions(dict.as_CFTypeRef());
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn trigger_permission_prompts() {}
+
 // ---- macOS: native event-tap grab ----
 
 #[cfg(target_os = "macos")]
-fn start_capture_macos(ctx: Arc<GrabCtx>) {
+fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         // Raw mach port pointer, used by the callback to re-enable the tap after a timeout.
         let tap_port: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
@@ -189,6 +254,11 @@ fn start_capture_macos(ctx: Arc<GrabCtx>) {
                 crate::diag::log(
                     "CAPTURE FAILED: could not create CGEventTap (check Accessibility / Input Monitoring permission)",
                 );
+                // Surface it to the UI (guidance dialog) and re-arm the guard so a retry can run.
+                // The native permission prompts themselves are triggered by the UI thread, which
+                // is the reliable place for macOS to present the dialog.
+                failed.store(true, Ordering::SeqCst);
+                CAPTURE_RUNNING.store(false, Ordering::SeqCst);
                 return;
             }
         };
