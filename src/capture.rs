@@ -12,15 +12,22 @@
 
 use crate::control::{on_capture, GrabCtx, RawInput};
 use crate::protocol::MsButton;
+use rdev::Key;
+use std::os::raw::c_void;
+use std::sync::{Arc, OnceLock};
+
+// `core-foundation` / `core-graphics` are macOS-only dependencies (declared under
+// `[target.'cfg(target_os = "macos")'.dependencies]`). Importing them unconditionally breaks the
+// Windows / Linux builds, so they are gated here.
+#[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
+#[cfg(target_os = "macos")]
 use core_foundation::runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes};
+#[cfg(target_os = "macos")]
 use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
     EventField,
 };
-use rdev::Key;
-use std::os::raw::c_void;
-use std::sync::{Arc, OnceLock};
 
 // ---- cursor visibility / parking (capture-layer concern) ----
 
