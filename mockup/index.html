@@ -1,0 +1,1208 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="p3PnDiG0jjdLv5HPYASbuJ">
+<head data-page-node-id="F0kUhiB2fyGkP9nDMBZ3GC">
+<meta charset="UTF-8" data-page-node-id="277DDyj6qTBpvhku1gIt8r">
+<title>MouseShare · UI 原型</title>
+<style>
+:root {
+  --window-bg: rgba(236,236,236,0.65);
+  --sidebar-bg: rgba(236,236,236,0.45);
+  --toolbar-bg: rgba(236,236,236,0.55);
+  --content-bg: rgba(255,255,255,0.5);
+  --card-bg: #ffffff;
+  --card-stroke: rgba(0,0,0,0.08);
+  --card-stroke-strong: rgba(0,0,0,0.14);
+  --label: rgba(0,0,0,0.86);
+  --secondary-label: rgba(0,0,0,0.55);
+  --tertiary-label: rgba(0,0,0,0.35);
+  --quaternary-label: rgba(0,0,0,0.18);
+  --accent: #007aff;
+  --accent-hover: #0a84ff;
+  --accent-tint: rgba(0,122,255,0.10);
+  --accent-tint-strong: rgba(0,122,255,0.18);
+  --green: #34c759;
+  --green-tint: rgba(52,199,89,0.10);
+  --orange: #ff9500;
+  --orange-tint: rgba(255,149,0,0.12);
+  --divider: rgba(0,0,0,0.08);
+  --divider-strong: rgba(0,0,0,0.15);
+  --field-bg: white;
+  --field-bg-fill: #f5f5f7;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--label);
+  background: linear-gradient(135deg, #2b3a4a 0%, #1a2530 100%);
+  min-height: 100vh;
+}
+.stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 40px 0 80px 0;
+  gap: 32px;
+}
+.stage-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: rgba(255,255,255,0.55);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+.stage-label::before, .stage-label::after {
+  content: "";
+  width: 28px;
+  height: 1px;
+  background: rgba(255,255,255,0.20);
+}
+
+.window {
+  width: 1280px;
+  height: 800px;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--window-bg);
+  backdrop-filter: blur(40px) saturate(180%);
+  -webkit-backdrop-filter: blur(40px) saturate(180%);
+  box-shadow:
+    0 0 0 0.5px rgba(0,0,0,0.6),
+    0 22px 70px rgba(0,0,0,0.5),
+    0 4px 12px rgba(0,0,0,0.25);
+  display: flex;
+  flex-direction: column;
+}
+
+.toolbar {
+  height: 52px;
+  background: rgba(255,255,255,0.12);
+  border-bottom: 0.5px solid var(--divider);
+  flex-shrink: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.traffic-lights {
+  position: absolute;
+  left: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  gap: 8px;
+  z-index: 2;
+}
+.traffic-lights span {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  display: block;
+}
+.traffic-lights .r { background: #ff5f57; }
+.traffic-lights .y { background: #febc2e; }
+.traffic-lights .g { background: #28c840; }
+.toolbar-title {
+  position: absolute;
+  left: 80px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--label);
+}
+.toolbar-right {
+  margin-left: auto;
+  margin-right: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 4px 9px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.pill.accent { background: var(--accent-tint); color: var(--accent); }
+.pill.green { background: var(--green-tint); color: #16802b; }
+.pill.orange { background: var(--orange-tint); color: #b85800; }
+.pill .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.icon-btn {
+  width: 36px;
+  height: 28px;
+  border-radius: 7px;
+  background: rgba(0,0,0,0.04);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--label);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  border: 0.5px solid var(--divider);
+  font-family: inherit;
+}
+
+.body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  background: var(--content-bg);
+}
+.sidebar {
+  width: 220px;
+  background: var(--sidebar-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-right: 0.5px solid var(--divider);
+  padding: 12px 12px 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px 18px 8px;
+}
+.brand-mark {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #4f9dff 0%, #5856d6 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-weight: 700;
+  font-size: 17px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.10), inset 0 0.5px 0 rgba(255,255,255,0.4);
+}
+.brand-name {
+  font-size: 15.5px;
+  font-weight: 700;
+  color: var(--label);
+  letter-spacing: -0.2px;
+}
+.brand-sub {
+  font-size: 10.5px;
+  color: var(--secondary-label);
+  margin-top: 1px;
+  letter-spacing: 0.1px;
+}
+.nav-group-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--tertiary-label);
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  padding: 14px 10px 4px 10px;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  font-size: 13px;
+  color: var(--label);
+  cursor: pointer;
+  user-select: none;
+  border: none;
+  background: transparent;
+  text-align: left;
+  width: 100%;
+  font-family: inherit;
+}
+.nav-item:hover { background: rgba(0,0,0,0.04); }
+.nav-item.active {
+  background: rgba(0,0,0,0.10);
+  font-weight: 500;
+}
+.nav-item.active .nav-icon { color: var(--accent); }
+.nav-icon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  color: var(--secondary-label);
+}
+.nav-badge {
+  margin-left: auto;
+  background: var(--accent);
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 8px;
+  min-width: 18px;
+  text-align: center;
+  line-height: 1.4;
+}
+
+.main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 28px 40px 40px 40px;
+  background: var(--content-bg);
+}
+.main::-webkit-scrollbar { width: 8px; }
+.main::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.18); border-radius: 4px; }
+
+.page-header {
+  margin-bottom: 28px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+.page-title {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--label);
+  margin: 0 0 4px 0;
+  letter-spacing: -0.5px;
+}
+.page-subtitle {
+  font-size: 13.5px;
+  color: var(--secondary-label);
+  margin: 0;
+  line-height: 1.4;
+}
+
+.card {
+  background: var(--card-bg);
+  border-radius: 12px;
+  border: 0.5px solid var(--card-stroke);
+  margin-bottom: 20px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  overflow: hidden;
+}
+.card-header {
+  padding: 14px 20px 6px 20px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+.card-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--label);
+  margin: 0;
+  letter-spacing: -0.1px;
+}
+.card-subtitle {
+  font-size: 11.5px;
+  color: var(--secondary-label);
+}
+.card-body { padding: 12px 20px 18px 20px; }
+
+.mode-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.mode-card {
+  border: 1.5px solid var(--card-stroke-strong);
+  border-radius: 10px;
+  padding: 16px;
+  cursor: pointer;
+  background: white;
+  text-align: left;
+  font-family: inherit;
+  color: inherit;
+  position: relative;
+}
+.mode-card:hover { border-color: var(--accent); }
+.mode-card.selected {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+  box-shadow: 0 0 0 0.5px var(--accent);
+}
+.mode-card .check {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  display: none;
+}
+.mode-card.selected .check { display: flex; }
+.mode-icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 9px;
+  background: var(--accent-tint);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 12px;
+}
+.mode-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0 0 4px 0;
+  color: var(--label);
+}
+.mode-desc {
+  font-size: 12.5px;
+  color: var(--secondary-label);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.form-row {
+  display: flex;
+  align-items: center;
+  padding: 11px 0;
+  border-bottom: 0.5px solid var(--divider);
+}
+.form-row:last-child { border-bottom: none; }
+.form-label {
+  font-size: 13px;
+  color: var(--label);
+  width: 110px;
+  flex-shrink: 0;
+}
+.form-control {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.form-input {
+  padding: 7px 11px;
+  border: 1px solid var(--card-stroke-strong);
+  border-radius: 7px;
+  background: var(--field-bg);
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--label);
+  outline: none;
+  flex: 1;
+  min-width: 0;
+}
+.form-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-tint);
+}
+.form-input.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 12.5px;
+}
+.form-input.fixed {
+  flex: 0 0 100px;
+}
+.form-suffix {
+  font-size: 12px;
+  color: var(--secondary-label);
+}
+.form-link {
+  font-size: 13px;
+  color: var(--accent);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: none;
+  font-family: inherit;
+}
+.btn-primary {
+  background: var(--accent);
+  color: white;
+}
+.btn-secondary {
+  background: rgba(0,0,0,0.05);
+  color: var(--label);
+  border: 0.5px solid var(--card-stroke-strong);
+}
+.btn-row {
+  display: flex;
+  gap: 8px;
+}
+
+.canvas-card {
+  background: var(--card-bg);
+  border-radius: 12px;
+  border: 0.5px solid var(--card-stroke);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  overflow: hidden;
+  margin-bottom: 20px;
+}
+.canvas-area {
+  background:
+    radial-gradient(circle, rgba(0,0,0,0.08) 0.5px, transparent 0.5px),
+    #f5f5f7;
+  background-size: 16px 16px, auto;
+  min-height: 380px;
+  padding: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  position: relative;
+}
+
+.screen-tile {
+  position: relative;
+  background: white;
+  border: 1.5px solid #d1d1d6;
+  border-radius: 10px;
+  padding: 14px 16px 12px 16px;
+  min-width: 168px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+  text-align: left;
+}
+.screen-tile.is-me {
+  border-color: var(--accent);
+  background: white;
+  box-shadow: 0 0 0 1px var(--accent), 0 4px 14px rgba(0,122,255,0.20);
+}
+.screen-tile .me-badge {
+  position: absolute;
+  top: -10px;
+  left: 14px;
+  background: white;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 9px;
+  letter-spacing: 0.8px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+}
+.screen-tile .preview {
+  width: 100%;
+  height: 64px;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(180deg, #f5f5f7 0%, #ebebef 100%);
+  border: 0.5px solid rgba(0,0,0,0.06);
+}
+.screen-tile.is-me .preview {
+  background: linear-gradient(135deg, #4f9dff 0%, #5856d6 100%);
+}
+.screen-tile .preview::after {
+  content: "";
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  right: 28px;
+  height: 5px;
+  background: rgba(60,60,67,0.20);
+  border-radius: 2.5px;
+}
+.screen-tile.is-me .preview::after {
+  background: rgba(255,255,255,0.55);
+}
+.screen-tile .preview::before {
+  content: "";
+  position: absolute;
+  top: 24px;
+  left: 12px;
+  right: 50px;
+  height: 5px;
+  background: rgba(60,60,67,0.15);
+  border-radius: 2.5px;
+}
+.screen-tile.is-me .preview::before {
+  background: rgba(255,255,255,0.35);
+}
+.screen-tile .cursor-mark {
+  position: absolute;
+  top: 22px;
+  right: 22px;
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+}
+.screen-tile .name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--label);
+  margin-bottom: 3px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.screen-tile .name .star { color: var(--orange); font-size: 11px; }
+.screen-tile .resolution {
+  font-size: 11px;
+  color: var(--secondary-label);
+  font-family: ui-monospace, monospace;
+  letter-spacing: 0.2px;
+}
+
+.peer-list { padding: 4px 0; }
+.peer-row {
+  display: flex;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 0.5px solid var(--divider);
+  gap: 12px;
+}
+.peer-row:last-child { border-bottom: none; }
+.peer-row .peer-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: var(--accent-tint);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.peer-row .peer-meta {
+  flex: 1;
+  min-width: 0;
+}
+.peer-row .peer-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.peer-row .peer-sub {
+  font-size: 11.5px;
+  color: var(--secondary-label);
+  font-family: ui-monospace, monospace;
+  margin-top: 1px;
+}
+.peer-row .peer-action {
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.discovery-row {
+  display: flex;
+  align-items: center;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: white;
+  border: 0.5px solid var(--card-stroke);
+  margin-bottom: 8px;
+  gap: 12px;
+}
+.discovery-row .live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  flex-shrink: 0;
+  box-shadow: 0 0 0 2.5px rgba(52,199,89,0.18);
+}
+.discovery-row .name {
+  flex: 1;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--label);
+}
+.discovery-row .addr {
+  font-size: 11.5px;
+  color: var(--secondary-label);
+  font-family: ui-monospace, monospace;
+  margin-right: 4px;
+}
+
+.kbd-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(0,0,0,0.06);
+  border: 0.5px solid rgba(0,0,0,0.10);
+  border-radius: 4px;
+  padding: 1px 7px;
+  font-size: 11.5px;
+  font-family: ui-monospace, monospace;
+  color: var(--label);
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  padding: 0 20px 18px 20px;
+}
+.stat {
+  background: var(--field-bg-fill);
+  border-radius: 8px;
+  padding: 14px;
+}
+.stat-label {
+  font-size: 11px;
+  color: var(--secondary-label);
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+.stat-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--label);
+}
+.stat-foot {
+  font-size: 11px;
+  color: var(--tertiary-label);
+  margin-top: 2px;
+}
+
+.activity {
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 0 20px 16px 20px;
+}
+.act-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 0;
+  font-size: 12px;
+}
+.act-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex-shrink: 0;
+}
+.act-dot.info { background: var(--accent); }
+.act-dot.ok { background: var(--green); }
+.act-dot.warn { background: var(--orange); }
+.act-dot.err { background: #ff3b30; }
+.act-time {
+  color: var(--tertiary-label);
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  width: 60px;
+  flex-shrink: 0;
+}
+.act-msg {
+  flex: 1;
+  color: var(--label);
+  line-height: 1.4;
+}
+
+/* Hint strip at the bottom of canvas */
+.canvas-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 11px;
+  background: rgba(255,255,255,0.85);
+  backdrop-filter: blur(10px);
+  border: 0.5px solid var(--divider);
+  border-radius: 11px;
+  font-size: 11.5px;
+  color: var(--secondary-label);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+}
+</style>
+</head>
+<body data-page-node-id="eEzZIHHneijSBXHvUwUjx3">
+
+<div class="stage" data-page-node-id="q0fbY8QA4vCs8BUqfPNadk">
+
+  <div class="stage-label" data-page-node-id="sN7AxYgWAuOjq9wgL7U28T">主窗口 · 连接页（活跃）</div>
+
+  <div class="window" data-page-node-id="4BFUNAtYx4HNU1JFjsxUWB">
+    <div class="toolbar" data-page-node-id="DCSORkmdlklRqDmHsDHggK">
+      <div class="traffic-lights" data-page-node-id="rNMuragUzOQUuB3IO7WIQj"><span class="r" data-page-node-id="6MASV4gK3PbYfBYk5ZKBZn"></span><span class="y" data-page-node-id="C3y9cy74ha0v9QqCpTL7sV"></span><span class="g" data-page-node-id="IzmW9fa5kvWx6BuEE9zd1P"></span></div>
+      <div class="toolbar-title" data-page-node-id="Ye766SoE4jKqCsKwQkMS2g">MouseShare</div>
+      <div class="toolbar-right" data-page-node-id="hS4OAdA7qVclSYSt9OqDz7">
+        <span class="pill accent" data-page-node-id="CgW2KCV6PzxyEjPTWtfPcx"><span class="dot" data-page-node-id="eQU8JfHezC5kZ4BcgNgvjt"></span>主机·正在服务</span>
+        <button class="icon-btn" data-page-node-id="hylYQLdUmt85anu6f3jQwv">EN</button>
+      </div>
+    </div>
+
+    <div class="body" data-page-node-id="YkbntIM4Gk1gBjbY4GSgYP">
+      <div class="sidebar" data-page-node-id="xzfADWBq9mYCPEfW9ylQkl">
+        <div class="sidebar-brand" data-page-node-id="MbvPiohAAnqw84Pwd4v3RD">
+          <div class="brand-mark" data-page-node-id="DrnlAljg27qHMKaNqkxp0j">M</div>
+          <div data-page-node-id="BHhdKv94TLrxZQh8MBmxEt">
+            <div class="brand-name" data-page-node-id="3mkQB0AbXBVd8iMmtmMkzh">MouseShare</div>
+            <div class="brand-sub" data-page-node-id="1ixVwqZ8fqfSFLUmN3mMFs">v0.3 · 局域网键鼠共享</div>
+          </div>
+        </div>
+        <div class="nav-group-label" data-page-node-id="gEWccLMHPrf1dw9QsBY8ci">配置</div>
+        <button class="nav-item active" data-page-node-id="boMCi61eX54siVWMSfRUuB">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="uGHNZQIFxw0JevmxSCZu5V">
+            <path d="M4 9a4 4 0 014-4h2a4 4 0 014 4v6a4 4 0 01-4 4H8a4 4 0 01-4-4V9z" data-page-node-id="GdUtixieHxratLmxlhSubm"/>
+            <path d="M14 9a4 4 0 014-4h0a4 4 0 014 4v6a4 4 0 01-4 4" data-page-node-id="aF6A27lLibzv22mxF8EgHH"/>
+          </svg>
+          连接
+        </button>
+        <button class="nav-item" data-page-node-id="L5kmmWcVcUEGbW1b37YSho">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="M3HbUIovgREvUaed5hkO7D">
+            <rect x="3" y="4" width="18" height="12" rx="2" data-page-node-id="PSLYXvlAZT0q0DKARCIB42"/>
+            <path d="M8 20h8M12 16v4" data-page-node-id="bpXJFv4TDgj3P93gKVPQ9r"/>
+          </svg>
+          屏幕布局
+        </button>
+        <button class="nav-item" data-page-node-id="13xiU3cvkosoFTQeEdyUy6">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="6pMvUcaJo9kSwAYhaO2Fn8">
+            <circle cx="12" cy="12" r="9" data-page-node-id="XLC18Ml7InoGPXch6pcc0A"/>
+            <path d="M12 7v5l3 2" data-page-node-id="6tdvXKTXAXCaOGEcC68hVF"/>
+          </svg>
+          状态
+          <span class="nav-badge" data-page-node-id="zksgeBYvzQFwYB9PCFxFOu">3</span>
+        </button>
+        <div class="nav-group-label" data-page-node-id="fxKVZNW2R3SYTPkJwNV6yY">网络</div>
+        <button class="nav-item" data-page-node-id="oWce9DsecBsIJv4iUCa4R3">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="oh4JT6WWMuoVo3FFw1jazU">
+            <circle cx="9" cy="12" r="2.5" data-page-node-id="FjDxASPs73z9pufcvHHZDi"/>
+            <circle cx="16" cy="12" r="2.5" data-page-node-id="PC5RGcQduyJLJXk5u6DOu8"/>
+            <path d="M5 12a2.5 2.5 0 012.5-2.5M5 12a2.5 2.5 0 012.5 2.5M21 12a2.5 2.5 0 00-2.5-2.5M21 12a2.5 2.5 0 00-2.5 2.5" data-page-node-id="yBk36rP0sDrtZjCiLU1T8F"/>
+          </svg>
+          发现的设备
+          <span class="nav-badge" style="background:var(--green)" data-page-node-id="640KbJ6mDlM1R7VwO4RvQG">1</span>
+        </button>
+      </div>
+
+      <div class="main" data-page-node-id="2tXlmGLEOE8mzfXJwucj4j">
+        <div class="page-header" data-page-node-id="3Zc0QOikVUlK7L1GXe2LPw">
+          <div data-page-node-id="Mdg0X02rhvQl1AxZuPHFNl">
+            <h1 class="page-title" data-page-node-id="05d6Wfq78Yk9xbnUERZsy9">连接</h1>
+            <p class="page-subtitle" data-page-node-id="daDRUloB2fG5CDjG6qG7QV">选择本机角色，并告诉副机如何连接</p>
+          </div>
+          <div class="kbd-hint" data-page-node-id="SBpgGeKxHdaD7Dw0SAjJRq">⌘S 保存</div>
+        </div>
+
+        <div class="card" data-page-node-id="83PD8JTytBFICfCBOjkfnG">
+          <div class="card-header" data-page-node-id="FgnGFNq5dMJFGJcKpCUvmz">
+            <div class="card-title-wrap" data-page-node-id="8jWGGLxySyKTEUssBKI085">
+              <h3 class="card-title" data-page-node-id="4vC3vSXM8IH7ohKbntOLDF">我的角色</h3>
+              <span class="card-subtitle" data-page-node-id="NENPK2elG77DibOIqM10pr">决定谁接真实的鼠标和键盘</span>
+            </div>
+          </div>
+          <div class="card-body" data-page-node-id="P6KdlzX8gwZECAtVtlRGSZ">
+            <div class="mode-grid" data-page-node-id="TFdscebEHaGMvAWKCGkbjS">
+              <button class="mode-card selected" data-page-node-id="6oEbDNkEwCtLB6QiMJpgG9">
+                <div class="check" data-page-node-id="MT5rR9qvrGb8FRBjkvLdbG">✓</div>
+                <div class="mode-icon" data-page-node-id="zfUBBOKwlI03iGksWUCIRe">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="xfFU2ZUKay29YFxBuyXobM">
+                    <rect x="2" y="4" width="20" height="13" rx="2" data-page-node-id="yIc5IqfGBKGpYMM6Pmtnzs"/>
+                    <path d="M8 21h8M12 17v4" data-page-node-id="IbM5fsrAW50CIkKvqGceGX"/>
+                  </svg>
+                </div>
+                <h4 class="mode-title" data-page-node-id="IfJXXxEKldOE7dGtxSiGl8">主机（Primary）</h4>
+                <p class="mode-desc" data-page-node-id="7YRQWF2oBC5hHaJ7TGYGqj">这台机器接真实的鼠标和键盘，并将它们共享给局域网中的所有副机。</p>
+              </button>
+              <button class="mode-card" data-page-node-id="MrFGvLGECBMHx5161qFWxy">
+                <div class="check" data-page-node-id="kRnfI03UlYEMJZDAqM7HEN">✓</div>
+                <div class="mode-icon" data-page-node-id="BhpSlH1ELiMVDixGd31Xu3">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="FYIfCc3QST0CGUaZv6Gvem">
+                    <rect x="2" y="4" width="20" height="13" rx="2" data-page-node-id="o3jmLmjixcsIKd5m6dHpXk"/>
+                  </svg>
+                </div>
+                <h4 class="mode-title" data-page-node-id="Xjwc2vh3Pd7TgnDfxxHKgo">副机（Secondary）</h4>
+                <p class="mode-desc" data-page-node-id="hhR08O5QsMqFM2VNxHilab">接收来自主机的输入，或直接把鼠标划到屏幕边缘进入主机。</p>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" data-page-node-id="xP50gCI17a6QsU5XmgTSjS">
+          <div class="card-header" data-page-node-id="XHEDDhf1ZEt661jIYJEcVv">
+            <div class="card-title-wrap" data-page-node-id="yX9amGwpI6KNk5f6inWiUQ">
+              <h3 class="card-title" data-page-node-id="NMn2uYWSGeQf0pGiU5Mylt">主机配置</h3>
+              <span class="card-subtitle" data-page-node-id="daB1aYxsUh3sH9HCZFEENd">告诉副机如何连到这台机器</span>
+            </div>
+          </div>
+          <div class="card-body" data-page-node-id="CGKWWuNJDZ7oEfwgXCHY39">
+            <div class="form-row" data-page-node-id="RLZU1seLEv9Dbu6zyiN41j">
+              <span class="form-label" data-page-node-id="FHZFuXTM74R435gF3gK5TR">本机名称</span>
+              <div class="form-control" data-page-node-id="fwWcHhYJ3AGTSRyFAZax9W">
+                <input class="form-input" value="xudingjun-macbook-pro" data-page-node-id="NJZxXxXuB9G5wStio5FgNS"/>
+              </div>
+            </div>
+            <div class="form-row" data-page-node-id="Qd6R5qFCsyDKfKjrq5SVVz">
+              <span class="form-label" data-page-node-id="ttbPE8DtZXPTJLF9kAf7IR">监听端口</span>
+              <div class="form-control" data-page-node-id="6XxJAgsrffuHu2Sn03pFHg">
+                <input class="form-input mono fixed" value="49152" data-page-node-id="X3jhgxeOU2gAn0yQTCBlxd"/>
+                <span class="form-suffix" data-page-node-id="ir9Ngt8er2XNHLs5UD3tgy">TCP 端口</span>
+              </div>
+            </div>
+            <div class="form-row" data-page-node-id="MbT3OGdPyAOLx40RHAQE5t">
+              <span class="form-label" data-page-node-id="kBgVelrCNxRFWNXUV9wRxR">本地 IP</span>
+              <div class="form-control" data-page-node-id="gRZRb2FgEJYWNLyGDoZ1BH">
+                <input class="form-input mono" value="10.43.53.33" data-page-node-id="cS9ErXTOs50OjFadR9Cyk0"/>
+              </div>
+            </div>
+            <div class="form-row" data-page-node-id="EbZgqfuRzqH9R3jeJtCc7D">
+              <span class="form-label" data-page-node-id="v9Rzi4OXJdXOPCGD2Yz19M">对外地址</span>
+              <div class="form-control" data-page-node-id="ql1r8ejYBeFoKaIT7g4XRn">
+                <input class="form-input mono" value="10.43.53.33:49152" data-page-node-id="GreCgOrs44FsGFB8iIjdH0"/>
+                <a class="form-link" data-page-node-id="H7hRldPYXvtHsHwSzd9qha">复制</a>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" data-page-node-id="3s1XqFurSNYhtwHIa9w7fQ">
+          <div class="card-header" data-page-node-id="FyscpExwgavAQeFXMwChWD">
+            <div class="card-title-wrap" data-page-node-id="PCas7ySL3gnCQuCiSwUOsP">
+              <h3 class="card-title" data-page-node-id="TkFucNFFCdLptDpOvmySEz">本地屏幕</h3>
+              <span class="card-subtitle" data-page-node-id="CaCeQP3oIwr7GcCemvn0lB">它们会自动加入主屏布局</span>
+            </div>
+            <button class="btn btn-secondary" style="margin-top: 0;" data-page-node-id="qWneBWYdsbpWEtmoZnjPjh">刷新</button>
+          </div>
+          <div class="card-body" style="padding-top: 4px;" data-page-node-id="1th3KRvzHZhRFB3rlezdQT">
+            <div class="peer-row" data-page-node-id="WYEEjXgmLmbQFo5F03xc6W">
+              <div class="peer-icon" data-page-node-id="LEsXBHAWIiX9JUouC2ig5L">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="XhkiGIIfzAgkbLGf9nYQdZ">
+                  <rect x="2" y="4" width="20" height="13" rx="2" data-page-node-id="HAHFqRa3jTSLr3A9r41SA7"/>
+                  <path d="M8 21h8M12 17v4" data-page-node-id="lg9eiTAMxfhFFA0ysjsSkK"/>
+                </svg>
+              </div>
+              <div class="peer-meta" data-page-node-id="XqBJXJyIE3PYPc7ebCbKBG">
+                <div class="peer-name" data-page-node-id="cNdj4qwJgEQY87LULjxB1M">内置视网膜显示屏</div>
+                <div class="peer-sub" data-page-node-id="8o1Ad0N7ETv2ZKWFxL9g7G">2940 × 1912 · @2x</div>
+              </div>
+              <span style="color: var(--green); font-size: 12px; font-weight: 600;" data-page-node-id="hn4CjwXJzdYE1ngZHPrAXw">● 已加入</span>
+            </div>
+            <div class="peer-row" data-page-node-id="D4DYIpXyJgQ09U3zEgJJqq">
+              <div class="peer-icon" data-page-node-id="pUASCmQbslyYznC45doQKK">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="Vwai29LxrfovyxecYR8FV6">
+                  <rect x="3" y="5" width="14" height="10" rx="1.5" data-page-node-id="isrfma2DAoExTukvytAUfo"/>
+                  <rect x="7" y="10" width="14" height="10" rx="1.5" data-page-node-id="D7IJL0xO7CVxHTDO75B3By"/>
+                </svg>
+              </div>
+              <div class="peer-meta" data-page-node-id="B6wiF0DfubBttU8cgIGsyB">
+                <div class="peer-name" data-page-node-id="xeBJQDOw9kQy1S6lJ4Ss4V">小米 27 寸</div>
+                <div class="peer-sub" data-page-node-id="ASBs6BcmV1p5s9Eg2mvNJP">1920 × 1080 · @1x</div>
+              </div>
+              <span style="color: var(--secondary-label); font-size: 12px;" data-page-node-id="N8CDVcHH5pN0Lybx1UG7uV">未连接</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <div class="stage-label" data-page-node-id="ziw9PQz751z315MCmAC7v2">屏幕布局页（滚动出 canvas）</div>
+
+  <div class="window" data-page-node-id="3TAcM2fDFjIeXpfyMFf94m">
+    <div class="toolbar" data-page-node-id="HclRL6UA7k5Nnn1moVY0U3">
+      <div class="traffic-lights" data-page-node-id="aZhKxh5yiFkdafRcLUG6t5"><span class="r" data-page-node-id="6cC6tVbxgeFx3CRdP66NBY"></span><span class="y" data-page-node-id="z7ugsIemWOCOvHzheF8DvH"></span><span class="g" data-page-node-id="Ml1jUuivYpHvzcTFeziwRd"></span></div>
+      <div class="toolbar-title" data-page-node-id="IN0rzGnvVXbNz9UzFAHCD2">MouseShare</div>
+      <div class="toolbar-right" data-page-node-id="lFAt3YRESJODCCtk7Jcix7">
+        <span class="pill green" data-page-node-id="601v85jwNsB2YNoBBV1F6v"><span class="dot" data-page-node-id="NMA6DrzE8XGCYB8j6UWGyG"></span>已连接 1 个副机</span>
+        <button class="icon-btn" data-page-node-id="e5GiaK3rfgbpf0guSGgVTs">EN</button>
+      </div>
+    </div>
+
+    <div class="body" data-page-node-id="rLXVcDU36vPfdxzw8Gkpb6">
+      <div class="sidebar" data-page-node-id="UnCoeSG4bvTLWq438CrPiu">
+        <div class="sidebar-brand" data-page-node-id="K2UjLeCSkAEdhRTbVvIGLU">
+          <div class="brand-mark" data-page-node-id="7kLuY071OP6rkByNiOAciO">M</div>
+          <div data-page-node-id="RI2ikt3JE8AIpkKtpP5dd5">
+            <div class="brand-name" data-page-node-id="DFXgCKNdIlRwrUmmsR1sbn">MouseShare</div>
+            <div class="brand-sub" data-page-node-id="7cmgRwH83HIHtxvTi99FnS">v0.3 · 局域网键鼠共享</div>
+          </div>
+        </div>
+        <div class="nav-group-label" data-page-node-id="deibdFKvsw9bpSRzLBU3wq">配置</div>
+        <button class="nav-item" data-page-node-id="ez98qghvVJRP9zMlpJmwTF">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="HfxcwD4O2J2R3d8mUtXUmX">
+            <path d="M4 9a4 4 0 014-4h2a4 4 0 014 4v6a4 4 0 01-4 4H8a4 4 0 01-4-4V9z" data-page-node-id="J8UddqUCAxs3hCEOwGAzOv"/>
+            <path d="M14 9a4 4 0 014-4h0a4 4 0 014 4v6a4 4 0 01-4 4" data-page-node-id="ANziSqLuTO0HsYeGDopGyA"/>
+          </svg>
+          连接
+        </button>
+        <button class="nav-item active" data-page-node-id="FkI9vjIkvBvvVGktioFqMQ">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="zp8CrtQ42yEBexHvH3HoiF">
+            <rect x="3" y="4" width="18" height="12" rx="2" data-page-node-id="2oJrfufRBjALfelz8eLO7d"/>
+            <path d="M8 20h8M12 16v4" data-page-node-id="MY9G3iOtHuSCY8YZv9BQl7"/>
+          </svg>
+          屏幕布局
+        </button>
+        <button class="nav-item" data-page-node-id="vpDihsQI4e9FMR2Ohf7slS">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="3ZKS2HgxNaydjeBb74oyuA">
+            <circle cx="12" cy="12" r="9" data-page-node-id="spzsTEUKE3whmbwTJC5pL8"/>
+            <path d="M12 7v5l3 2" data-page-node-id="RklX2pL07d7uTuAq9XKhYE"/>
+          </svg>
+          状态
+        </button>
+        <div class="nav-group-label" data-page-node-id="EY9vHy8NDk2Ss152twoZ8L">网络</div>
+        <button class="nav-item" data-page-node-id="M547YUej40Lptjn7adkKqO">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="97coBBX3imLVVSXju2JjmO">
+            <circle cx="9" cy="12" r="2.5" data-page-node-id="ktwuAagCCh0DCuE7vfV6Yy"/>
+            <circle cx="16" cy="12" r="2.5" data-page-node-id="kebaKLmEatUNE8OnH3rnWI"/>
+          </svg>
+          发现的设备
+        </button>
+      </div>
+
+      <div class="main" data-page-node-id="qUnPp6lBdWv2lczLSVbKuw">
+        <div class="page-header" data-page-node-id="gIpyXntmGXRhaqfWspEIbu">
+          <div data-page-node-id="DBQ4GDQZdV9WFLf97j3rsH">
+            <h1 class="page-title" data-page-node-id="7jhYIJCejTTa1Fi9rOyQa1">屏幕布局</h1>
+            <p class="page-subtitle" data-page-node-id="1THJSRLcPtuBapHyZbZyLL">把屏幕块摆成和你桌面一样的相对位置 · 橙色点是真实光标</p>
+          </div>
+          <div class="btn-row" data-page-node-id="J13I0wbxDnhhhndfYq3190">
+            <button class="btn btn-secondary" data-page-node-id="joVRRvzzOo5VnkFJKnsp6Q">自动排列</button>
+            <button class="btn btn-primary" data-page-node-id="CYpXXt1R6txVIn3xFlMDdF">保存布局</button>
+          </div>
+        </div>
+
+        <div class="canvas-card" data-page-node-id="HPdnnHhCYW6ZBbGDdAxZDD">
+          <div class="canvas-area" data-page-node-id="70OkN5bo0gyf3dDDYffqqk">
+            <div class="screen-tile is-me" data-page-node-id="ZaRWPanr5GwDsCz1zVTa1u">
+              <div class="me-badge" data-page-node-id="kWWGq5TIpEuxwGVWL7RGzx">本机</div>
+              <div class="preview" data-page-node-id="MBwtwE7uJjbwgdhNjnZSiY">
+                <svg class="cursor-mark" viewBox="0 0 24 24" fill="#ff9500" stroke="white" stroke-width="1.2" data-page-node-id="XsaHz9qzuSpmCqVDgMtCQj">
+                  <path d="M5 3l4 16 3-7 7-3z" data-page-node-id="byG0kLCv5GSo2unJGZvxs4"/>
+                </svg>
+              </div>
+              <div class="name" data-page-node-id="foo9vCxzGdKofruXjahMIN"><span class="star" data-page-node-id="4i79jzIvf5gzy2escovC9W">★</span> xudingjun-macbook-pro</div>
+              <div class="resolution" data-page-node-id="eBtRz4A3e5rSBNd0EayqHo">2940 × 1912 · @2x</div>
+            </div>
+            <div style="width: 24px; border-top: 2px dashed var(--accent); align-self: center;" data-page-node-id="IE5M2oDdDexkix9N8aOn9r"></div>
+            <div class="screen-tile" data-page-node-id="Jap8DfhqjPiJUVST1DBHrk">
+              <div class="preview" data-page-node-id="MtbWgLqJFEkKjK5S1Oohq0"></div>
+              <div class="name" data-page-node-id="rlVY5lJQOfxdtsazqq78Ky">xiaomi-pc</div>
+              <div class="resolution" data-page-node-id="SQwHNRBHaZvgsKviZ822ZD">1920 × 1080 · @1x</div>
+            </div>
+            <div class="canvas-hint" data-page-node-id="fEGo2E5JN05HMsulaSBzbb">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" data-page-node-id="enGYa607kWfNDbIKaQ7wbE"><path d="M5 12h14M13 5l7 7-7 7" data-page-node-id="j6SpDZcjuHhmubBL68Mu5D"/></svg>
+              <span data-page-node-id="1UX8YdEZXeAePLzJcVPYYg">光标从这里划到右边屏幕即可穿越</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" data-page-node-id="3KmUY0vLgjRNbvIKYlTNAx">
+          <div class="card-header" data-page-node-id="CxiL1FWcuTVxi4SQIceSKL">
+            <div class="card-title-wrap" data-page-node-id="4nQCirbtu11UpvvmWs4Ora">
+              <h3 class="card-title" data-page-node-id="m7TLz7EpesRMeqsvxM3JPH">连接的客户端</h3>
+              <span class="card-subtitle" data-page-node-id="S9oEOV0Q2WJHX3xwOVicXf">拖到上面画布加入布局，或点击移除</span>
+            </div>
+            <button class="btn btn-secondary" data-page-node-id="oXCaUU8ObB1H9wRfDjiB62">+ 添加屏幕</button>
+          </div>
+          <div class="card-body" data-page-node-id="aIDxOj5rUceYGUDKAfmYoC">
+            <div class="peer-row" data-page-node-id="e6tbyGSrLnaBh8InYLBteA">
+              <div class="peer-icon" data-page-node-id="UsLciMVVCDXamyvt3GEDd7">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" data-page-node-id="t3u5O6CR10sZ7rj5T2zPh1">
+                  <rect x="3" y="5" width="14" height="10" rx="1.5" data-page-node-id="nUbO3xtXNvF5RAi8GDIeZj"/>
+                  <rect x="7" y="10" width="14" height="10" rx="1.5" data-page-node-id="aiq8BSGimVXHIzPMFWKF0D"/>
+                </svg>
+              </div>
+              <div class="peer-meta" data-page-node-id="qlAH0T910a5CLXVwU9PCU4">
+                <div class="peer-name" data-page-node-id="4cYEVSa1TKfxC3mEaVTlvy">xiaomi-pc</div>
+                <div class="peer-sub" data-page-node-id="JttYj2ICphD887sa06WkcW">1920 × 1080 · @1x</div>
+              </div>
+              <button class="peer-action" style="background: var(--green);" data-page-node-id="FhYuitCLdPGr40ZFbEFOI0">已加入</button>
+            </div>
+            <div class="peer-row" data-page-node-id="vAVttBxLLMl3q3LwjHWbCM">
+              <div class="peer-icon" data-page-node-id="RMg3Q94Ta25wabeiCWVoAp">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" data-page-node-id="lM3lFD0WKc0fTFuw9THDFl">
+                  <rect x="3" y="5" width="14" height="10" rx="1.5" data-page-node-id="bFZ9EVRCJABKFaOSLom9on"/>
+                  <rect x="7" y="10" width="14" height="10" rx="1.5" data-page-node-id="xoeaU2hPu8Yjd9BaxddCZY"/>
+                </svg>
+              </div>
+              <div class="peer-meta" data-page-node-id="bjtMaoefoABaGLELkcYVhZ">
+                <div class="peer-name" data-page-node-id="9L5UI57F9Ie7iC70ROKw2C">thinkpad-side</div>
+                <div class="peer-sub" data-page-node-id="8CcJNDlYkGHkRIrk7QwZGC">2560 × 1440 · @1x</div>
+              </div>
+              <button class="peer-action" data-page-node-id="pkeIFWkA5ViGr6Qml8nRnz">+ 加入</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <div class="stage-label" data-page-node-id="cKtRc3qigpBxx5VB23egSq">状态页</div>
+
+  <div class="window" style="height: 720px;" data-page-node-id="NyDdNBvzBZW6HIlPw6n8xY">
+    <div class="toolbar" data-page-node-id="cJRF8K7iDwx5Bxcq0DO28T">
+      <div class="traffic-lights" data-page-node-id="1oqbSjAu0KjozoTYB5reXT"><span class="r" data-page-node-id="D2hmdBDPdyiM4xe2rTav9i"></span><span class="y" data-page-node-id="4bjmqsyt4iA5zo7dAxfMzh"></span><span class="g" data-page-node-id="4nMzUv7Ln5A8b065aJPdtZ"></span></div>
+      <div class="toolbar-title" data-page-node-id="omC1O4WK0c9usgYkby5axa">MouseShare</div>
+      <div class="toolbar-right" data-page-node-id="X88kzbw5IxERpdSbGOsDLf">
+        <span class="pill green" data-page-node-id="QrdDbktOlRKA4Q6BLEsJSg"><span class="dot" data-page-node-id="5BSVAa2uQn1RfcHS4uHVCe"></span>运行中</span>
+        <button class="icon-btn" data-page-node-id="tV5wKpASsHXc32Q5sOFy9M">EN</button>
+      </div>
+    </div>
+
+    <div class="body" data-page-node-id="p1PQgYMhyrInJXULWSjvJs">
+      <div class="sidebar" data-page-node-id="18rMz6ww86rlWG5H6bpCuX">
+        <div class="sidebar-brand" data-page-node-id="dVqb9blNC94todqaE6kOeI">
+          <div class="brand-mark" data-page-node-id="nleOiDXaNyFQIGi9CX94uC">M</div>
+          <div data-page-node-id="KBTFPVCBPZnfy0IsPDBSsB">
+            <div class="brand-name" data-page-node-id="YOWW9UL8LYiUVhe204cr2F">MouseShare</div>
+            <div class="brand-sub" data-page-node-id="LQ5Sj7N4GwoIi0QEFHWUc5">v0.3 · 局域网键鼠共享</div>
+          </div>
+        </div>
+        <div class="nav-group-label" data-page-node-id="1dwEfpDaQnaFayB3utEuhS">配置</div>
+        <button class="nav-item" data-page-node-id="XkywJ7RL8chQAjK2Xjooio"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" data-page-node-id="ktfs9NhkZduyNd7ulZEoa0"><path d="M4 9a4 4 0 014-4h2a4 4 0 014 4v6a4 4 0 01-4 4H8a4 4 0 01-4-4V9z" data-page-node-id="LxHO0B7wMEdn6ZPG1LWkhv"/><path d="M14 9a4 4 0 014-4h0a4 4 0 014 4v6a4 4 0 01-4 4" data-page-node-id="b2LJ6KnYlWlvCjFz02OMym"/></svg>连接</button>
+        <button class="nav-item" data-page-node-id="rvqB6csFpwXu309AnIsPiR"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" data-page-node-id="I6F1lND0LEEMt4tlJQrONV"><rect x="3" y="4" width="18" height="12" rx="2" data-page-node-id="8b1oxy0al5qoSK1DBPUcoE"/><path d="M8 20h8M12 16v4" data-page-node-id="139mzXxV7ipovgd5eGhpFR"/></svg>屏幕布局</button>
+        <button class="nav-item active" data-page-node-id="MsMlzmCsrc59yshDh6OUIo">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" data-page-node-id="ygnMDQvq0ddOxQdb27K44R">
+            <circle cx="12" cy="12" r="9" data-page-node-id="Ckkwk4fsW24u3099sqQO9f"/>
+            <path d="M12 7v5l3 2" data-page-node-id="mUMiKrO3Qit4JBtFTRpILR"/>
+          </svg>
+          状态
+        </button>
+        <div class="nav-group-label" data-page-node-id="q1oax3VTUWayNO8Tm9kjTV">网络</div>
+        <button class="nav-item" data-page-node-id="p9iyJxi8vgyl94clReGmbc"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" data-page-node-id="sr47xyCF20DAlK5cCXw1Yr"><circle cx="9" cy="12" r="2.5" data-page-node-id="KogenaDgIL1vOwtXaBWvlI"/><circle cx="16" cy="12" r="2.5" data-page-node-id="J9wtBcGfBYhkLtBnDFMKgN"/></svg>发现的设备</button>
+      </div>
+
+      <div class="main" data-page-node-id="YsJ01xGmC1gIOEpoqf26Ci">
+        <div class="page-header" data-page-node-id="bSNV2JmWYyTO7xjOD6QmFh">
+          <div data-page-node-id="jQd3SG3NAjUMc1XJp5y4Zs">
+            <h1 class="page-title" data-page-node-id="aWUOIjp2ElRRACuOIZYBzj">运行状态</h1>
+            <p class="page-subtitle" data-page-node-id="Z9pBKJcbxFODLLm164UoR3">鼠标穿越次数、剪贴板同步、最近事件</p>
+          </div>
+        </div>
+
+        <div class="card" data-page-node-id="YVzF1jaslLV7eNic0TPvKj">
+          <div class="card-header" data-page-node-id="dS66P4zxQgvacWy85mh2mz">
+            <div class="card-title-wrap" data-page-node-id="wwNrozwj0BLNFVaMnQEAQf">
+              <h3 class="card-title" data-page-node-id="FQn9D31zydtdnE7gMSTMPL">本次会话统计</h3>
+            </div>
+          </div>
+          <div class="stat-grid" data-page-node-id="fIvzWrvoNJl7GUDHryqtO2">
+            <div class="stat" data-page-node-id="xVRUVXhNiWj3GtaUXEt9DM">
+              <div class="stat-label" data-page-node-id="1DwlCLBxJbGv8E56sk4xwF">跨屏穿越</div>
+              <div class="stat-value" data-page-node-id="6EK5VEizcwNv1HiWyW56C5">42</div>
+              <div class="stat-foot" data-page-node-id="uqHmQfehuASHTjmJFIDvpV">次</div>
+            </div>
+            <div class="stat" data-page-node-id="y9EJvHT9GObthkHwyeDyz0">
+              <div class="stat-label" data-page-node-id="HQuZmww3ovvfu3wkEoiJRy">共享文件</div>
+              <div class="stat-value" data-page-node-id="z3eT806C5QZGplOtSCO55o">3</div>
+              <div class="stat-foot" data-page-node-id="tol8y5H4PPyFGeyQWX17AA">1.2 MB</div>
+            </div>
+            <div class="stat" data-page-node-id="aCMHsk5IdOMNQ2uvApddMA">
+              <div class="stat-label" data-page-node-id="z4hy8DzMZqskG9Jgq0bQ5m">已连接时长</div>
+              <div class="stat-value" data-page-node-id="cXvhpterd0HURW3WW8A7BM">00:42:18</div>
+              <div class="stat-foot" data-page-node-id="dcc4vLIODKAnIIzo17tUQp">自 09:07 开始</div>
+            </div>
+          </div>
+          <div style="border-top: 0.5px solid var(--divider);" data-page-node-id="YMFGWQdGD18gXtwuPx9cYP"></div>
+          <div class="activity" data-page-node-id="OseqErsH6TlFPTlrIumG6k">
+            <div class="act-row" data-page-node-id="s2FTSAAF8ZKHlTwcaqE45b">
+              <div class="act-dot ok" data-page-node-id="xZMB7PUnn9BLPCAwMmEUnT"></div>
+              <div class="act-time" data-page-node-id="P1xuFvIi8eTPzgYhYX3eYC">11:23</div>
+              <div class="act-msg" data-page-node-id="j5UvVfUu0qVXJR3GjPgYWY">已和 xiaomi-pc 建立 TCP 连接</div>
+            </div>
+            <div class="act-row" data-page-node-id="KG23Ayz28CUQyhz193zblt">
+              <div class="act-dot info" data-page-node-id="3CbZhFmtV5axUUX4JXpfmy"></div>
+              <div class="act-time" data-page-node-id="fYfYyBTNAYWOc5CTu46EHP">11:24</div>
+              <div class="act-msg" data-page-node-id="DBRgUkbyMvN1cMvrCQ2MeB">鼠标从主屏右边穿越到 xiaomi-pc</div>
+            </div>
+            <div class="act-row" data-page-node-id="0SDUCVuu8GOY8APR01i1bq">
+              <div class="act-dot warn" data-page-node-id="cPH41KTa9aAgHybui8KR39"></div>
+              <div class="act-time" data-page-node-id="EoH9FVUzGKfTFhDMGCJlYL">11:25</div>
+              <div class="act-msg" data-page-node-id="OSXHI0iM1ur9WcE6FC1id6">thinkpad-side 超过 30 秒未应答</div>
+            </div>
+            <div class="act-row" data-page-node-id="dOigELV6eqHTlBMWBCc9dr">
+              <div class="act-dot err" data-page-node-id="TfzfhRiqgi6J8yG7FUAZOu"></div>
+              <div class="act-time" data-page-node-id="PiWXar2rxHyhvyvLzvUFjO">11:26</div>
+              <div class="act-msg" data-page-node-id="Fk5rQGZ1ZHgCuQnkRJMSi5">thinkpad-side UDP 信标丢失，重试中</div>
+            </div>
+            <div class="act-row" data-page-node-id="cQ37bQC0ErsZf8sTl7Xliz">
+              <div class="act-dot ok" data-page-node-id="bmIakZH1HjGAlfcazsztsj"></div>
+              <div class="act-time" data-page-node-id="bwfVhtBT8tpIyN7M99rXmM">11:30</div>
+              <div class="act-msg" data-page-node-id="7sGv27rMjyiCJEj0bPVFI1">剪贴板同步：复制了 3 个文件路径</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" data-page-node-id="v2GElDrtHFMRDhF7FkpUi3">
+          <div class="card-header" data-page-node-id="korTaa7ozrTrDH6ow4SAyW">
+            <div class="card-title-wrap" data-page-node-id="wzdXOTM9TGTMJNtoZ4LNqJ">
+              <h3 class="card-title" data-page-node-id="nEam8gmlCB75S8AgNabbHy">网络</h3>
+              <span class="card-subtitle" data-page-node-id="tbKHKNs14bCieKLYMHQ7Dt">主机端口 49152 · UDP 信标 49153</span>
+            </div>
+            <button class="btn btn-secondary" data-page-node-id="K8vhngBgWHP3Lz3v5RWwaG">复制诊断包</button>
+          </div>
+          <div class="card-body" data-page-node-id="VBSVGsG6gfun5z03cezjaO">
+            <div class="peer-row" data-page-node-id="Dd83Y4iEnwwe0E5RzqdNHg">
+              <div class="peer-icon" style="background: var(--green-tint); color: var(--green);" data-page-node-id="bzQXUvS7Jl9938Bw0lWMaL">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" data-page-node-id="T9AsLMTosu2VtQ9BRHGxgS"><path d="M4 12h16M16 6l6 6-6 6" data-page-node-id="3smUsUygsefdGCorqpjTT5"/></svg>
+              </div>
+              <div class="peer-meta" data-page-node-id="6dm4ubwKmrhKDZ1bFB1XIr">
+                <div class="peer-name" data-page-node-id="2ZZ93mn2m8uWpZaAzubzke">xiaomi-pc</div>
+                <div class="peer-sub" data-page-node-id="WVhHknHRl3wybC9iAthPnv">10.43.53.42 · 通过 LAN</div>
+              </div>
+              <button class="peer-action" style="background: var(--green);" data-page-node-id="i7CGquMRcTD92jYO5VBFSb">已在线</button>
+            </div>
+            <div class="peer-row" data-page-node-id="SzG2d5z2BzOfvsnGNj3UFy">
+              <div class="peer-icon" style="background: rgba(255,59,48,0.10); color: #ff3b30;" data-page-node-id="YSrGMfZJQRazK0W3qwxZDQ">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" data-page-node-id="B03VnPigLCgCoR2WDenHq2"><circle cx="12" cy="12" r="9" data-page-node-id="9H5JtjKrm8trSwxES3wrLc"/><path d="M9 9l6 6M15 9l-6 6" data-page-node-id="8v8ZssGjwqQtg4jEDJAnNO"/></svg>
+              </div>
+              <div class="peer-meta" data-page-node-id="wImb0Cvtwbde4SWDHTIHAf">
+                <div class="peer-name" data-page-node-id="uf0Kt4m5jEIPzYRFQQJOY6">thinkpad-side</div>
+                <div class="peer-sub" data-page-node-id="LIAJybhq96ZsUJI3Lcx8CV">10.43.53.51 · 30s 前断连</div>
+              </div>
+              <button class="peer-action" style="background: rgba(255,59,48,0.10); color: #ff3b30;" data-page-node-id="9H3zOEjqCWEp0A18GTQgCE">已断开</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>

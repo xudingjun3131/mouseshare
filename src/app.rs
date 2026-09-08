@@ -21,39 +21,59 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-// ---- Accent + screen role colors (solid, contrast-safe on any canvas) ----
-const COL_PRIMARY: Color32 = Color32::from_rgb(0, 122, 255); // macOS system blue
-const COL_ME: Color32 = Color32::from_rgb(48, 199, 89); // iOS green
-const COL_CLIENT: Color32 = Color32::from_rgb(120, 120, 128); // iOS gray (label-safe)
+/// The sidebar page currently shown in the main area.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Connection,
+    Layout,
+    Status,
+    Discovered,
+}
 
-/// Theme-derived palette. Everything outside the canvas uses the egui theme directly; the canvas
-/// and its tiles need explicit colors so they stay legible in both light and dark modes.
+/// Theme-derived palette.
 ///
 /// The palette follows macOS system colours (Apple's "systemBlue", "label"/"secondaryLabel",
 /// "windowBackground"/"sidebarBackground", "secondarySystemFill" …) so the chrome reads as a native
-/// app in both light and dark appearances.
+/// app in both light and dark appearances. The surfaces are deliberately *layered* — sidebar sits
+/// behind the content, cards sit on top of it — which is what makes it read as macOS rather than
+/// one flat slab.
 #[derive(Clone, Copy)]
 struct UiTheme {
+    /// Main content area behind the cards.
+    window_bg: Color32,
+    /// Sidebar / navigation material.
     sidebar_bg: Color32,
-    canvas_bg: Color32,
-    card_bg: Color32,
     toolbar_bg: Color32,
+    /// Card surface (white in light mode, secondarySystemFill in dark).
+    card_bg: Color32,
+    card_stroke: Color32,
+    /// Text-field background and the muted fill used by stat tiles.
+    field_bg: Color32,
+    fill_bg: Color32,
+    /// label / secondaryLabel / tertiaryLabel.
     text: Color32,
     muted: Color32,
+    faint: Color32,
     accent: Color32,
-    /// Translucent accent used for selected/active fills (segmented thumb, focus rings).
     accent_tint: Color32,
+    accent_tint_strong: Color32,
     hairline: Color32,
+    divider: Color32,
     /// Canvas dot-grid colour — barely-there texture so the virtual desktop does not read as
     /// one flat slab of colour.
     grid: Color32,
     /// Shadow cast by a screen tile, plus the halo drawn around it while hovering/dragging.
     shadow: Color32,
-    /// Segmented-control track + selected-segment (NSSegmentedControl) colours.
-    seg_track: Color32,
-    seg_selected: Color32,
-    /// Status pill background (idle = amber tint).
-    idle_tint: Color32,
+    /// Semantic status colours (systemGreen / systemOrange / systemRed) + their tints.
+    green: Color32,
+    green_tint: Color32,
+    orange: Color32,
+    orange_tint: Color32,
+    red: Color32,
+    red_tint: Color32,
+    /// Sidebar row hover / selected backgrounds.
+    nav_hover: Color32,
+    nav_active: Color32,
     /// Secondary ("bordered") button surfaces — flat fill + hover lift.
     btn_bg: Color32,
     btn_hover: Color32,
@@ -64,39 +84,61 @@ impl UiTheme {
         let dark = ctx.style().visuals.dark_mode;
         if dark {
             UiTheme {
-                sidebar_bg: Color32::from_rgb(36, 36, 38),     // sidebarBackground
-                canvas_bg: Color32::from_rgb(28, 28, 30),      // windowBackground
-                card_bg: Color32::from_rgb(44, 44, 46),        // secondarySystemFill
-                toolbar_bg: Color32::from_rgb(28, 28, 30),
-                text: Color32::from_rgb(245, 245, 247),        // label
-                muted: Color32::from_rgb(152, 152, 157),       // secondaryLabel
+                window_bg: Color32::from_rgb(30, 30, 32),       // windowBackground
+                sidebar_bg: Color32::from_rgb(38, 38, 40),      // sidebarBackground
+                toolbar_bg: Color32::from_rgb(44, 44, 46),
+                card_bg: Color32::from_rgb(44, 44, 46),         // secondarySystemFill
+                card_stroke: Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+                field_bg: Color32::from_rgb(28, 28, 30),
+                fill_bg: Color32::from_rgb(58, 58, 60),         // tertiarySystemFill
+                text: Color32::from_rgb(245, 245, 247),         // label
+                muted: Color32::from_rgb(152, 152, 157),        // secondaryLabel
+                faint: Color32::from_rgb(99, 99, 102),          // tertiaryLabel
                 accent: Color32::from_rgb(10, 132, 255),        // systemBlue (dark)
-                accent_tint: Color32::from_rgba_unmultiplied(10, 132, 255, 72),
-                hairline: Color32::from_rgba_unmultiplied(255, 255, 255, 18),
-                grid: Color32::from_rgba_unmultiplied(255, 255, 255, 14),
-                shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 130),
-                seg_track: Color32::from_rgb(58, 58, 60),
-                seg_selected: Color32::from_rgb(99, 99, 102),
-                idle_tint: Color32::from_rgba_unmultiplied(255, 159, 10, 82),
+                accent_tint: Color32::from_rgba_unmultiplied(10, 132, 255, 46),
+                accent_tint_strong: Color32::from_rgba_unmultiplied(10, 132, 255, 72),
+                hairline: Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                divider: Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+                grid: Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+                shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 140),
+                green: Color32::from_rgb(48, 209, 88),
+                green_tint: Color32::from_rgba_unmultiplied(48, 209, 88, 46),
+                orange: Color32::from_rgb(255, 159, 10),
+                orange_tint: Color32::from_rgba_unmultiplied(255, 159, 10, 46),
+                red: Color32::from_rgb(255, 69, 58),
+                red_tint: Color32::from_rgba_unmultiplied(255, 69, 58, 46),
+                nav_hover: Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+                nav_active: Color32::from_rgba_unmultiplied(255, 255, 255, 31),
                 btn_bg: Color32::from_rgb(58, 58, 60),
                 btn_hover: Color32::from_rgb(72, 72, 75),
             }
         } else {
             UiTheme {
-                sidebar_bg: Color32::from_rgb(236, 236, 239),  // sidebarBackground
-                canvas_bg: Color32::from_rgb(246, 246, 249),   // windowBackground
-                card_bg: Color32::from_rgb(255, 255, 255),      // tertiarySystemFill
-                toolbar_bg: Color32::from_rgb(246, 246, 249),
+                window_bg: Color32::from_rgb(246, 246, 248),    // windowBackground
+                sidebar_bg: Color32::from_rgb(236, 236, 239),   // sidebarBackground
+                toolbar_bg: Color32::from_rgb(243, 243, 245),
+                card_bg: Color32::from_rgb(255, 255, 255),      // white card on gray
+                card_stroke: Color32::from_rgba_unmultiplied(0, 0, 0, 20),
+                field_bg: Color32::from_rgb(255, 255, 255),
+                fill_bg: Color32::from_rgb(245, 245, 247),      // systemGray6
                 text: Color32::from_rgb(29, 29, 31),            // label
                 muted: Color32::from_rgb(134, 134, 139),        // secondaryLabel
+                faint: Color32::from_rgb(174, 174, 178),        // tertiaryLabel
                 accent: Color32::from_rgb(0, 122, 255),         // systemBlue (light)
-                accent_tint: Color32::from_rgba_unmultiplied(0, 122, 255, 62),
-                hairline: Color32::from_rgba_unmultiplied(0, 0, 0, 10),
-                grid: Color32::from_rgba_unmultiplied(0, 0, 0, 22),
-                shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 42),
-                seg_track: Color32::from_rgb(227, 227, 232),
-                seg_selected: Color32::from_rgb(255, 255, 255),
-                idle_tint: Color32::from_rgba_unmultiplied(255, 159, 10, 72),
+                accent_tint: Color32::from_rgba_unmultiplied(0, 122, 255, 26),
+                accent_tint_strong: Color32::from_rgba_unmultiplied(0, 122, 255, 46),
+                hairline: Color32::from_rgba_unmultiplied(0, 0, 0, 20),
+                divider: Color32::from_rgba_unmultiplied(0, 0, 0, 20),
+                grid: Color32::from_rgba_unmultiplied(0, 0, 0, 26),
+                shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 31),
+                green: Color32::from_rgb(52, 199, 89),
+                green_tint: Color32::from_rgba_unmultiplied(52, 199, 89, 31),
+                orange: Color32::from_rgb(255, 149, 0),
+                orange_tint: Color32::from_rgba_unmultiplied(255, 149, 0, 36),
+                red: Color32::from_rgb(255, 59, 48),
+                red_tint: Color32::from_rgba_unmultiplied(255, 59, 48, 26),
+                nav_hover: Color32::from_rgba_unmultiplied(0, 0, 0, 10),
+                nav_active: Color32::from_rgba_unmultiplied(0, 0, 0, 20),
                 btn_bg: Color32::from_rgb(234, 234, 238),
                 btn_hover: Color32::from_rgb(223, 223, 228),
             }
@@ -307,7 +349,8 @@ pub fn setup_style(ctx: &egui::Context) {
     .into_iter()
     .collect();
 
-    // Uniform control rounding — the macOS squircle look.
+    // Uniform control rounding — the macOS squircle look. Text fields and buttons use 7pt,
+    // the tighter radius Apple uses for inline controls (vs. 10–12pt for cards).
     for w in [
         &mut style.visuals.widgets.inactive,
         &mut style.visuals.widgets.hovered,
@@ -315,24 +358,33 @@ pub fn setup_style(ctx: &egui::Context) {
         &mut style.visuals.widgets.open,
         &mut style.visuals.widgets.noninteractive,
     ] {
-        w.corner_radius = egui::CornerRadius::same(9);
+        w.corner_radius = egui::CornerRadius::same(7);
         // A hairline on every control keeps the panel from looking like a wall of flat fills.
         w.bg_stroke = egui::Stroke::new(
             1.0_f32,
             if dark {
-                Color32::from_white_alpha(26)
+                Color32::from_white_alpha(52)
             } else {
-                Color32::from_black_alpha(18)
+                Color32::from_black_alpha(51)
             },
         );
     }
     style.visuals.widgets.hovered.expansion = 0.0;
     style.visuals.widgets.active.expansion = 0.0;
+    // Text fields: white-on-window in light mode (cards are white too, so the border is what
+    // defines the field), one step darker than the card in dark mode.
+    style.visuals.widgets.inactive.bg_fill = if dark {
+        Color32::from_rgb(28, 28, 30)
+    } else {
+        Color32::from_rgb(255, 255, 255)
+    };
+    style.visuals.widgets.hovered.bg_fill = style.visuals.widgets.inactive.bg_fill;
+    style.visuals.widgets.active.bg_fill = style.visuals.widgets.inactive.bg_fill;
 
     let theme = UiTheme::from_ctx(ctx);
-    // Window + panel share the canvas/sidebar material so egui's popups and scroll areas match.
-    style.visuals.window_fill = theme.canvas_bg;
-    style.visuals.panel_fill = theme.canvas_bg;
+    // Window + panel share the content material so egui's popups and scroll areas match.
+    style.visuals.window_fill = theme.window_bg;
+    style.visuals.panel_fill = theme.window_bg;
     style.visuals.window_stroke = egui::Stroke::NONE;
     style.visuals.override_text_color = Some(theme.text);
 
@@ -349,6 +401,8 @@ pub struct MouseShareApp {
     pub my_name: String,
     /// Selected UI language (mirrors `config.lang`, kept separate for cheap access).
     pub lang: Lang,
+    /// Which sidebar page the main area is showing.
+    pub page: Page,
     /// Transient toast message with the moment it was shown (auto-hides after 3 s).
     pub toast: Option<(Instant, String)>,
     /// Set when networking failed at startup (port busy / primary unreachable). Shown as a
@@ -358,6 +412,11 @@ pub struct MouseShareApp {
     pub inc_tx: Sender<(String, Message)>,
     /// Throttle timestamp for the primary's periodic layout push to secondaries.
     pub last_layout_push: Option<Instant>,
+    /// Cached tail of the diagnostic log, for the status page's activity list.
+    pub activity_cache: Vec<(String, String, Color32)>,
+    /// When `activity_cache` was last refreshed — the log is re-read at most every 2 s,
+    /// otherwise every frame would hit the disk 60×/second for no visible gain.
+    pub activity_poll: Option<Instant>,
     /// The capture thread's control-plane state (who has the mouse, edge-push progress).
     /// Shared read-only here so the status card can show live hand-off state.
     pub ctrl: Arc<Mutex<crate::Ctrl>>,
@@ -384,10 +443,13 @@ impl MouseShareApp {
             net,
             my_name,
             lang,
+            page: Page::Connection,
             toast: None,
             startup_error,
             inc_tx,
             last_layout_push: None,
+            activity_cache: Vec::new(),
+            activity_poll: None,
             ctrl,
             discovered,
         }
@@ -484,67 +546,59 @@ impl eframe::App for MouseShareApp {
 
         let theme = UiTheme::from_ctx(ctx);
 
-        // ---- Unified toolbar: app glyph + brand + live status + language toggle ----
-        // With the macOS full-size content view, this panel sits *under* the native title bar, so
+        // ---- Unified toolbar: brand on the left, live status + language toggle on the right ----
+        // With the macOS full-size content view this panel sits *under* the native title bar, so
         // we clear the traffic-light zone on the left and let the red/yellow/green buttons float
-        // above the toolbar — the standard Big Sur+ "unified" window look.
+        // above — the standard Big Sur+ "unified" window look. The old toolbar also carried the
+        // product tagline here; it crowded the brand and is now the page subtitle instead.
         egui::TopBottomPanel::top("titlebar")
             .frame(egui::Frame::NONE.fill(theme.toolbar_bg))
             .show(ctx, |ui| {
                 let panel_rect = ui.max_rect();
-                ui.add_space(13.0);
+                ui.add_space(11.0);
                 ui.horizontal(|ui| {
-                    // Clear the macOS traffic-light cluster (≈70px) so the brand doesn't collide
+                    // Clear the macOS traffic-light cluster (≈78px) so the brand doesn't collide
                     // with the red/yellow/green buttons. No-op on Windows/Linux.
                     #[cfg(target_os = "macos")]
-                    ui.add_space(70.0);
+                    ui.add_space(78.0);
 
-                    // App glyph (mouse) drawn in the accent color.
-                    let (_, icon_rect) = ui.allocate_space(vec2(26.0, 26.0));
-                    draw_mouse_icon(ui.painter(), icon_rect, theme.accent);
-
-                    ui.add_space(9.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("MouseShare")
-                                .size(16.0)
-                                .strong()
-                                .color(theme.text),
-                        );
-                        ui.label(
-                            egui::RichText::new(t.tagline)
-                                .size(11.5)
-                                .color(theme.muted),
-                        );
-                    });
+                    ui.label(
+                        egui::RichText::new("MouseShare")
+                            .size(13.0)
+                            .strong()
+                            .color(theme.text),
+                    );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Right padding so the lang toggle isn't glued to the window edge.
-                        ui.add_space(16.0);
-                        // Language toggle — refined pill button.
+                        ui.add_space(14.0);
+                        // Language toggle — a small bordered chip (macOS toolbar-item look).
                         let lang_btn = egui::Button::new(
-                            egui::RichText::new(self.lang.toggle_label()).size(12.5).color(theme.text),
+                            egui::RichText::new(self.lang.toggle_label())
+                                .size(10.5)
+                                .strong()
+                                .color(theme.text),
                         )
-                        .corner_radius(8)
-                        .fill(theme.card_bg)
+                        .min_size(vec2(36.0, 28.0))
+                        .corner_radius(7)
+                        .fill(theme.btn_bg)
                         .stroke(egui::Stroke::new(1.0, theme.hairline));
                         if ui.add(lang_btn).clicked() {
                             self.lang = self.lang.toggled();
                             self.config.lang = self.lang.code().to_string();
                             save_config(&self.config); // persist immediately
                         }
-                        ui.add_space(14.0);
+                        ui.add_space(8.0);
 
-                        // Live connection status pill: coloured dot + short label.
+                        // Live connection status pill: coloured dot + short label on a tint.
                         let (dot_color, status_text, tint) = match &*self.net.lock().unwrap() {
-                            Net::Primary { .. } => (COL_ME, t.conn_primary, theme.accent_tint),
-                            Net::Secondary { .. } => (COL_ME, t.conn_connected, theme.accent_tint),
-                            Net::Idle => (Color32::from_rgb(255, 159, 10), t.conn_idle, theme.idle_tint),
+                            Net::Primary { .. } => (theme.accent, t.conn_primary, theme.accent_tint),
+                            Net::Secondary { .. } => (theme.green, t.conn_connected, theme.green_tint),
+                            Net::Idle => (theme.orange, t.conn_idle, theme.orange_tint),
                         };
-                        status_pill(ui, dot_color, tint, status_text, theme);
+                        status_pill(ui, dot_color, tint, status_text);
                     });
                 });
-                ui.add_space(13.0);
+                ui.add_space(11.0);
                 // Hairline under the toolbar.
                 ui.painter().line_segment(
                     [pos2(panel_rect.left(), panel_rect.bottom()), pos2(panel_rect.right(), panel_rect.bottom())],
@@ -595,125 +649,128 @@ impl eframe::App for MouseShareApp {
             self.reconnect();
         }
 
-        // ---- Left sidebar: grouped setting cards on the macOS sidebar material ----
-        egui::SidePanel::left("config")
-            .default_width(360.0)
-            .resizable(true)
+        // The discovery page only makes sense for a secondary (a primary *is* the host); if the
+        // role was switched while that page was open, fall back to the connection page.
+        if self.page == Page::Discovered && self.config.mode != "secondary" {
+            self.page = Page::Connection;
+        }
+
+        // ---- Sidebar: real navigation (macOS System Settings pattern) ----
+        // A fixed 220px icon+label rail instead of stacked setting cards. Moving the settings
+        // into the content area is what frees room for large page titles and full-width cards —
+        // the stacked-card sidebar had space for neither.
+        egui::SidePanel::left("nav")
+            .default_width(220.0)
+            .resizable(false)
             .frame(egui::Frame::NONE.fill(theme.sidebar_bg))
+            .show(ctx, |ui| {
+                // Hairline separating the sidebar material from the content.
+                let pr = ui.max_rect();
+                ui.painter().line_segment(
+                    [pos2(pr.right(), pr.min.y), pos2(pr.right(), pr.max.y)],
+                    (1.0, theme.hairline),
+                );
+                ui.add_space(12.0);
+                brand_block(ui, theme);
+                ui.add_space(6.0);
+
+                let peer_count = self.net.lock().unwrap().peer_count();
+                let disc_count = self.discovered.lock().unwrap().len();
+
+                nav_group_label(ui, t.nav_group_config, theme);
+                if nav_item(
+                    ui,
+                    theme,
+                    self.page == Page::Connection,
+                    t.nav_connection,
+                    NavIcon::Connection,
+                    None,
+                ) {
+                    self.page = Page::Connection;
+                }
+                if nav_item(ui, theme, self.page == Page::Layout, t.nav_layout, NavIcon::Layout, None) {
+                    self.page = Page::Layout;
+                }
+                let status_badge =
+                    if peer_count > 0 { Some((format!("{}", peer_count), theme.accent)) } else { None };
+                if nav_item(
+                    ui,
+                    theme,
+                    self.page == Page::Status,
+                    t.nav_status,
+                    NavIcon::Status,
+                    status_badge.as_ref(),
+                ) {
+                    self.page = Page::Status;
+                }
+
+                nav_group_label(ui, t.nav_group_network, theme);
+                let disc_badge =
+                    if disc_count > 0 { Some((format!("{}", disc_count), theme.green)) } else { None };
+                if self.config.mode == "secondary" {
+                    if nav_item(
+                        ui,
+                        theme,
+                        self.page == Page::Discovered,
+                        t.nav_discovered,
+                        NavIcon::Network,
+                        disc_badge.as_ref(),
+                    ) {
+                        self.page = Page::Discovered;
+                    }
+                }
+
+                // Bottom-anchored: keep "Quit" pinned to the foot of the rail on tall windows.
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.add_space(12.0);
+                    if nav_item(ui, theme, false, t.exit_app, NavIcon::Power, None) {
+                        if self.config.mode == "primary" {
+                            self.config.layout = self.shared_layout.lock().unwrap().clone();
+                            save_config(&self.config);
+                        }
+                        std::process::exit(0);
+                    }
+                });
+            });
+
+        // ---- Main content: whichever page the sidebar has selected ----
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(theme.window_bg))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.basic_card(ui, t, theme);
-                        if self.config.mode == "secondary" {
-                            self.discovered_card(ui, t, theme);
-                        }
-                        self.screens_card(ui, t);
-                        self.status_card(ui, t, theme);
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin { left: 40, right: 40, top: 28, bottom: 24 })
+                            .show(ui, |ui| match self.page {
+                                Page::Connection => self.page_connection(ui, t, theme),
+                                Page::Layout => self.page_layout(ui, t, theme),
+                                Page::Status => self.page_status(ui, t, theme),
+                                Page::Discovered => self.page_discovered(ui, t, theme),
+                            });
                     });
             });
 
-        // ---- Central canvas: the virtual desktop ----
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(theme.canvas_bg))
-            .show(ctx, |ui| {
-                // Hairline separating the sidebar material from the canvas.
-                let pr = ui.max_rect();
-                ui.painter().line_segment(
-                    [pos2(pr.min.x, pr.min.y), pos2(pr.min.x, pr.max.y)],
-                    (1.0, theme.hairline),
-                );
-                // Paint the header into its own measured block so the canvas rectangle below is
-                // exact and does not depend on the fragile cursor state after long hints/legends.
-                let header = ui.vertical(|ui| {
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new(t.layout_title)
-                                .size(15.0)
-                                .strong()
-                                .color(theme.text),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(20.0);
-                        // Force wrapping in English, where the hint is long enough to overflow a
-                        // single line and would otherwise corrupt the following cursor/placement.
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(t.layout_hint)
-                                    .size(12.5)
-                                    .color(theme.muted),
-                            )
-                            .wrap(),
-                        );
-                    });
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(20.0);
-                        legend_chip(ui, COL_PRIMARY, t.legend_primary, theme);
-                        ui.add_space(14.0);
-                        legend_chip(ui, COL_ME, t.legend_me, theme);
-                        ui.add_space(14.0);
-                        legend_chip(ui, COL_CLIENT, t.legend_client, theme);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(20.0);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(t.layout_tip)
-                                        .size(12.0)
-                                        .color(theme.muted),
-                                )
-                                .wrap(),
-                            );
+        // ---- Transient toast: bottom-centre overlay, click-through ----
+        if let Some((_, msg)) = &self.toast {
+            let msg = msg.clone();
+            egui::Area::new(egui::Id::new("toast"))
+                .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -28.0))
+                .order(egui::Order::Tooltip)
+                .show(ctx, |ui| {
+                    egui::Frame::NONE
+                        .fill(theme.card_bg)
+                        .corner_radius(10)
+                        .inner_margin(egui::Margin::symmetric(16, 9))
+                        .stroke(egui::Stroke::new(1.0, theme.card_stroke))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("✓").strong().color(theme.green));
+                                ui.label(egui::RichText::new(&msg).size(12.5).color(theme.text));
+                            });
                         });
-                    });
-                    ui.add_space(8.0);
-                })
-                .response
-                .rect;
-
-                let panel_rect = ui.max_rect();
-                let canvas_rect = Rect::from_min_max(
-                    pos2(panel_rect.min.x, header.max.y),
-                    panel_rect.max,
-                );
-
-                let mut layout = self.shared_layout.lock().unwrap();
-                if layout.screens.is_empty() {
-                    layout.screens.push(crate::layout::Screen {
-                        name: self.config.name.clone(),
-                        ox: 0,
-                        oy: 0,
-                        w: 1920,
-                        h: 1080,
-                        is_local: true,
-                        scale: 1.0,
-                    });
-                }
-                // Live cursor position from the control plane, drawn on the canvas: while you
-                // move the mouse this dot must track it. A dot that doesn't move or sits in
-                // the wrong place means the reported coordinates don't match the layout —
-                // visible at a glance instead of guesswork.
-                let cur = self.ctrl.lock().unwrap().last_real;
-                let layout_changed = draw_layout(
-                    ui,
-                    &mut layout,
-                    &self.config.name,
-                    t,
-                    theme,
-                    canvas_rect,
-                    cur,
-                );
-                drop(layout);
-                // Persist drag repositioning immediately (primary only — it owns the layout and
-                // broadcasts it to every secondary within 2 s).
-                if layout_changed && self.config.mode == "primary" {
-                    self.config.layout = self.shared_layout.lock().unwrap().clone();
-                    save_config(&self.config);
-                }
-            });
+                });
+        }
 
         // Primary: push the current layout to every secondary every couple of seconds so all
         // machines draw the same map (including the primary's own screen and any repositioning
@@ -734,316 +791,1064 @@ impl eframe::App for MouseShareApp {
 }
 
 impl MouseShareApp {
-    fn basic_card(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
-        card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            section_header(ui, t.section_basic);
+    // ---- Pages ---------------------------------------------------------------------------
 
-            field_label(ui, t.machine_name, theme);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.config.name)
-                    .desired_width(f32::INFINITY),
-            );
+    /// The tail of the diagnostic log, refreshed at most every 2 s. Each entry is
+    /// `(age-label, message, dot-colour)`, oldest first.
+    fn recent_activity(&mut self, max: usize) -> Vec<(String, String, Color32)> {
+        let now = Instant::now();
+        let stale = match self.activity_poll {
+            Some(t0) => now.duration_since(t0) >= Duration::from_secs(2),
+            None => true,
+        };
+        if stale {
+            self.activity_cache = read_activity(max);
+            self.activity_poll = Some(now);
+        }
+        self.activity_cache.clone()
+    }
 
-            ui.add_space(12.0);
-            field_label(ui, t.role, theme);
-            // NSSegmentedControl-style role switch.
-            segmented(
-                ui,
-                &mut self.config.mode,
-                &[("primary", t.role_primary_short), ("secondary", t.role_secondary_short)],
-                theme,
-            );
+    /// Connection: role (two mode cards), role-specific networking, local screens.
+    fn page_connection(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
+        page_header(ui, t.page_connection, t.page_connection_sub, theme);
 
-            if self.config.mode == "secondary" {
-                ui.add_space(12.0);
-                field_label(ui, t.server_addr, theme);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.config.server_addr)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                );
-                ui.add_space(10.0);
-                if secondary_btn(ui, t.connect_host, theme).clicked() {
+        // ---- Role: two large mode cards (System Settings "default app" pattern) ----
+        // A segmented control fit the label but not the explanation; two cards give room for
+        // the one-line description that tells a first-time user which role to pick.
+        card(ui, theme, |ui| {
+            card_header(ui, theme, t.card_role, t.card_role_sub, |_ui| {});
+            card_body(ui, |ui| {
+                let gap = 12.0;
+                let w = ((ui.available_width() - gap) / 2.0).max(140.0);
+                let mut picked: Option<&'static str> = None;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    if mode_card(
+                        ui,
+                        w,
+                        theme,
+                        self.config.mode == "primary",
+                        t.role_primary_card,
+                        t.role_primary_desc,
+                        NavIcon::Layout,
+                        "role-primary",
+                    ) {
+                        picked = Some("primary");
+                    }
+                    if mode_card(
+                        ui,
+                        w,
+                        theme,
+                        self.config.mode == "secondary",
+                        t.role_secondary_card,
+                        t.role_secondary_desc,
+                        NavIcon::Connection,
+                        "role-secondary",
+                    ) {
+                        picked = Some("secondary");
+                    }
+                });
+                if let Some(p) = picked {
+                    self.config.mode = p.to_string();
+                }
+            });
+        });
+
+        // ---- Role-specific networking ----
+        if self.config.mode == "secondary" {
+            card(ui, theme, |ui| {
+                card_header(ui, theme, t.card_secondary, t.card_secondary_sub, |_ui| {});
+                card_body(ui, |ui| {
+                    form_row(ui, theme, t.machine_name, true, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.name)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                    form_row(ui, theme, t.server_addr, true, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.server_addr)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
+                    form_row(ui, theme, t.primary_name, false, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.primary_name)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                });
+                let mut connect = false;
+                card_footer(ui, theme, |ui| {
+                    connect = primary_btn(ui, theme, t.connect_host);
+                });
+                if connect {
                     self.reconnect();
                 }
-            } else {
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    field_label(ui, t.listen_port, theme);
-                    ui.add(egui::DragValue::new(&mut self.config.port).speed(1));
-                });
-                ui.add_space(8.0);
-                if secondary_btn(ui, t.detect_ip, theme).clicked() {
-                    if let Ok(ip) = local_ip_address::local_ip() {
-                        self.config.server_addr = format!("{}:{}", ip, self.config.port);
+            });
+        } else {
+            let mut detect = false;
+            let mut save = false;
+            card(ui, theme, |ui| {
+                card_header(ui, theme, t.card_primary, t.card_primary_sub, |_ui| {});
+                card_body(ui, |ui| {
+                    form_row(ui, theme, t.machine_name, true, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.name)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                    form_row(ui, theme, t.listen_port, true, |ui| {
+                        ui.add(egui::DragValue::new(&mut self.config.port).speed(1));
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new(t.port_hint).size(11.5).color(theme.faint));
+                    });
+                    let mut copy = false;
+                    form_row(ui, theme, t.address, false, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.server_addr)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        ui.add_space(10.0);
+                        copy = link_btn(ui, theme, t.copy);
+                    });
+                    if copy {
+                        let addr = self.config.server_addr.clone();
+                        clipboard::set_clipboard(&addr);
+                        self.show_toast(t.copied);
                     }
-                }
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(t.address).weak().size(12.0));
-                    ui.monospace(&self.config.server_addr);
                 });
-                ui.add_space(8.0);
-                if secondary_btn(ui, t.copy_addr, theme).clicked() {
-                    clipboard::set_clipboard(&self.config.server_addr);
-                    self.show_toast(t.copied);
+                card_footer(ui, theme, |ui| {
+                    detect = secondary_btn(ui, theme, t.detect_ip);
+                    ui.add_space(8.0);
+                    save = primary_btn(ui, theme, t.save);
+                });
+            });
+            if detect {
+                if let Ok(ip) = local_ip_address::local_ip() {
+                    self.config.server_addr = format!("{}:{}", ip, self.config.port);
                 }
             }
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
-            field_label(ui, t.primary_name, theme);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.config.primary_name)
-                    .desired_width(f32::INFINITY),
-            );
-
-            ui.add_space(16.0);
-            // Primary action — filled accent button (full width).
-            let save = egui::Button::new(
-                egui::RichText::new(t.save).strong().color(Color32::WHITE),
-            )
-            .min_size(vec2(ui.available_width(), 36.0))
-            .corner_radius(9)
-            .fill(theme.accent);
-            if ui.add(save).clicked() {
+            if save {
                 self.config.layout = self.shared_layout.lock().unwrap().clone();
                 save_config(&self.config);
                 self.show_toast(t.saved_hint);
             }
+        }
 
-            if let Some((_, msg)) = &self.toast {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("✓").strong().color(COL_ME).size(13.0));
-                    ui.label(egui::RichText::new(msg.clone()).size(12.5).color(COL_ME));
-                });
-            }
-        });
-    }
-
-    /// A macOS "bordered" secondary button — rounded, tinted fill, hairline border.
-    fn screens_card(&mut self, ui: &mut egui::Ui, t: Tr) {
-        card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            section_header(ui, t.section_screens);
-            ui.label(egui::RichText::new(t.screens_hint).weak().size(12.0));
-            ui.add_space(4.0);
-
-            let mut layout = self.shared_layout.lock().unwrap();
-            let mut dup_idx: Option<usize> = None;
-            let mut del_idx: Option<usize> = None;
-            for (i, s) in layout.screens.iter().enumerate() {
-                ui.horizontal(|ui| {
+        // ---- Local screens (this machine's own displays) ----
+        let mut dup_idx: Option<usize> = None;
+        let mut del_idx: Option<usize> = None;
+        let mut add = false;
+        card(ui, theme, |ui| {
+            card_header(ui, theme, t.card_screens, t.card_screens_sub, |ui| {
+                add = secondary_btn(ui, theme, t.add_screen);
+            });
+            card_body(ui, |ui| {
+                let layout = self.shared_layout.lock().unwrap();
+                if layout.screens.is_empty() {
+                    ui.label(egui::RichText::new(t.screens_empty).size(12.5).color(theme.muted));
+                    return;
+                }
+                for (i, s) in layout.screens.iter().enumerate() {
                     let phys = s.physical_size();
-                    let size_label = if phys != (s.w, s.h) {
-                        // HiDPI panel: logical (layout) size @ scale, plus the real pixel size.
-                        format!("{}×{} @{:.2}x ({}×{})", s.w, s.h, s.scale, phys.0, phys.1)
+                    let meta = if phys != (s.w, s.h) {
+                        format!("{} × {} · @{:.0}x", s.w, s.h, s.scale)
                     } else {
-                        format!("{}×{}", s.w, s.h)
+                        format!("{} × {}", s.w, s.h)
                     };
-                    ui.monospace(format!("{}  {}", s.name, size_label));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button(t.del).clicked() {
-                            del_idx = Some(i);
-                        }
-                        if ui.small_button(t.dup).clicked() {
-                            dup_idx = Some(i);
-                        }
-                    });
-                });
-            }
-            if let Some(i) = dup_idx {
-                layout.duplicate_screen(i);
-            }
-            if let Some(i) = del_idx {
-                if layout.screens.len() > 1 {
-                    layout.screens.remove(i);
-                } else {
-                    self.toast = Some((Instant::now(), t.keep_one.to_string()));
+                    let joined = s.is_local;
+                    peer_row(
+                        ui,
+                        theme,
+                        &s.name,
+                        &meta,
+                        NavIcon::Layout,
+                        if joined { theme.accent } else { theme.muted },
+                        |ui| {
+                            // Only offer removal when more than one screen would remain.
+                            if layout.screens.len() > 1 && danger_link(ui, theme, t.del) {
+                                del_idx = Some(i);
+                            }
+                            ui.add_space(10.0);
+                            if link_btn(ui, theme, t.dup) {
+                                dup_idx = Some(i);
+                            }
+                        },
+                    );
                 }
-            }
-
-            ui.add_space(8.0);
-            if ui.button(t.add_screen).clicked() {
-                let max_x = layout
-                    .screens
-                    .iter()
-                    .map(|s| s.ox + s.w as i32)
-                    .max()
-                    .unwrap_or(0);
-                let n = layout.screens.len() + 1;
-                layout.screens.push(crate::layout::Screen {
-                    name: format!("machine-{}", n),
-                    ox: max_x + 40,
-                    oy: 0,
-                    w: 1920,
-                    h: 1080,
-                    is_local: false,
-                    scale: 1.0,
-                });
-            }
+            });
         });
+        if let Some(i) = dup_idx {
+            self.shared_layout.lock().unwrap().duplicate_screen(i);
+        }
+        if let Some(i) = del_idx {
+            self.shared_layout.lock().unwrap().screens.remove(i);
+        }
+        if add {
+            let mut layout = self.shared_layout.lock().unwrap();
+            let max_x = layout.screens.iter().map(|s| s.ox + s.w as i32).max().unwrap_or(0);
+            let n = layout.screens.len() + 1;
+            layout.screens.push(crate::layout::Screen {
+                name: format!("machine-{}", n),
+                ox: max_x + 40,
+                oy: 0,
+                w: 1920,
+                h: 1080,
+                is_local: false,
+                scale: 1.0,
+            });
+        }
     }
 
-    fn status_card(&mut self, ui: &mut egui::Ui, t: Tr, _theme: UiTheme) {
-        card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            section_header(ui, t.section_status);
-            let peers = self.net.lock().unwrap().peer_count();
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(t.peers).weak());
-                ui.label(egui::RichText::new(format!("{}", peers)).strong().size(15.0));
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(t.local_name).weak());
-                ui.monospace(&self.my_name);
-            });
-            ui.add_space(4.0);
-            // Connection state (primary = serving; secondary = linked to host; idle = not connected).
-            let conn_label = match &*self.net.lock().unwrap() {
-                Net::Primary { .. } => t.conn_primary,
-                Net::Secondary { .. } => t.conn_connected,
-                Net::Idle => t.conn_idle,
-            };
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(t.conn_status).weak());
-                ui.label(egui::RichText::new(conn_label).strong().size(15.0));
-            });
-            ui.add_space(4.0);
-            // Live control-plane state (primary only): who has the mouse right now, and —
-            // while the cursor is pinned against a shared edge — how many pushes are in.
-            if self.config.mode == "primary" {
-                let c = self.ctrl.lock().unwrap();
-                let line = if let Some(r) = &c.remote {
-                    t.ctrl_remote.replace("{}", &r.name)
-                } else {
-                    t.ctrl_local.to_string()
-                };
-                drop(c);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(t.ctrl_status).weak());
-                    ui.label(egui::RichText::new(line).strong().size(15.0));
-                });
-            }
-            if self.config.mode == "secondary" {
-                let is_idle = matches!(&*self.net.lock().unwrap(), Net::Idle);
-                if is_idle {
-                    ui.add_space(8.0);
-                    if ui.button(t.reconnect_host).clicked() {
-                        self.reconnect();
-                    }
-                }
-            }
-            ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new(t.hotkey_hint)
-                    .size(12.0)
-                    .color(ui.visuals().weak_text_color()),
-            );
-            if self.config.mode == "primary" {
-                // Point primary users at the diagnostic log: if crossing misbehaves, this file
-                // contains the exact decisions (pins, hand-offs, samples) needed to diagnose it.
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} {}",
-                        t.diag_hint,
-                        crate::diag::log_path().display()
-                    ))
-                    .size(11.0)
-                    .color(ui.visuals().weak_text_color()),
+    /// Screen layout: the draggable virtual desktop, plus the machine list.
+    fn page_layout(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
+        page_header(ui, t.page_layout, t.page_layout_sub, theme);
+
+        card(ui, theme, |ui| {
+            card_header(ui, theme, t.card_canvas, t.card_canvas_sub, |_ui| {});
+            card_body(ui, |ui| {
+                let (rect, _) = ui.allocate_exact_size(
+                    vec2(ui.available_width(), 400.0),
+                    egui::Sense::hover(),
                 );
-            }
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(t.background_hint)
-                    .size(12.0)
-                    .color(ui.visuals().weak_text_color()),
-            );
-            if ui.button(t.exit_app).clicked() {
-                // Persist the (possibly dragged) layout before quitting on the primary.
-                if self.config.mode == "primary" {
+                // Recessed surface for the virtual desktop.
+                ui.painter()
+                    .rect_filled(rect, egui::CornerRadius::same(10), theme.fill_bg);
+                dot_grid(ui.painter(), rect, theme.grid);
+                ui.painter().rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(10),
+                    (1.0, theme.card_stroke),
+                    egui::StrokeKind::Inside,
+                );
+                ui.set_clip_rect(rect);
+
+                let cur = self.ctrl.lock().unwrap().last_real;
+                let mut layout = self.shared_layout.lock().unwrap();
+                if layout.screens.is_empty() {
+                    layout.screens.push(crate::layout::Screen {
+                        name: self.config.name.clone(),
+                        ox: 0,
+                        oy: 0,
+                        w: 1920,
+                        h: 1080,
+                        is_local: true,
+                        scale: 1.0,
+                    });
+                }
+                let changed =
+                    draw_layout(ui, &mut layout, &self.config.name, t, theme, rect, cur);
+                drop(layout);
+                // Persist drag repositioning immediately (primary only — it owns the layout and
+                // broadcasts it to every secondary within 2 s).
+                if changed && self.config.mode == "primary" {
                     self.config.layout = self.shared_layout.lock().unwrap().clone();
                     save_config(&self.config);
                 }
-                std::process::exit(0);
-            }
+            });
+        });
+
+        // Machine list: the screens in the layout and whether they are live.
+        card(ui, theme, |ui| {
+            card_header(ui, theme, t.card_clients, t.card_clients_sub, |_ui| {});
+            card_body(ui, |ui| {
+                let layout = self.shared_layout.lock().unwrap();
+                if layout.screens.is_empty() {
+                    ui.label(egui::RichText::new(t.screens_empty).size(12.5).color(theme.muted));
+                    return;
+                }
+                for s in layout.screens.iter() {
+                    let phys = s.physical_size();
+                    let meta = if phys != (s.w, s.h) {
+                        format!("{} × {} · @{:.0}x", s.w, s.h, s.scale)
+                    } else {
+                        format!("{} × {}", s.w, s.h)
+                    };
+                    let live = s.name == self.my_name || s.is_local;
+                    peer_row(
+                        ui,
+                        theme,
+                        &s.name,
+                        &meta,
+                        NavIcon::Layout,
+                        if live { theme.green } else { theme.muted },
+                        |ui| {
+                            let (label, col) = if live {
+                                (t.online, theme.green)
+                            } else {
+                                (t.offline, theme.faint)
+                            };
+                            status_chip(ui, theme, col, label);
+                        },
+                    );
+                }
+            });
         });
     }
 
-    /// "Discovered on LAN" card (secondary only). Lists primaries heard via the UDP beacon and
-    /// lets the user connect with one click — this is the visible half of auto-discovery.
-    fn discovered_card(&mut self, ui: &mut egui::Ui, t: Tr, _theme: UiTheme) {
-        let list = self.discovered.lock().unwrap().clone();
-        card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            section_header(ui, t.section_discovered);
-            if list.is_empty() {
-                ui.label(egui::RichText::new(t.discovered_empty).weak().size(12.0));
-            } else {
-                for d in &list {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{}  ·  {}", d.name, d.addr()))
-                                .strong()
-                                .size(13.0),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button(t.discovered_connect).clicked() {
-                                self.config.server_addr = d.addr();
-                                self.connect_to(d.addr());
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
-                }
+    /// Status: live session stats, network peers, and the tail of the diagnostic log.
+    fn page_status(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
+        page_header(ui, t.page_status, t.page_status_sub, theme);
+
+        let peers = self.net.lock().unwrap().peer_count();
+        let conn_label = match &*self.net.lock().unwrap() {
+            Net::Primary { .. } => t.conn_primary,
+            Net::Secondary { .. } => t.conn_connected,
+            Net::Idle => t.conn_idle,
+        };
+        let conn_color = match &*self.net.lock().unwrap() {
+            Net::Primary { .. } => theme.accent,
+            Net::Secondary { .. } => theme.green,
+            Net::Idle => theme.orange,
+        };
+        let ctrl_line = if self.config.mode == "primary" {
+            let c = self.ctrl.lock().unwrap();
+            match &c.remote {
+                Some(r) => t.ctrl_remote.replace("{}", &r.name),
+                None => t.ctrl_local.to_string(),
             }
+        } else {
+            t.ctrl_local.to_string()
+        };
+
+        // ---- Session stats ----
+        card(ui, theme, |ui| {
+            card_header(ui, theme, t.card_stats, "", |_ui| {});
+            card_body(ui, |ui| {
+                ui.columns(3, |cols| {
+                    stat_tile(&mut cols[0], theme, t.stat_peers, &format!("{}", peers), t.stat_peers_foot);
+                    stat_tile(&mut cols[1], theme, t.stat_conn, conn_label, "");
+                    stat_tile(&mut cols[2], theme, t.stat_ctrl, &ctrl_line, "");
+                });
+            });
+            // Hints live inside the same card, below the stats.
+            card_body(ui, |ui| {
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new(t.local_name).size(12.5).color(theme.muted));
+                ui.label(egui::RichText::new(&self.my_name).size(13.0).strong().color(theme.text));
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(t.hotkey_hint)
+                        .size(12.0)
+                        .color(theme.muted),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(t.background_hint)
+                        .size(12.0)
+                        .color(theme.muted),
+                );
+                if self.config.mode == "primary" {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            t.diag_hint,
+                            crate::diag::log_path().display()
+                        ))
+                        .size(11.0)
+                        .color(theme.faint),
+                    );
+                }
+            });
         });
+
+        // ---- Recent activity: the tail of the real diagnostic log ----
+        card(ui, theme, |ui| {
+            card_header(ui, theme, t.card_activity, t.card_activity_sub, |_ui| {});
+            card_body(ui, |ui| {
+                let events = self.recent_activity(6);
+                if events.is_empty() {
+                    ui.label(egui::RichText::new(t.activity_empty).size(12.5).color(theme.muted));
+                    return;
+                }
+                for (age, msg, dot) in events {
+                    activity_row(ui, theme, dot, &age, &msg);
+                }
+            });
+        });
+
+        // ---- Reconnect shortcut for an idle secondary ----
+        let mut reconnect = false;
+        if self.config.mode == "secondary"
+            && matches!(&*self.net.lock().unwrap(), Net::Idle)
+        {
+            card(ui, theme, |ui| {
+                card_header(ui, theme, t.card_network, t.card_network_sub, |_ui| {});
+                card_footer(ui, theme, |ui| {
+                    reconnect = primary_btn(ui, theme, t.reconnect_host);
+                });
+            });
+        }
+        if reconnect {
+            self.reconnect();
+        }
+    }
+
+    /// Discovered primaries on the LAN (secondary only) — one click to connect.
+    fn page_discovered(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
+        page_header(ui, t.page_discovered, t.page_discovered_sub, theme);
+
+        let list = self.discovered.lock().unwrap().clone();
+        let mut pick: Option<String> = None;
+        card(ui, theme, |ui| {
+            card_header(ui, theme, t.card_discovered, t.card_discovered_sub, |_ui| {});
+            card_body(ui, |ui| {
+                if list.is_empty() {
+                    ui.label(
+                        egui::RichText::new(t.discovered_empty)
+                            .size(12.5)
+                            .color(theme.muted),
+                    );
+                    return;
+                }
+                for d in &list {
+                    let addr = d.addr();
+                    peer_row(
+                        ui,
+                        theme,
+                        &d.name,
+                        &addr,
+                        NavIcon::Network,
+                        theme.green,
+                        |ui| {
+                            if primary_btn(ui, theme, t.discovered_connect) {
+                                pick = Some(addr.clone());
+                            }
+                        },
+                    );
+                }
+            });
+        });
+        if let Some(addr) = pick {
+            self.config.server_addr = addr.clone();
+            self.connect_to(addr);
+        }
     }
 }
 
-/// A macOS "group" card: white (light) / secondary-fill (dark) surface, hairline border, 12px
-/// radius. The fill is read from the theme so it tracks the system appearance.
-fn card(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
-    let theme = UiTheme::from_ctx(ui.ctx());
+// ---- Sidebar -----------------------------------------------------------------------------
+
+/// Which glyph a sidebar row (or a mode card) draws.
+#[derive(Clone, Copy)]
+enum NavIcon {
+    /// Two displays side by side — sharing / connection.
+    Connection,
+    /// One display on a stand — screen layout.
+    Layout,
+    /// Clock face — live status.
+    Status,
+    /// Two linked nodes — network discovery.
+    Network,
+    /// Power symbol — quit.
+    Power,
+}
+
+/// Stroke-drawn 18px navigation glyph. Stroke icons (rather than filled shapes) match the
+/// macOS sidebar, and they stay legible at 1.6px in both appearances.
+fn draw_nav_icon(p: &egui::Painter, rect: Rect, icon: NavIcon, color: Color32) {
+    let s = egui::Stroke::new(1.6, color);
+    match icon {
+        NavIcon::Connection => {
+            let h = rect.height() * 0.66;
+            let w = rect.width() * 0.46;
+            let y = rect.center().y - h / 2.0;
+            let a = Rect::from_min_size(pos2(rect.min.x, y), vec2(w, h));
+            let b = Rect::from_min_size(pos2(rect.max.x - w, y + h * 0.20), vec2(w, h * 0.80));
+            p.rect_stroke(a, 2.0, s, egui::StrokeKind::Inside);
+            p.rect_stroke(b, 2.0, s, egui::StrokeKind::Inside);
+        }
+        NavIcon::Layout => {
+            let body = Rect::from_min_size(rect.min, vec2(rect.width(), rect.height() * 0.70));
+            p.rect_stroke(body, 2.0, s, egui::StrokeKind::Inside);
+            let cx = rect.center().x;
+            p.line_segment([pos2(cx, body.max.y), pos2(cx, rect.max.y - 1.0)], s);
+            p.line_segment(
+                [
+                    pos2(cx - rect.width() * 0.24, rect.max.y - 1.0),
+                    pos2(cx + rect.width() * 0.24, rect.max.y - 1.0),
+                ],
+                s,
+            );
+        }
+        NavIcon::Status => {
+            p.circle_stroke(rect.center(), rect.width() * 0.40, s);
+            let c = rect.center();
+            p.line_segment([c, pos2(c.x, c.y - rect.height() * 0.22)], s);
+            p.line_segment([c, pos2(c.x + rect.width() * 0.19, c.y + rect.height() * 0.11)], s);
+        }
+        NavIcon::Network => {
+            let r = rect.width() * 0.15;
+            let cy = rect.center().y;
+            let c1 = pos2(rect.min.x + r, cy);
+            let c2 = pos2(rect.max.x - r, cy);
+            p.circle_stroke(c1, r, s);
+            p.circle_stroke(c2, r, s);
+            p.line_segment([pos2(c1.x + r, cy), pos2(c2.x - r, cy)], s);
+        }
+        NavIcon::Power => {
+            let c = rect.center();
+            let r = rect.width() * 0.32;
+            // Arc: an open circle with the gap at the top, drawn as short chords.
+            let steps = 14;
+            let start = -std::f32::consts::PI * 0.80;
+            let end = std::f32::consts::PI * 0.80;
+            let mut prev: Option<egui::Pos2> = None;
+            for i in 0..=steps {
+                let a = start + (end - start) * (i as f32 / steps as f32);
+                let pt = pos2(c.x + r * a.sin(), c.y - r * a.cos());
+                if let Some(pv) = prev {
+                    p.line_segment([pv, pt], s);
+                }
+                prev = Some(pt);
+            }
+            p.line_segment([pos2(c.x, c.y - r), pos2(c.x, c.y - r * 0.15)], s);
+        }
+    }
+}
+
+/// Small uppercase group heading in the sidebar.
+fn nav_group_label(ui: &mut egui::Ui, text: &str, theme: UiTheme) {
     ui.add_space(10.0);
+    ui.label(egui::RichText::new(text).size(10.5).strong().color(theme.faint));
+    ui.add_space(3.0);
+}
+
+/// A sidebar row: 18px stroke icon, 13px label, optional right-aligned count badge.
+/// Returns `true` when clicked.
+fn nav_item(
+    ui: &mut egui::Ui,
+    theme: UiTheme,
+    selected: bool,
+    label: &str,
+    icon: NavIcon,
+    badge: Option<&(String, Color32)>,
+) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 32.0), egui::Sense::click());
+    if selected {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(7), theme.nav_active);
+    } else if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(7), theme.nav_hover);
+    }
+    let icon_rect = Rect::from_min_size(
+        pos2(rect.min.x + 10.0, rect.center().y - 9.0),
+        vec2(18.0, 18.0),
+    );
+    draw_nav_icon(
+        ui.painter(),
+        icon_rect,
+        icon,
+        if selected { theme.accent } else { theme.muted },
+    );
+    // Clip so a long label never spills over the badge.
+    let cp = ui.painter().with_clip_rect(rect);
+    cp.text(
+        pos2(rect.min.x + 38.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.0),
+        theme.text,
+    );
+    if let Some((text, col)) = badge {
+        let w = 12.0 + text.chars().count() as f32 * 6.5;
+        let pill = Rect::from_min_size(
+            pos2(rect.max.x - 10.0 - w, rect.center().y - 9.0),
+            vec2(w, 18.0),
+        );
+        ui.painter()
+            .rect_filled(pill, egui::CornerRadius::same(9), *col);
+        ui.painter().text(
+            pill.center(),
+            Align2::CENTER_CENTER,
+            text,
+            FontId::proportional(10.0),
+            Color32::WHITE,
+        );
+    }
+    resp.clicked()
+}
+
+/// Sidebar brand block: gradient mark + wordmark + version line.
+fn brand_block(ui: &mut egui::Ui, theme: UiTheme) {
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        let (mark, _) = ui.allocate_exact_size(vec2(34.0, 34.0), egui::Sense::hover());
+        fill_gradient(
+            ui.painter(),
+            mark,
+            8.0,
+            Color32::from_rgb(79, 157, 255),
+            Color32::from_rgb(88, 86, 214),
+        );
+        ui.painter().text(
+            mark.center(),
+            Align2::CENTER_CENTER,
+            "M",
+            FontId::proportional(17.0),
+            Color32::WHITE,
+        );
+        ui.add_space(10.0);
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new("MouseShare")
+                    .size(15.5)
+                    .strong()
+                    .color(theme.text),
+            );
+            ui.label(
+                egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                    .size(10.5)
+                    .color(theme.muted),
+            );
+        });
+    });
+}
+
+// ---- Content-area components -------------------------------------------------------------
+
+/// Page title (28pt semibold) + one-line subtitle — the macOS System Settings heading.
+fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str, theme: UiTheme) {
+    ui.label(egui::RichText::new(title).size(28.0).strong().color(theme.text));
+    ui.add_space(1.0);
+    ui.label(egui::RichText::new(subtitle).size(13.5).color(theme.muted));
+    ui.add_space(18.0);
+}
+
+/// A grouped card: white (light) / secondarySystemFill (dark), hairline border, 12pt radius.
+fn card(ui: &mut egui::Ui, theme: UiTheme, body: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(9.0);
     egui::Frame::NONE
         .fill(theme.card_bg)
         .corner_radius(12)
-        .inner_margin(egui::Margin::same(14))
-        .stroke(egui::Stroke::new(1.0, theme.hairline))
+        .stroke(egui::Stroke::new(1.0, theme.card_stroke))
         .show(ui, body);
 }
 
-/// Section title inside a card — the macOS form-label look (semibold, small caps feel via size).
-fn section_header(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(13.0).strong().color(UiTheme::from_ctx(ui.ctx()).text));
-    ui.add_space(8.0);
+/// Card header: 14pt semibold title + 11.5pt subtitle, with optional trailing actions.
+fn card_header(
+    ui: &mut egui::Ui,
+    theme: UiTheme,
+    title: &str,
+    subtitle: &str,
+    action: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::NONE
+        .inner_margin(egui::Margin { left: 20, right: 20, top: 14, bottom: 6 })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(
+                        egui::RichText::new(title).size(14.0).strong().color(theme.text),
+                    );
+                    if !subtitle.is_empty() {
+                        ui.label(
+                            egui::RichText::new(subtitle).size(11.5).color(theme.muted),
+                        );
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    action(ui);
+                });
+            });
+        });
 }
 
-/// Small caption above an input field.
-fn field_label(ui: &mut egui::Ui, text: &str, _theme: UiTheme) {
-    ui.label(egui::RichText::new(text).size(12.0).color(UiTheme::from_ctx(ui.ctx()).muted));
-    ui.add_space(5.0);
+/// Card body: standard 20px horizontal padding.
+fn card_body(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::NONE
+        .inner_margin(egui::Margin { left: 20, right: 20, top: 8, bottom: 18 })
+        .show(ui, body);
 }
 
-fn legend_chip(ui: &mut egui::Ui, color: Color32, text: &str, theme: UiTheme) {
-    let (_, r) = ui.allocate_space(vec2(11.0, 11.0));
-    ui.painter().rect_filled(r, 3.0, color);
-    ui.label(egui::RichText::new(text).size(12.0).color(theme.muted));
+/// Card footer for the action buttons, separated from the body by the row rhythm.
+fn card_footer(ui: &mut egui::Ui, theme: UiTheme, body: impl FnOnce(&mut egui::Ui)) {
+    let r = egui::Frame::NONE
+        .inner_margin(egui::Margin { left: 20, right: 20, top: 4, bottom: 16 })
+        .show(ui, |ui| {
+            ui.horizontal(body);
+        })
+        .response
+        .rect;
+    ui.painter().line_segment(
+        [pos2(r.min.x, r.min.y - 4.0), pos2(r.max.x, r.min.y - 4.0)],
+        (1.0, theme.divider),
+    );
 }
 
-/// A live connection-status pill: a coloured dot followed by a short label, on a tinted
-/// background — the macOS "status chip" look in the toolbar.
-fn status_pill(ui: &mut egui::Ui, dot: Color32, tint: Color32, text: &str, theme: UiTheme) {
-    // Deliberately built from standard egui widgets instead of a hand-allocated rect. The toolbar
-    // lays this out right-to-left beside the language button, and `allocate_rect` ignores the
-    // layout direction — it painted the pill straight over the language button. Letting egui
-    // place it also auto-fits the width to the text in every language (a fixed estimate based on
-    // 'M' width x char count is badly wrong for CJK).
+/// A settings row: 110px label column, then the control, with an optional hairline below.
+fn form_row(
+    ui: &mut egui::Ui,
+    theme: UiTheme,
+    label: &str,
+    divider: bool,
+    control: impl FnOnce(&mut egui::Ui),
+) {
+    let r = egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(0, 11))
+        .show(ui, |ui| {
+            let (lr, _) = ui.allocate_exact_size(vec2(110.0, 20.0), egui::Sense::hover());
+            let cp = ui.painter().with_clip_rect(lr.expand2(vec2(4.0, 0.0)));
+            cp.text(
+                lr.left_center(),
+                Align2::LEFT_CENTER,
+                label,
+                FontId::proportional(13.0),
+                theme.text,
+            );
+            ui.add_space(16.0);
+            control(ui);
+        })
+        .response
+        .rect;
+    if divider {
+        ui.painter().line_segment(
+            [pos2(r.min.x, r.max.y), pos2(r.max.x, r.max.y)],
+            (1.0, theme.divider),
+        );
+    }
+}
+
+/// Approximate rendered width of `text` in `font` (sums per-glyph advances). Good enough for
+/// wrapping decisions; kerning is a fraction of a pixel at UI sizes.
+fn text_width(ui: &egui::Ui, text: &str, font: &FontId) -> f32 {
+    ui.fonts(|f| text.chars().map(|c| f.glyph_width(font, c)).sum())
+}
+
+/// Greedy wrap. Breaks on ASCII spaces for Latin text and per character for CJK, which has no
+/// word separators — a space-only split would never wrap Chinese at all.
+fn wrap_lines(ui: &egui::Ui, text: &str, font: &FontId, max_w: f32) -> Vec<String> {
+    if max_w <= 0.0 {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0.0;
+    for seg in text.split(' ') {
+        let cjk = seg.chars().any(|c| (c as u32) > 0x2e80);
+        if cjk {
+            for ch in seg.chars() {
+                let w = ui.fonts(|f| f.glyph_width(font, ch));
+                if cur_w + w > max_w && !cur.is_empty() {
+                    lines.push(std::mem::take(&mut cur));
+                    cur_w = 0.0;
+                }
+                cur.push(ch);
+                cur_w += w;
+            }
+        } else {
+            let w = text_width(ui, seg, font);
+            if cur_w + w > max_w && !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0.0;
+            }
+            if !cur.is_empty() {
+                cur.push(' ');
+                cur_w += ui.fonts(|f| f.glyph_width(font, ' '));
+            }
+            cur.push_str(seg);
+            cur_w += w;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// A selectable "mode" card: 38px icon tile, 15pt title, wrapped 12.5pt description, and a
+/// filled accent check in the top-right corner when selected. Two of these side by side is
+/// how System Settings presents an either/or choice with consequences worth explaining.
+///
+/// Everything is drawn by the painter on top of a single click target, so there is no inner
+/// widget competing for the click (which is what made the old segmented control fiddly).
+fn mode_card(
+    ui: &mut egui::Ui,
+    width: f32,
+    theme: UiTheme,
+    selected: bool,
+    title: &str,
+    desc: &str,
+    icon: NavIcon,
+    id: &str,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 148.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    let fill = if selected { theme.accent_tint } else { theme.card_bg };
+    let (sw, sc) = if selected {
+        (1.5, theme.accent)
+    } else if hovered {
+        (1.5, theme.accent)
+    } else {
+        (1.0, theme.card_stroke)
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(10), fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::same(10),
+        (sw, sc),
+        egui::StrokeKind::Inside,
+    );
+
+    // Icon tile.
+    let tile = Rect::from_min_size(pos2(rect.min.x + 16.0, rect.min.y + 16.0), vec2(38.0, 38.0));
+    ui.painter()
+        .rect_filled(tile, egui::CornerRadius::same(9), theme.accent_tint_strong);
+    draw_nav_icon(ui.painter(), tile.shrink(9.0), icon, theme.accent);
+
+    // Selected check, top-right.
+    if selected {
+        let c = pos2(rect.max.x - 26.0, rect.min.y + 26.0);
+        ui.painter().circle_filled(c, 10.0, theme.accent);
+        ui.painter().text(
+            c,
+            Align2::CENTER_CENTER,
+            "✓",
+            FontId::proportional(11.0),
+            Color32::WHITE,
+        );
+    }
+
+    // Title + wrapped description.
+    let pad = 16.0;
+    let text_w = (rect.width() - pad * 2.0).max(20.0);
+    let cp = ui.painter().with_clip_rect(rect);
+    cp.text(
+        pos2(rect.min.x + pad, rect.min.y + 66.0),
+        Align2::LEFT_TOP,
+        title,
+        FontId::proportional(15.0),
+        theme.text,
+    );
+    let desc_font = FontId::proportional(12.5);
+    let mut y = rect.min.y + 88.0;
+    for line in wrap_lines(ui, desc, &desc_font, text_w) {
+        cp.text(
+            pos2(rect.min.x + pad, y),
+            Align2::LEFT_TOP,
+            line,
+            desc_font.clone(),
+            theme.muted,
+        );
+        y += 17.0;
+    }
+    resp.clicked()
+}
+
+/// Filled accent button (the one primary action per card).
+fn primary_btn(ui: &mut egui::Ui, theme: UiTheme, label: &str) -> bool {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).color(Color32::WHITE))
+            .fill(theme.accent)
+            .corner_radius(7),
+    )
+    .clicked()
+}
+
+/// Bordered secondary button.
+fn secondary_btn(ui: &mut egui::Ui, theme: UiTheme, label: &str) -> bool {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).color(theme.text))
+            .fill(theme.btn_bg)
+            .stroke(egui::Stroke::new(1.0, theme.card_stroke))
+            .corner_radius(7),
+    )
+    .clicked()
+}
+
+/// Text-only accent link (used for "Copy", "Duplicate" — cheap actions that shouldn't
+/// compete with the primary button).
+fn link_btn(ui: &mut egui::Ui, theme: UiTheme, label: &str) -> bool {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(13.0).color(theme.accent))
+            .fill(Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(5),
+    )
+    .clicked()
+}
+
+/// Same as `link_btn` but in the destructive colour.
+fn danger_link(ui: &mut egui::Ui, theme: UiTheme, label: &str) -> bool {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(13.0).color(theme.red))
+            .fill(Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(5),
+    )
+    .clicked()
+}
+
+/// A list row for one machine: 36px icon tile, name, monospace metadata, and a trailing slot
+/// for an action or status chip.
+fn peer_row(
+    ui: &mut egui::Ui,
+    theme: UiTheme,
+    name: &str,
+    meta: &str,
+    icon: NavIcon,
+    tint: Color32,
+    trailing: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(0, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (tile, _) = ui.allocate_exact_size(vec2(36.0, 36.0), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    tile,
+                    egui::CornerRadius::same(8),
+                    Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 46),
+                );
+                draw_nav_icon(ui.painter(), tile.shrink(9.0), icon, tint);
+
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    // Allocate both text rows explicitly rather than drawing at `ui.cursor()`:
+                    // the cursor rect is zero-height for an empty layout, which makes painter
+                    // text drift depending on egui's internal state.
+                    let row_w = (ui.available_width() - 90.0).max(40.0);
+                    let (nr, _) =
+                        ui.allocate_exact_size(vec2(row_w, 17.0), egui::Sense::hover());
+                    ui.painter()
+                        .with_clip_rect(nr)
+                        .text(nr.left_center(), Align2::LEFT_CENTER, name, FontId::proportional(13.0), theme.text);
+                    let (mr, _) =
+                        ui.allocate_exact_size(vec2(row_w, 14.0), egui::Sense::hover());
+                    ui.painter()
+                        .with_clip_rect(mr)
+                        .text(mr.left_center(), Align2::LEFT_CENTER, meta, FontId::monospace(11.0), theme.muted);
+                });
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    trailing(ui);
+                });
+            });
+        });
+    // Hairline between rows.
+    let r = ui.max_rect();
+    ui.painter().line_segment(
+        [pos2(r.min.x, r.max.y), pos2(r.max.x, r.max.y)],
+        (1.0, theme.divider),
+    );
+}
+
+/// Small tinted status chip ("在线" / "离线"), used as the trailing element of a list row.
+fn status_chip(ui: &mut egui::Ui, theme: UiTheme, color: Color32, label: &str) {
+    egui::Frame::NONE
+        .fill(Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 40))
+        .corner_radius(9)
+        .inner_margin(egui::Margin::symmetric(10, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let (dr, _) = ui.allocate_exact_size(vec2(7.0, 7.0), egui::Sense::hover());
+                ui.painter().circle_filled(dr.center(), 3.5, color);
+                ui.label(egui::RichText::new(label).size(11.5).color(theme.text));
+            });
+        });
+}
+
+/// A stat tile: uppercase 11pt label, 18pt value, 11pt footnote on a muted fill.
+fn stat_tile(ui: &mut egui::Ui, theme: UiTheme, label: &str, value: &str, foot: &str) {
+    ui.add_space(4.0);
+    egui::Frame::NONE
+        .fill(theme.fill_bg)
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(label).size(11.0).strong().color(theme.muted));
+            ui.add_space(2.0);
+            // Explicit rect instead of `ui.cursor()` — see the note in `peer_row`.
+            let (vr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), egui::Sense::hover());
+            ui.painter()
+                .with_clip_rect(vr)
+                .text(vr.left_center(), Align2::LEFT_CENTER, value, FontId::proportional(18.0), theme.text);
+            if !foot.is_empty() {
+                ui.label(egui::RichText::new(foot).size(11.0).color(theme.faint));
+            }
+        });
+}
+
+/// One line of the activity timeline: status dot, relative age, message.
+fn activity_row(ui: &mut egui::Ui, theme: UiTheme, dot: Color32, age: &str, msg: &str) {
+    egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(0, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (dr, _) = ui.allocate_exact_size(vec2(7.0, 7.0), egui::Sense::hover());
+                ui.painter().circle_filled(dr.center(), 3.5, dot);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(age).size(11.0).color(theme.faint));
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(msg).size(12.0).color(theme.text))
+                        .truncate(),
+                );
+            });
+        });
+}
+
+/// Read and parse the last `max` entries of the real diagnostic log, oldest first, as
+/// `(age-label, message, dot-colour)`. Called at most every 2 s via `recent_activity`.
+fn read_activity(max: usize) -> Vec<(String, String, Color32)> {
+    let Ok(text) = std::fs::read_to_string(crate::diag::log_path()) else {
+        return Vec::new();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for line in text.lines().rev() {
+        let Some((ts, msg)) = line.split_once(' ') else { continue };
+        let Ok(ms) = ts.parse::<u64>() else { continue };
+        let secs = now.saturating_sub(ms) / 1000;
+        let age = if secs < 60 {
+            format!("{secs}s")
+        } else if secs < 3600 {
+            format!("{}m", secs / 60)
+        } else {
+            format!("{}h", secs / 3600)
+        };
+        // Colour by severity keywords, mirroring the log's own vocabulary.
+        let up = msg.to_ascii_uppercase();
+        let dot = if up.contains("ERROR") || up.contains("FAIL") {
+            Color32::from_rgb(255, 69, 58)
+        } else if up.contains("WARN") {
+            Color32::from_rgb(255, 159, 10)
+        } else if up.contains("HAND-OFF") || up.contains("ENTER") || up.contains("RETURN") {
+            Color32::from_rgb(0, 122, 255)
+        } else {
+            Color32::from_rgb(52, 199, 89)
+        };
+        out.push((age, msg.to_string(), dot));
+        if out.len() >= max {
+            break;
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// A live connection-status pill: a coloured dot followed by a short label on a tinted
+/// background — the macOS "status chip" look in the toolbar. The label takes the dot's colour
+/// so the three states (serving / connected / idle) read apart at a glance.
+fn status_pill(ui: &mut egui::Ui, dot: Color32, tint: Color32, text: &str) {
+    // Deliberately built from standard egui widgets instead of a hand-allocated rect. The
+    // toolbar lays this out right-to-left beside the language button, and `allocate_rect`
+    // ignores the layout direction — it painted the pill straight over the language button.
+    // Letting egui place it also auto-fits the width to the text in every language (a fixed
+    // estimate based on 'M' width x char count is badly wrong for CJK).
     egui::Frame::NONE
         .fill(tint)
         .corner_radius(12)
@@ -1052,96 +1857,12 @@ fn status_pill(ui: &mut egui::Ui, dot: Color32, tint: Color32, text: &str, theme
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 // A real circle, not a "●" glyph, so it looks identical in every font.
-                let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                let (dot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
                 ui.painter().circle_filled(dot_rect.center(), 4.5, dot);
-                ui.label(egui::RichText::new(text).size(12.5).color(theme.muted));
+                ui.label(egui::RichText::new(text).size(12.5).color(dot));
             });
         });
-}
-
-/// A macOS "bordered" secondary button — rounded, surface-tinted fill, hairline border. Returns
-/// the `Response` so callers can test `.clicked()`.
-fn secondary_btn(ui: &mut egui::Ui, label: &str, theme: UiTheme) -> egui::Response {
-    // `allocate_exact_size` rather than `allocate_rect`: it honours the layout direction and
-    // advances the cursor, so stacked buttons can never overlap each other.
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
-    let fill = if resp.hovered() { theme.btn_hover } else { theme.btn_bg };
-    ui.painter().rect_filled(rect, egui::CornerRadius::same(9), fill);
-    ui.painter().rect_stroke(rect, egui::CornerRadius::same(9), egui::Stroke::new(1.0_f32, theme.hairline), egui::StrokeKind::Inside);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        egui::FontId::proportional(13.0),
-        theme.text,
-    );
-    resp
-}
-
-/// An NSSegmentedControl-style two-state toggle: a rounded track with a selected-segment "thumb"
-/// (white in light mode, tertiary-gray in dark) that carries a soft shadow. Used for the
-/// Primary / Secondary role switch.
-fn segmented(ui: &mut egui::Ui, value: &mut String, options: &[(&str, &str)], theme: UiTheme) {
-    let n = options.len() as f32;
-    let h = 30.0;
-    let gap = 2.0;
-    let total_w = ui.available_width();
-    let seg_w = (total_w - gap * (n - 1.0)) / n;
-    let track = ui.allocate_rect(
-        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total_w, h)),
-        egui::Sense::hover(),
-    );
-    ui.painter()
-        .rect_filled(track.rect, egui::CornerRadius::same(8), theme.seg_track);
-    let mut clicked: Option<usize> = None;
-    for (i, (val, label)) in options.iter().enumerate() {
-        let x = track.rect.min.x + i as f32 * (seg_w + gap);
-        let r = egui::Rect::from_min_size(egui::pos2(x, track.rect.min.y), egui::vec2(seg_w, h));
-        let selected = *value == *val;
-        let resp = ui.interact(r, egui::Id::new(("seg", i)), egui::Sense::click());
-        if resp.clicked() {
-            clicked = Some(i);
-        }
-        if selected {
-            soft_shadow(ui.painter(), r, 8.0, theme.shadow, 0.6);
-            ui.painter().rect_filled(r, egui::CornerRadius::same(8), theme.seg_selected);
-        }
-        ui.painter().text(
-            r.center(),
-            egui::Align2::CENTER_CENTER,
-            *label,
-            egui::FontId::proportional(13.0),
-            if selected { theme.text } else { theme.muted },
-        );
-    }
-    if let Some(i) = clicked {
-        *value = options[i].0.to_string();
-    }
-}
-
-/// Draw a small mouse glyph (the app icon) in the given color.
-fn draw_mouse_icon(p: &egui::Painter, rect: Rect, color: Color32) {
-    let c = rect.center();
-    let w = rect.width();
-    let h = rect.height();
-    let body = Rect::from_center_size(c, vec2(w, h));
-    // Soft drop shadow.
-    p.rect_filled(
-        Rect::from_center_size(c + vec2(0.0, 1.0), vec2(w, h)),
-        h * 0.5,
-        Color32::from_black_alpha(35),
-    );
-    // Body (vertical pill).
-    p.rect_filled(body, h * 0.5, color);
-    // Scroll wheel near the top.
-    let wheel_w = w * 0.2;
-    let wheel_h = h * 0.18;
-    let wheel = Rect::from_center_size(
-        pos2(c.x, rect.top() + h * 0.28),
-        vec2(wheel_w, wheel_h),
-    );
-    p.rect_filled(wheel, wheel_w * 0.5, Color32::from_white_alpha(200));
 }
 
 /// Draw the virtual desktop. Returns `true` when the layout was changed by dragging, so the
@@ -1264,6 +1985,7 @@ fn draw_layout(
             theme,
             top,
             bottom,
+            t.legend_me,
         );
     }
 
@@ -1283,6 +2005,7 @@ fn draw_layout(
             theme,
             top,
             bottom,
+            t.legend_me,
         );
     }
 
@@ -1319,8 +2042,13 @@ fn draw_layout(
     changed
 }
 
-/// Paint one screen tile: a gradient "monitor" with an inset glass area, a specular top
-/// edge, and the machine name / resolution inside.
+/// Paint one screen tile as a **display card**, not a coloured slab: a white card with a
+/// rounded mini-preview at the top and the machine name / resolution underneath. The old
+/// version filled the whole tile with a saturated gradient and scrimmed the bottom, which
+/// read as a glowing button rather than a monitor.
+///
+/// `top`/`bottom` only colour the preview strip now, so a tile stays legible at any size and
+/// the accent is reserved for "this machine".
 #[allow(clippy::too_many_arguments)]
 fn paint_tile(
     painter: &egui::Painter,
@@ -1334,99 +2062,114 @@ fn paint_tile(
     theme: UiTheme,
     top: Color32,
     bottom: Color32,
+    me_label: &str,
 ) {
-    const R: f32 = 14.0;
-    // 1. Body: a soft vertical gradient. The previous palette was too saturated — these
-    //    mid-tones read as a display card, not a glowing button.
-    fill_gradient(painter, rect, R, top, bottom);
+    const R: f32 = 10.0;
 
-    // 2. A thin specular sheen along the very top edge — gives the surface a glassy hint.
-    let sheen_h = rect.height().min(2.5);
-    painter.rect_filled(
-        Rect::from_min_size(rect.min, vec2(rect.width(), sheen_h)),
-        egui::CornerRadius { nw: R as u8, ne: R as u8, sw: 0, se: 0 },
-        Color32::from_white_alpha(38),
-    );
+    // 1. Card body: the card surface, one step above the canvas.
+    painter.rect_filled(rect, egui::CornerRadius::same(R as u8), theme.card_bg);
 
-    // 3. Clean 1px bezel.
-    painter.rect_stroke(
-        rect,
-        egui::CornerRadius::same(R as u8),
-        (1.0, Color32::from_white_alpha(60)),
-        egui::StrokeKind::Inside,
-    );
-
-    // 4. Bottom label scrim (Apple/Music-card pattern): a translucent dark panel so the
-    //    name + resolution are always legible regardless of the underlying gradient.
-    if rect.width() > 56.0 && rect.height() > 44.0 {
-        let scrim_h = (rect.height() * 0.40).clamp(30.0, 58.0);
-        let scrim_rect = Rect::from_min_max(
-            pos2(rect.min.x, rect.max.y - scrim_h),
-            rect.max,
-        );
-        painter.rect_filled(
-            scrim_rect,
-            egui::CornerRadius { nw: 0, ne: 0, sw: R as u8, se: R as u8 },
-            Color32::from_black_alpha(110),
-        );
-        // A hairline along the top of the scrim so it reads as a separate panel.
-        painter.line_segment(
-            [scrim_rect.left_top(), scrim_rect.right_top()],
-            (1.0, Color32::from_white_alpha(40)),
-        );
-
-        let title = if is_primary { format!("★ {name}") } else { name.to_string() };
-        let base_y = scrim_rect.min.y;
-        painter.text(
-            pos2(rect.center().x, base_y + 8.0),
-            Align2::CENTER_TOP,
-            title,
-            FontId::proportional(13.5),
-            Color32::WHITE,
-        );
-        let res = if phys != (rect.width() as u32, rect.height() as u32) && scale != 1.0 {
-            format!("{}×{}  @{}x", phys.0, phys.1, scale)
-        } else {
-            format!("{}×{}", phys.0, phys.1)
-        };
-        painter.text(
-            pos2(rect.center().x, base_y + 27.0),
-            Align2::CENTER_TOP,
-            res,
-            FontId::proportional(11.0),
-            Color32::from_white_alpha(205),
-        );
-    }
-
-    // 5. "本机" badge — a small white pill in the top-left corner. Cleaner than the old
-    //    bottom-of-tile text and works at any tile size that fits the badge.
-    if is_me && rect.width() > 72.0 && rect.height() > 36.0 {
-        let pill_rect = Rect::from_min_size(
-            pos2(rect.min.x + 10.0, rect.min.y + 10.0),
-            vec2(36.0, 19.0),
-        );
-        painter.rect_filled(pill_rect, egui::CornerRadius::same(10), Color32::from_white_alpha(225));
-        painter.text(
-            pill_rect.center(),
-            Align2::CENTER_CENTER,
-            "本机",
-            FontId::proportional(10.5),
-            Color32::from_black_alpha(225),
-        );
-    }
-
-    // 6. Hover halo — a soft accent ring outside the tile.
+    // 2. Border: hairline normally, accent for this machine, accent + halo while hovered.
+    let (sw, sc) = if hover {
+        (2.0, theme.accent)
+    } else if is_me {
+        (1.5, theme.accent)
+    } else {
+        (1.0, Color32::from_gray(209))
+    };
+    painter.rect_stroke(rect, egui::CornerRadius::same(R as u8), (sw, sc), egui::StrokeKind::Inside);
     if hover {
         painter.rect_stroke(
-            rect.expand(5.0),
-            egui::CornerRadius::same((R + 5.0) as u8),
-            (2.5, Color32::from_rgba_unmultiplied(theme.accent.r(), theme.accent.g(), theme.accent.b(), 170)),
+            rect.expand(4.0),
+            egui::CornerRadius::same((R + 4.0) as u8),
+            (2.0, Color32::from_rgba_unmultiplied(theme.accent.r(), theme.accent.g(), theme.accent.b(), 120)),
             egui::StrokeKind::Outside,
         );
     }
-}
 
-/// Highlight every edge where one of this machine's displays touches a secondary's — those
+    let pad = 14.0;
+    let content = rect.shrink(pad);
+    if content.width() < 24.0 || content.height() < 20.0 {
+        return;
+    }
+    // Clip so long machine names can never spill outside the card.
+    let cp = painter.with_clip_rect(rect);
+
+    // 3. Mini preview: a tinted strip with two faint "content" bars, so the tile reads as a
+    //    screen even at a glance.
+    let prev_h = (content.height() * 0.45).clamp(14.0, 64.0);
+    let prev = Rect::from_min_size(content.min, vec2(content.width(), prev_h));
+    if prev.height() > 8.0 {
+        fill_gradient(&cp, prev, 6.0, top, bottom);
+        let lw1 = (prev.width() - 40.0).max(6.0);
+        let lw2 = (prev.width() - 62.0).max(4.0);
+        let ly1 = prev.min.y + prev.height() * 0.28;
+        let ly2 = prev.min.y + prev.height() * 0.50;
+        if prev.height() > 18.0 {
+            cp.rect_filled(
+                Rect::from_min_size(pos2(prev.min.x + 12.0, ly1), vec2(lw1, 4.0)),
+                2.0,
+                Color32::from_white_alpha(150),
+            );
+            cp.rect_filled(
+                Rect::from_min_size(pos2(prev.min.x + 12.0, ly2), vec2(lw2, 4.0)),
+                2.0,
+                Color32::from_white_alpha(95),
+            );
+        }
+    }
+
+    // 4. Name + resolution beneath the preview.
+    let text_y = prev.max.y + 10.0;
+    if text_y < rect.max.y - 4.0 {
+        let title = if is_primary { format!("★ {name}") } else { name.to_string() };
+        cp.text(
+            pos2(content.min.x, text_y),
+            Align2::LEFT_TOP,
+            title,
+            FontId::proportional(13.0),
+            theme.text,
+        );
+        let res = if phys != (rect.width() as u32, rect.height() as u32) && scale != 1.0 {
+            format!("{} × {} · @{:.0}x", phys.0, phys.1, scale)
+        } else {
+            format!("{} × {}", phys.0, phys.1)
+        };
+        if text_y + 20.0 < rect.max.y {
+            cp.text(
+                pos2(content.min.x, text_y + 18.0),
+                Align2::LEFT_TOP,
+                res,
+                FontId::monospace(11.0),
+                theme.muted,
+            );
+        }
+    }
+
+    // 5. "This machine" badge floating on the top-left corner — the prototype's white pill,
+    //    which stays crisp at any tile size (the old bottom-anchored text collided with the
+    //    resolution line on short tiles).
+    if is_me && rect.width() > 84.0 && rect.height() > 44.0 {
+        let pill = Rect::from_min_size(
+            pos2(rect.min.x + 14.0, rect.min.y - 9.0),
+            vec2(38.0, 18.0),
+        );
+        painter.rect_filled(pill, egui::CornerRadius::same(9), theme.card_bg);
+        painter.rect_stroke(
+            pill,
+            egui::CornerRadius::same(9),
+            (1.0, theme.accent),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            pill.center(),
+            Align2::CENTER_CENTER,
+            me_label,
+            FontId::proportional(9.5),
+            theme.accent,
+        );
+    }
+}
 /// are the only places the cursor can cross.
 fn paint_shared_edges(
     painter: &egui::Painter,
