@@ -112,6 +112,16 @@ impl Net {
         }
     }
 
+    /// Whether the primary currently has a live connection to `name`. Used by the control plane to
+    /// detect a secondary that dropped mid-hand-off, so it can return control instead of forwarding
+    /// input into a dead socket forever.
+    pub fn has_peer(&self, name: &str) -> bool {
+        match self {
+            Net::Primary { peers } => peers.lock().unwrap().contains_key(name),
+            Net::Secondary { .. } | Net::Idle => false,
+        }
+    }
+
     /// Push the full layout to every connected secondary. Cheap (one small JSON frame per
     /// peer) and idempotent — the primary calls this periodically so new peers and any screen
     /// repositioning show up on every machine's canvas.

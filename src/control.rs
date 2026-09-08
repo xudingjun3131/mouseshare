@@ -145,22 +145,24 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
                     }
                 }
                 CaptureMode::Forwarding(name) => {
-                    let bbox = l.local_bbox();
-                    let loc = location;
-                    match (bbox, loc) {
-                        (Some(bbox), Some(loc)) if still_outside(&c, loc, (dx, dy), bbox) => {
-                            forward_motion(ctx, &name, dx, dy);
-                            if let Some(park) = c.parked {
-                                crate::capture::park_cursor(park);
-                            }
-                            true
+                    // While a secondary has control every delta is forwarded and the local event
+                    // dropped. The RETURN decision lives on the secondary: it tracks its own
+                    // virtual cursor (clamped to its own screen) and sends `ReturnControl` when
+                    // that cursor is pushed back across the shared edge. The primary's real cursor
+                    // is frozen at the edge here (events are dropped), so its position is *not* a
+                    // valid signal for deciding when to come back — that was the old bug where any
+                    // leftward twitch on the secondary snapped control straight back to the Mac.
+                    if !ctx.net.lock().unwrap().has_peer(&name) {
+                        // The secondary dropped mid-hand-off; return rather than forward into a
+                        // dead socket (which would leave the cursor hidden and stuck).
+                        leave_forwarding(ctx, &mut c, &l, &name, location);
+                        false
+                    } else {
+                        forward_motion(ctx, &name, dx, dy);
+                        if let Some(park) = c.parked {
+                            crate::capture::park_cursor(park);
                         }
-                        _ => {
-                            // Return to local (cursor came back across the edge, or we lost
-                            // position data). Release any held keys/buttons on the remote first.
-                            leave_forwarding(ctx, &mut c, &l, &name, loc);
-                            false
-                        }
+                        true
                     }
                 }
             }
@@ -265,21 +267,17 @@ fn predict_cross(
     None
 }
 
-/// While forwarding on `side`, is the predicted position still beyond the shared edge (i.e. still
-/// outside, so we should keep forwarding)? If it has reversed back inside, we return to local.
-fn still_outside(c: &Ctrl, loc: (f64, f64), delta: (f64, f64), bbox: (f64, f64, f64, f64)) -> bool {
-    let side = match &c.remote {
-        Some(r) => r.side,
-        None => return false,
-    };
+/// The secondary's virtual cursor should hand control back when it is being pushed back across the
+/// edge that faces the primary. `r.side` is that edge (the primary crossed its own side, so the
+/// secondary is entered on the opposite edge). Returns true when the cursor, after applying
+/// `(dx, dy)`, would pass that edge while still moving toward the primary.
+fn crossing_back(r: &RemoteCtrl, bbox: (f64, f64, f64, f64), dx: f64, dy: f64) -> bool {
     let (bl, bt, br, bb) = bbox;
-    let px = loc.0 + delta.0;
-    let py = loc.1 + delta.1;
-    match side {
-        Side::Right => px >= br - CROSS_EPS,
-        Side::Left => px <= bl + CROSS_EPS,
-        Side::Bottom => py >= bb - CROSS_EPS,
-        Side::Top => py <= bt + CROSS_EPS,
+    match r.side {
+        Side::Left => r.vx + dx <= bl + CROSS_EPS && dx < 0.0,
+        Side::Right => r.vx + dx >= br - 1.0 - CROSS_EPS && dx > 0.0,
+        Side::Top => r.vy + dy <= bt + CROSS_EPS && dy < 0.0,
+        Side::Bottom => r.vy + dy >= bb - 1.0 - CROSS_EPS && dy > 0.0,
     }
 }
 
@@ -399,6 +397,18 @@ fn attached_side(s: &Screen, bbox: (f64, f64, f64, f64)) -> Option<Side> {
     }
 }
 
+/// The secondary asked for control back (its cursor was pushed back across the shared edge).
+/// Return to local if we are currently forwarding. Unlike `cycle_control`, this always returns to
+/// the primary rather than rotating to the next machine.
+pub fn return_control(ctx: &GrabCtx) {
+    let mut c = ctx.ctrl.lock().unwrap();
+    let l = ctx.layout.lock().unwrap();
+    if let Some(r) = c.remote.clone() {
+        let loc = c.parked;
+        leave_forwarding(ctx, &mut c, &l, &r.name, loc);
+    }
+}
+
 /// Rotate control: local → each secondary → back to local. Invoked by the hotkey on the primary.
 pub fn cycle_control(ctx: &GrabCtx) {
     let mut c = ctx.ctrl.lock().unwrap();
@@ -482,6 +492,8 @@ pub fn on_leave_screen(ctx: &GrabCtx) {
 
 /// Apply a forwarded input event while we are being driven. Motion is relative: we accumulate the
 /// delta against our own virtual cursor and warp to the result (clamped to our own displays).
+/// When the cursor is pushed back across the edge facing the primary, we send `ReturnControl` so
+/// the primary hands control back (the primary can't tell on its own — its cursor is frozen).
 pub fn on_secondary_input(ctx: &GrabCtx, ev: InputEvent) {
     let mut c = ctx.ctrl.lock().unwrap();
     let bbox = c.local_bbox;
@@ -490,6 +502,21 @@ pub fn on_secondary_input(ctx: &GrabCtx, ev: InputEvent) {
     };
     match ev {
         InputEvent::MouseMotion { dx, dy } => {
+            if let Some(bbox) = bbox {
+                if crossing_back(r, bbox, dx, dy) {
+                    // Hand control back. Capture what we need, then drop the ctrl lock before
+                    // the network send so we don't hold it across the socket.
+                    let side = r.side;
+                    let (vx, vy) = (r.vx, r.vy);
+                    drop(c);
+                    ctx.net.lock().unwrap().send_message(Message::ReturnControl);
+                    crate::diag::log(&format!(
+                        "EDGE-RETURN side={:?} v=({:.0},{:.0}) d=({:.0},{:.0})",
+                        side, vx, vy, dx, dy
+                    ));
+                    return;
+                }
+            }
             r.vx += dx;
             r.vy += dy;
             if let Some((bl, bt, br, bb)) = bbox {
@@ -597,6 +624,41 @@ mod tests {
         assert_eq!(predict_cross(&l, (1918.0, 540.0), (10.0, 0.0), BBOX), None);
     }
 
+    // ---- crossing_back: the return decision lives on the secondary ----
+
+    #[test]
+    fn crossing_back_left_edge_returns() {
+        // Secondary entered on its LEFT edge (primary to its left). Cursor mid-screen moving left
+        // must NOT return; only when it reaches the left edge and keeps pushing left.
+        let r = RemoteCtrl { name: "B".into(), side: Side::Left, vx: 500.0, vy: 540.0 };
+        assert!(!crossing_back(&r, BBOX, -50.0, 0.0), "mid-screen left move must not return");
+        assert!(!crossing_back(&r, BBOX, 50.0, 0.0), "right move must not return");
+
+        let at_edge = RemoteCtrl { name: "B".into(), side: Side::Left, vx: 5.0, vy: 540.0 };
+        assert!(crossing_back(&at_edge, BBOX, -10.0, 0.0), "at left edge pushing left must return");
+        // At the edge but moving right (into the screen) must NOT return.
+        assert!(!crossing_back(&at_edge, BBOX, 10.0, 0.0));
+    }
+
+    #[test]
+    fn crossing_back_right_edge_returns() {
+        // Secondary entered on its RIGHT edge (primary to its right).
+        let r = RemoteCtrl { name: "B".into(), side: Side::Right, vx: 1915.0, vy: 540.0 };
+        assert!(crossing_back(&r, BBOX, 20.0, 0.0), "at right edge pushing right must return");
+        assert!(!crossing_back(&r, BBOX, -20.0, 0.0), "moving left (into screen) must not return");
+    }
+
+    #[test]
+    fn crossing_back_vertical_edges() {
+        let top = RemoteCtrl { name: "U".into(), side: Side::Top, vx: 960.0, vy: 5.0 };
+        assert!(crossing_back(&top, BBOX, 0.0, -10.0), "at top edge pushing up must return");
+        assert!(!crossing_back(&top, BBOX, 0.0, 10.0));
+
+        let bottom = RemoteCtrl { name: "D".into(), side: Side::Bottom, vx: 960.0, vy: 1075.0 };
+        assert!(crossing_back(&bottom, BBOX, 0.0, 10.0), "at bottom edge pushing down must return");
+        assert!(!crossing_back(&bottom, BBOX, 0.0, -10.0));
+    }
+
     #[test]
     fn hotkey_scrolllock_fires_on_press_only() {
         let mut st = HotkeyState::default();
@@ -630,9 +692,9 @@ mod integration {
     use std::time::Duration;
 
     /// Connect a primary hub (local screen A + remote B to its right) and a secondary client
-    /// (local screen B) over loopback, and return the two `GrabCtx` plus the secondary's incoming
-    /// channel so the test can observe every message the secondary receives.
-    fn setup_pair(port: u16) -> (GrabCtx, GrabCtx, Receiver<(String, Message)>) {
+    /// (local screen B) over loopback, and return the two `GrabCtx` plus the two incoming channels
+    /// (secondary's first, primary's second) so the test can observe messages in both directions.
+    fn setup_pair(port: u16) -> (GrabCtx, GrabCtx, Receiver<(String, Message)>, Receiver<(String, Message)>) {
         let primary_layout = Layout {
             screens: vec![
                 Screen {
@@ -667,7 +729,7 @@ mod integration {
             }],
         };
 
-        let (ptx, _prx) = channel();
+        let (ptx, prx) = channel();
         let (stx, srx) = channel();
         let pla = Arc::new(Mutex::new(primary_layout));
         let sla = Arc::new(Mutex::new(secondary_layout));
@@ -728,7 +790,7 @@ mod integration {
             my_name: "B".to_string(),
             primary_name: "A".to_string(),
         };
-        (primary, secondary, srx)
+        (primary, secondary, srx, prx)
     }
 
     /// Drain the secondary's incoming channel for `dur`, applying whatever the primary sent
@@ -768,7 +830,7 @@ mod integration {
 
     #[test]
     fn handoff_over_tcp() {
-        let (p, s, srx) = setup_pair(19211);
+        let (p, s, srx, _prx) = setup_pair(19211);
 
         // Primary cursor near the right edge moving right -> predict crossing into B.
         let dropped = on_capture(
@@ -800,17 +862,36 @@ mod integration {
             assert!((r.vy - 540.0).abs() < 0.5, "vy={}", r.vy);
         }
 
-        // Cursor returns across the edge -> control comes back to the primary.
+        // A leftward move while the secondary is mid-screen must NOT return control (this is the
+        // regression being guarded: the primary used to snap back on any leftward delta because
+        // its own cursor is frozen at the edge).
         let dropped2 = on_capture(
             &p,
             RawInput::Motion { dx: -50.0, dy: 0.0 },
             Some((1919.0, 540.0)),
         );
-        assert!(!dropped2, "returning event must NOT be dropped");
-
-        let msgs2 = pump(&s, &srx, Duration::from_millis(500));
+        assert!(dropped2, "leftward motion mid-screen must STILL be forwarded/dropped");
         assert!(
-            msgs2.iter().any(|m| matches!(m, Message::LeaveScreen)),
+            matches!(&*p.mode.lock().unwrap(), CaptureMode::Forwarding(n) if n == "B"),
+            "primary must remain forwarding after a mid-screen left move"
+        );
+        let msgs2 = pump(&s, &srx, Duration::from_millis(300));
+        assert!(
+            !msgs2.iter().any(|m| matches!(m, Message::LeaveScreen)),
+            "no LeaveScreen on a mid-screen left move"
+        );
+        // The secondary moved left from 102 -> 52, well inside the screen.
+        assert!(
+            (s.ctrl.lock().unwrap().remote.as_ref().unwrap().vx - 52.0).abs() < 0.5,
+            "secondary cursor should track the left move"
+        );
+
+        // The secondary (or the primary, on a disconnect) asks for control back.
+        return_control(&p);
+
+        let msgs3 = pump(&s, &srx, Duration::from_millis(500));
+        assert!(
+            msgs3.iter().any(|m| matches!(m, Message::LeaveScreen)),
             "secondary must receive LeaveScreen"
         );
         assert!(p.ctrl.lock().unwrap().remote.is_none(), "primary remote cleared");
@@ -822,8 +903,66 @@ mod integration {
     }
 
     #[test]
+    fn edge_return_roundtrip() {
+        let (p, s, srx, prx) = setup_pair(19215);
+
+        // Cross over right.
+        on_capture(
+            &p,
+            RawInput::Motion { dx: 100.0, dy: 0.0 },
+            Some((1918.0, 540.0)),
+        );
+        pump(&s, &srx, Duration::from_millis(300));
+        // secondary vx = 2 + 100 = 102
+
+        // Drive the cursor left, but not to the edge: no ReturnControl should be produced.
+        on_capture(
+            &p,
+            RawInput::Motion { dx: -50.0, dy: 0.0 },
+            Some((1919.0, 540.0)),
+        );
+        pump(&s, &srx, Duration::from_millis(300)); // vx 102 -> 52
+        assert!(
+            prx.try_recv().is_err(),
+            "no ReturnControl while the secondary is still mid-screen"
+        );
+
+        // Drive left past the left edge: the secondary detects crossing-back and sends
+        // ReturnControl over the real TCP loopback to the primary.
+        on_capture(
+            &p,
+            RawInput::Motion { dx: -100.0, dy: 0.0 },
+            Some((1919.0, 540.0)),
+        );
+        pump(&s, &srx, Duration::from_millis(300)); // vx 52 -> -48 -> crosses left edge
+
+        let mut got_return = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            match prx.recv_timeout(Duration::from_millis(100)) {
+                Ok((_, Message::ReturnControl)) => {
+                    got_return = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        assert!(got_return, "secondary must send ReturnControl to the primary");
+
+        // The primary's message handler calls return_control -> control returns.
+        return_control(&p);
+        let msgs = pump(&s, &srx, Duration::from_millis(300));
+        assert!(
+            msgs.iter().any(|m| matches!(m, Message::LeaveScreen)),
+            "secondary receives LeaveScreen after ReturnControl"
+        );
+        assert!(p.ctrl.lock().unwrap().remote.is_none(), "primary back to local");
+    }
+
+    #[test]
     fn cooldown_blocks_recross() {
-        let (p, s, srx) = setup_pair(19212);
+        let (p, s, srx, _prx) = setup_pair(19212);
 
         on_capture(
             &p,
@@ -831,11 +970,7 @@ mod integration {
             Some((1918.0, 540.0)),
         );
         pump(&s, &srx, Duration::from_millis(300));
-        on_capture(
-            &p,
-            RawInput::Motion { dx: -50.0, dy: 0.0 },
-            Some((1919.0, 540.0)),
-        );
+        return_control(&p);
         pump(&s, &srx, Duration::from_millis(300));
         assert!(
             p.ctrl.lock().unwrap().cooldown_until.is_some(),
@@ -862,7 +997,7 @@ mod integration {
 
     #[test]
     fn held_keys_released_on_leave() {
-        let (p, s, srx) = setup_pair(19213);
+        let (p, s, srx, _prx) = setup_pair(19213);
 
         on_capture(
             &p,
@@ -874,12 +1009,8 @@ mod integration {
         // Hold a key while forwarding.
         on_capture(&p, RawInput::KeyDown(Key::KeyA), None);
 
-        // Return across the edge -> leave_forwarding should release the held key first.
-        on_capture(
-            &p,
-            RawInput::Motion { dx: -50.0, dy: 0.0 },
-            Some((1919.0, 540.0)),
-        );
+        // Hand control back -> leave_forwarding should release the held key first.
+        return_control(&p);
         let msgs = pump(&s, &srx, Duration::from_millis(300));
 
         let keyup_idx = msgs
@@ -896,7 +1027,7 @@ mod integration {
 
     #[test]
     fn hotkey_enters_first_remote() {
-        let (p, _s, _srx) = setup_pair(19214);
+        let (p, _s, _srx, _prx) = setup_pair(19214);
 
         // ScrollLock in Local mode must rotate control into the first secondary (B).
         on_capture(&p, RawInput::KeyDown(Key::ScrollLock), None);

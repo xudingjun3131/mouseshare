@@ -39,7 +39,7 @@ pub use control::Ctrl;
 use log::info;
 
 use crate::config::{load_config, save_config, Config};
-use crate::control::{CaptureMode, GrabCtx, HotkeyState, on_enter_screen, on_leave_screen, on_secondary_input, cycle_control};
+use crate::control::{CaptureMode, GrabCtx, HotkeyState, on_enter_screen, on_leave_screen, on_secondary_input, cycle_control, return_control};
 use crate::i18n::Lang;
 use crate::layout::Layout;
 use crate::network::{connect_client, start_hub, Net};
@@ -244,6 +244,13 @@ fn main() -> anyhow::Result<()> {
                         // A secondary pressed the switch hotkey; only the primary rotates control.
                         if mode2 == "primary" {
                             cycle_control(&grab_ctx);
+                        }
+                    }
+                    Message::ReturnControl => {
+                        // A secondary's virtual cursor was pushed back across the shared edge;
+                        // only the primary hands control back (it is the one forwarding).
+                        if mode2 == "primary" {
+                            return_control(&grab_ctx);
                         }
                     }
                     _ => {}

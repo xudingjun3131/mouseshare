@@ -73,6 +73,10 @@ pub enum Message {
     /// next machine in the layout (primary as one machine, then each secondary). A secondary sends
     /// this to the primary; the primary also handles its own local ScrollLock press.
     Hotkey,
+    /// The secondary asks the primary for control back: its virtual cursor was pushed back across
+    /// the shared edge toward the primary. The primary leaves forwarding and resumes local control
+    /// (unlike `Hotkey`, this always returns to the primary, never rotates to another machine).
+    ReturnControl,
 }
 
 impl MsButton {
