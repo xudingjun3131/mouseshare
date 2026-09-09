@@ -152,6 +152,10 @@ pub fn send_paths(net: Arc<Mutex<Net>>, paths: Vec<PathBuf>) {
             "FILE-SEND token={} files={} bytes={}",
             token, n, total
         ));
+        // Visible confirmation on the sending machine. Without this the user cannot tell whether
+        // the copy was even detected (vs. silently swallowed by the monitor), and a failure
+        // further down the wire reads as "file copy just doesn't work".
+        crate::app::notify(crate::i18n::tr_file_sent(n));
     });
 }
 

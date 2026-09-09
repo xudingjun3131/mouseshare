@@ -279,10 +279,17 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     // A file copy arriving from another machine: reassemble, then put the paths
-                    // on the local pasteboard so Cmd/Ctrl+V pastes them.
+                    // on the local pasteboard so Cmd/Ctrl+V pastes them. On the hub the copy is
+                    // ALSO relayed to every other peer — the sender's `broadcast` only reaches
+                    // the hub's reader, not the other clients.
                     Message::ClipboardFiles { .. }
                     | Message::FileChunk { .. }
                     | Message::FileEnd { .. } => {
+                        if mode2 == "primary" {
+                            net.lock()
+                                .unwrap()
+                                .broadcast_all_except(msg.clone(), &from);
+                        }
                         let finished = file_rx.lock().unwrap().handle(msg);
                         if let Some(paths) = finished {
                             let n = paths.len();

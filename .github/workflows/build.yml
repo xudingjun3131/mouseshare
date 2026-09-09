@@ -118,6 +118,9 @@ jobs:
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>LSMinimumSystemVersion</key><string>10.13</string>
+            <!-- Belt-and-braces alongside the runtime beginActivity() call: forbid App Nap
+                 entirely so hiding/minimising the window can never throttle the event tap. -->
+            <key>NSAppSleepDisabled</key><string>YES</string>
           </dict></plist>
           EOF
           # Ad-hoc sign so the bundle is a valid signed app (user can right-click -> Open past Gatekeeper).

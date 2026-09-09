@@ -44,6 +44,14 @@ pub fn tr_file_received(n: usize) -> String {
     }
 }
 
+/// A file copy finished being sent to the other machine(s).
+pub fn tr_file_sent(n: usize) -> String {
+    match current_lang() {
+        Lang::Zh => format!("已发送 {} 个文件到其他设备。", n),
+        Lang::En => format!("Sent {} file(s) to the other machine(s).", n),
+    }
+}
+
 impl Lang {
     pub fn from_code(s: &str) -> Lang {
         if s.eq_ignore_ascii_case("en") {

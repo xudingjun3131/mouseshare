@@ -30,8 +30,8 @@ use core_foundation::base::TCFType;
 use core_foundation::runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes};
 #[cfg(target_os = "macos")]
 use core_graphics::event::{
-    CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
-    CallbackResult, EventField,
+    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, CallbackResult, EventField,
 };
 
 // ---- cursor visibility / parking (capture-layer concern) ----
@@ -121,7 +121,13 @@ pub fn disable_app_nap() {
     let options =
         NS_ACTIVITY_USER_INITIATED | NS_ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED | NS_ACTIVITY_LATENCY_CRITICAL;
 
-    objc::rc::autoreleasepool(|| unsafe {
+    // NOTE: deliberately **not** wrapped in an `autoreleasepool`. `beginActivity...` returns an
+    // *autoreleased* token (it is not an alloc/new/copy selector), so draining a pool around this
+    // call releases it — and with it the whole activity. That is precisely the bug this function
+    // shipped with: the token pointer we stashed was dangling, App Nap switched straight back on,
+    // and hiding/minimising the window throttled the event tap again (lag, no crossing, two
+    // cursors). Retaining it and never releasing keeps the activity alive for the process lifetime.
+    unsafe {
         let pi: *mut Object = msg_send![class!(NSProcessInfo), processInfo];
         if pi.is_null() {
             return;
@@ -140,12 +146,12 @@ pub fn disable_app_nap() {
             log::warn!("could not begin App Nap activity; hiding the window may cause lag");
             return;
         }
-        // The token comes back retained; keeping the pointer in a static is enough to stop it
-        // from ever being released, so the activity lasts for the whole process lifetime.
+        // +1 our own reference so the (autoreleased) pool drain cannot end the activity.
+        let _: *mut Object = msg_send![token, retain];
         let _ = APP_NAP_TOKEN.set(token as usize);
         log::info!("App Nap disabled (latency-critical activity begun)");
         crate::diag::log("app nap disabled");
-    });
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -276,7 +282,19 @@ fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
                 return CallbackResult::Keep;
             }
             // User revoked input monitoring / secure input: stop dropping so we don't eat input.
+            // Same state hazard as a timeout-disable: while the tap is down our Drop verdicts are
+            // ignored, so an un-recovered Forwarding state means BOTH cursors keep moving. Hand
+            // control back (try_lock — never wait here) and show the cursor.
             if event_type as u32 == CGEventType::TapDisabledByUserInput as u32 {
+                let fwd = ctx_cb
+                    .mode
+                    .try_lock()
+                    .map(|m| matches!(&*m, CaptureMode::Forwarding(_)))
+                    .unwrap_or(false);
+                if fwd {
+                    crate::diag::log("TAP DISABLED BY USER INPUT mid-forward — control returned");
+                    crate::control::try_return_control(&ctx_cb);
+                }
                 crate::capture::show_cursor();
                 return CallbackResult::Keep;
             }
@@ -318,6 +336,17 @@ fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
                 CGEventType::KeyUp => Some(RawInput::KeyUp(key_from_code(
                     cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16,
                 ))),
+                // Modifiers do NOT arrive as KeyDown/KeyUp on macOS — only as FlagsChanged.
+                // Without reading them here, the Ctrl+Alt+Space hotkey never fires: the tap
+                // never sees ControlLeft/Alt key events, so the modifier state stays false
+                // forever and Space is treated as a plain space. Read the event flags instead.
+                CGEventType::FlagsChanged => {
+                    let f = cg_ev.get_flags();
+                    Some(RawInput::Mods {
+                        ctrl: f.contains(CGEventFlags::CGEventFlagControl),
+                        alt: f.contains(CGEventFlags::CGEventFlagAlternate),
+                    })
+                }
                 // FlagsChanged (modifier state) and everything else: pass through unchanged.
                 _ => None,
             };

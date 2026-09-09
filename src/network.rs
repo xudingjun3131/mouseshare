@@ -164,6 +164,22 @@ impl Net {
         }
     }
 
+    /// [`broadcast_all`] but skipping one peer — used by the hub to relay a copy that arrived
+    /// from `except` to every *other* machine (the sender already has it).
+    pub fn broadcast_all_except(&self, msg: Message, except: &str) {
+        match self {
+            Net::Primary { peers } => {
+                for (name, tx) in peers.lock().unwrap().iter() {
+                    if name == except {
+                        continue;
+                    }
+                    let _ = tx.send(msg.clone());
+                }
+            }
+            Net::Secondary { .. } | Net::Idle => { /* nothing to relay */ }
+        }
+    }
+
     /// Send an arbitrary message to the primary (used by secondaries, e.g. the hotkey). The
     /// primary never calls this (it originates input itself); a `Primary`/`Idle` handle ignores it.
     pub fn send_message(&self, msg: Message) {

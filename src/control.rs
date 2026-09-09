@@ -35,6 +35,9 @@ pub enum RawInput {
     Wheel { dx: i64, dy: i64 },
     KeyDown(Key),
     KeyUp(Key),
+    /// Current modifier state (macOS reports these via FlagsChanged, never KeyDown/KeyUp).
+    /// Feeds the switch-hotkey's Ctrl+Alt tracker; never itself consumed or dropped.
+    Mods { ctrl: bool, alt: bool },
 }
 
 /// Capture state of the *primary*: local control, or forwarding to a named secondary.
@@ -218,7 +221,17 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
                     // is frozen at the edge here (events are dropped), so its position is *not* a
                     // valid signal for deciding when to come back — that was the old bug where any
                     // leftward twitch on the secondary snapped control straight back to the Mac.
-                    if !ctx.net.lock().unwrap().has_peer(&name) {
+                    //
+                    // The liveness probe uses `try_lock` and treats "busy" as alive: this runs on
+                    // the event-tap thread at 100+ Hz, and `net` is momentarily held by the input
+                    // pump for every frame. Blocking here would stall the tap, get it disabled by
+                    // macOS, and — with Drop verdicts ignored — both cursors move at once.
+                    let alive = ctx
+                        .net
+                        .try_lock()
+                        .map(|n| n.has_peer(&name))
+                        .unwrap_or(true);
+                    if !alive {
                         // The secondary dropped mid-hand-off; return rather than forward into a
                         // dead socket (which would leave the cursor hidden and stuck).
                         leave_forwarding(ctx, &mut c, &l, &name, location);
@@ -281,6 +294,15 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
                 c.held_keys.retain(|x| *x != k);
             }
             dropped
+        }
+        RawInput::Mods { ctrl, alt } => {
+            // macOS delivers modifier state via FlagsChanged only, so this is the only way the
+            // Ctrl+Alt+Space hotkey's modifier tracker ever learns Ctrl/Alt went down.
+            let mut c = ctx.ctrl.lock().unwrap();
+            c.hk.ctrl = ctrl;
+            c.hk.alt = alt;
+            // Never consumed: modifiers must keep reaching the OS and any remote.
+            false
         }
     }
 }
@@ -1085,18 +1107,14 @@ mod integration {
             net: net_primary,
             layout: pla.clone(),
             ctrl: Arc::new(Mutex::new(Ctrl {
+                // Block-scoped guards on purpose: a bare `pla.lock()` inside a struct literal
+                // keeps the temporary MutexGuard alive until the *whole literal* is evaluated,
+                // so the second `pla.lock()` two fields down would self-deadlock the thread.
                 local_bbox: {
-                    let g = pla.lock();
-                    eprintln!("[setup_pair] got primary layout lock 1");
-                    let b = g.unwrap().local_bbox();
-                    b
+                    let g = pla.lock().unwrap();
+                    g.local_bbox()
                 },
-                layout_snap: {
-                    let g = pla.lock();
-                    eprintln!("[setup_pair] got primary layout lock 2");
-                    let s = g.unwrap().clone();
-                    Arc::new(s)
-                },
+                layout_snap: Arc::new(pla.lock().unwrap().clone()),
                 ..Default::default()
             })),
             mode: Mutex::new(CaptureMode::Local),
@@ -1104,23 +1122,15 @@ mod integration {
             primary_name: "A".to_string(),
             input_tx: None,
         };
-        std::fs::write("/tmp/mstep.txt", "made primary").ok();
         let secondary = GrabCtx {
             net: net_secondary,
             layout: sla.clone(),
             ctrl: Arc::new(Mutex::new(Ctrl {
                 local_bbox: {
-                    let g = sla.lock();
-                    eprintln!("[setup_pair] got secondary layout lock 1");
-                    let b = g.unwrap().local_bbox();
-                    b
+                    let g = sla.lock().unwrap();
+                    g.local_bbox()
                 },
-                layout_snap: {
-                    let g = sla.lock();
-                    eprintln!("[setup_pair] got secondary layout lock 2");
-                    let s = g.unwrap().clone();
-                    Arc::new(s)
-                },
+                layout_snap: Arc::new(sla.lock().unwrap().clone()),
                 ..Default::default()
             })),
             mode: Mutex::new(CaptureMode::Local),
@@ -1128,7 +1138,6 @@ mod integration {
             primary_name: "A".to_string(),
             input_tx: None,
         };
-        std::fs::write("/tmp/mstep.txt", "made secondary").ok();
         (primary, secondary, srx, prx)
     }
 
