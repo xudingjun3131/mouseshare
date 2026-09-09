@@ -28,6 +28,18 @@ pub fn write_files(paths: &[PathBuf]) -> bool {
     imp::write_files(paths)
 }
 
+/// A counter that the OS increments on **every** change to the clipboard, however small.
+///
+/// Needed because "did the clipboard change?" cannot be answered by comparing *contents*: copy
+/// the same file twice and the paths are identical, so a content comparison sees no change and
+/// silently skips the second copy — the user presses Cmd+C again, nothing happens, and the
+/// feature reads as broken. The generation number changes even when the contents do not.
+///
+/// `None` on platforms that have no such counter (callers then fall back to comparing content).
+pub fn generation() -> Option<i64> {
+    imp::generation()
+}
+
 // ---------------------------------------------------------------- macOS -------------------
 
 #[cfg(target_os = "macos")]
@@ -242,6 +254,19 @@ mod imp {
             ok
         })
     }
+
+    /// `NSPasteboard.changeCount` — bumped on every write, including a re-copy of identical
+    /// contents. This is what lets the monitor notice a second Cmd+C of the same file.
+    pub fn generation() -> Option<i64> {
+        objc::rc::autoreleasepool(|| unsafe {
+            let pb: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
+            if pb.is_null() {
+                return None;
+            }
+            let n: i64 = msg_send![pb, changeCount];
+            Some(n)
+        })
+    }
 }
 
 // --------------------------------------------------------------- Windows -------------------
@@ -289,6 +314,10 @@ mod imp {
             buffer: *mut u16,
             buf_len: u32,
         ) -> u32;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetClipboardSequenceNumber() -> u32;
     }
 
     pub fn read_files() -> Vec<PathBuf> {
@@ -361,6 +390,12 @@ mod imp {
             ok
         }
     }
+
+    /// `GetClipboardSequenceNumber` — increments on every clipboard change, so re-copying the
+    /// same file (identical `CF_HDROP` contents) is still detected as a new copy.
+    pub fn generation() -> Option<i64> {
+        unsafe { Some(GetClipboardSequenceNumber() as i64) }
+    }
 }
 
 // ----------------------------------------------------------------- Linux / other ----------
@@ -373,5 +408,8 @@ mod imp {
     }
     pub fn write_files(_paths: &[PathBuf]) -> bool {
         false
+    }
+    pub fn generation() -> Option<i64> {
+        None
     }
 }

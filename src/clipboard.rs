@@ -31,6 +31,10 @@ const POLL_MS: u64 = 200;
 pub struct ClipState {
     pub text: Option<String>,
     pub files: Vec<PathBuf>,
+    /// The pasteboard generation counter at the moment we last wrote to it (locally or from a
+    /// remote). The monitor compares against the live counter rather than against contents, so a
+    /// second Cmd+C of the *same* file is still seen as a fresh copy.
+    pub gen: Option<i64>,
 }
 
 /// Set the local clipboard text. Used both by secondaries (remote -> local) and the primary
@@ -56,6 +60,12 @@ pub fn apply_remote_text(state: &Arc<Mutex<ClipState>>, text: &str) {
         st.files.clear();
     }
     set_clipboard(text);
+    // Our own write bumped the generation counter; remember the new value so the monitor sees it
+    // as "ours" and stays quiet.
+    {
+        let mut st = state.lock().unwrap();
+        st.gen = clipfile::generation();
+    }
 }
 
 /// Same as [`apply_remote_text`] for a finished file transfer: write the paths onto the local
@@ -65,6 +75,7 @@ pub fn apply_remote_files(state: &Arc<Mutex<ClipState>>, paths: &[PathBuf]) -> b
     let mut st = state.lock().unwrap();
     st.files = paths.to_vec();
     st.text = None;
+    st.gen = clipfile::generation();
     ok
 }
 
@@ -95,6 +106,19 @@ pub fn start_monitor(state: Arc<Mutex<ClipState>>, net: Arc<Mutex<Net>>) {
         loop {
             std::thread::sleep(Duration::from_millis(POLL_MS));
 
+            // The pasteboard generation counter is the *primary* change signal: it advances on
+            // every write even when the contents are unchanged, so a second copy of the same file
+            // (identical paths) is still detected. Content comparison is kept as the fallback for
+            // platforms with no counter (Linux).
+            let gen = clipfile::generation();
+            let gen_changed = match (gen, state.lock().unwrap().gen) {
+                (Some(g), Some(last)) => g != last,
+                _ => true, // no counter: fall through to content comparison
+            };
+            if !gen_changed {
+                continue;
+            }
+
             // One snapshot of the pasteboard — see the note above about why these two reads
             // must be considered together rather than as independent channels.
             let text: Option<String> = cb.get_text().ok();
@@ -104,7 +128,8 @@ pub fn start_monitor(state: Arc<Mutex<ClipState>>, net: Arc<Mutex<Net>>) {
                 // ---- a file paste (files win) ----
                 let changed = {
                     let st = state.lock().unwrap();
-                    st.files != files
+                    // On a counter-less platform `gen_changed` is always true, so gate on content.
+                    gen_changed || st.files != files
                 };
                 if changed {
                     {
@@ -113,26 +138,39 @@ pub fn start_monitor(state: Arc<Mutex<ClipState>>, net: Arc<Mutex<Net>>) {
                         // Remember the text that rides along with the file paste (usually the
                         // file name) so it is not re-detected as a new copy on the next tick.
                         st.text = text;
+                        st.gen = gen;
                     }
                     log::info!("clipboard files changed ({} item(s))", files.len());
-                    crate::diag::log(&format!("CLIP-FILES-DETECTED n={}", files.len()));
+                    crate::diag::log(&format!(
+                        "CLIP-FILES-DETECTED n={} gen={:?}",
+                        files.len(),
+                        gen
+                    ));
                     crate::transfer::send_paths(net.clone(), files);
                 }
             } else if let Some(t) = text {
                 // ---- a text paste ----
                 let changed = {
                     let st = state.lock().unwrap();
-                    st.text.as_deref() != Some(t.as_str())
+                    gen_changed || st.text.as_deref() != Some(t.as_str())
                 };
                 if changed {
                     {
                         let mut st = state.lock().unwrap();
                         st.text = Some(t.clone());
                         st.files.clear();
+                        st.gen = gen;
                     }
                     log::debug!("clipboard text changed ({} bytes)", t.len());
                     net.lock().unwrap().broadcast_clipboard(&t, None);
                 }
+            } else {
+                // Neither files nor text: record the generation so a later same-content write is
+                // still detected, and clear our stale snapshot.
+                let mut st = state.lock().unwrap();
+                st.gen = gen;
+                st.files.clear();
+                st.text = None;
             }
         }
     });

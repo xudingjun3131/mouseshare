@@ -180,14 +180,38 @@ impl Receiver {
     pub fn handle(&mut self, msg: Message) -> Option<Vec<PathBuf>> {
         match msg {
             Message::ClipboardFiles { token, entries } => {
+                let n = entries.len();
+                let bytes: u64 = entries.iter().map(|e| e.size).sum();
+                let names: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+                crate::diag::log(&format!(
+                    "FILE-RECV-BEGIN token={} files={} bytes={} entries=[{}]",
+                    token,
+                    n,
+                    bytes,
+                    names.join(", ")
+                ));
                 self.begin(token, entries);
                 None
             }
             Message::FileChunk { token, seq, data } => {
+                if seq == 0 {
+                    crate::diag::log(&format!("FILE-RECV-FIRST-CHUNK token={}", token));
+                }
                 self.chunk(token, seq, &data);
                 None
             }
-            Message::FileEnd { token } => self.finish(token),
+            Message::FileEnd { token } => {
+                let out = self.finish(token);
+                crate::diag::log(&format!(
+                    "FILE-RECV-END token={} result={}",
+                    token,
+                    match &out {
+                        Some(p) => format!("ok n={}", p.len()),
+                        None => "none (transfer dropped or produced no files)".to_string(),
+                    }
+                ));
+                out
+            }
             _ => None,
         }
     }

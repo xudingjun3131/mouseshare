@@ -257,13 +257,18 @@ fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
                              cg_ev: &CGEvent| {
             // Re-enable a tap the OS disabled (the callback ran too long, or App Nap kicked in).
             if event_type as u32 == CGEventType::TapDisabledByTimeout as u32 {
-                // Order matters: hand control back **before** re-arming the tap. While the tap is
-                // disabled our `Drop` verdicts are ignored, so local events leak through *and*
-                // keep being forwarded — both cursors move at once. Returning control stops that
-                // the moment it happens; the user simply crosses again.
-                if matches!(&*ctx_cb.mode.lock().unwrap(), CaptureMode::Forwarding(_)) {
+                // `try_lock`, never `lock`: this callback is already being told it took too long,
+                // so the last thing it may do is wait on a mutex. If the GUI thread holds `mode`
+                // we simply skip this recovery — the next timeout, or the user moving back,
+                // rights it — rather than stalling and earning another disable.
+                let fwd = ctx_cb
+                    .mode
+                    .try_lock()
+                    .map(|m| matches!(&*m, CaptureMode::Forwarding(_)))
+                    .unwrap_or(false);
+                if fwd {
                     crate::diag::log("TAP DISABLED mid-forward — control returned to local");
-                    crate::control::return_control(&ctx_cb);
+                    crate::control::try_return_control(&ctx_cb);
                 }
                 if let Some(&port) = tap_port_cb.get() {
                     unsafe { CGEventTapEnable(port as *mut c_void, true) };

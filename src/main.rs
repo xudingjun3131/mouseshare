@@ -181,6 +181,20 @@ fn main() -> anyhow::Result<()> {
         layout_snap: Arc::new(layout.lock().unwrap().clone()),
         ..Default::default()
     }));
+    // Forwarded input is handed to the network through an unbounded queue instead of being sent
+    // inline: the producer is the macOS event-tap callback, which must never wait on the `net`
+    // lock (a stalled tap is disabled by the OS, and a disabled tap stops dropping events while
+    // we keep forwarding — both cursors then move at once). See `GrabCtx::input_tx`.
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<control::OutboundInput>();
+    {
+        let net = net.clone();
+        std::thread::spawn(move || {
+            for cmd in input_rx {
+                net.lock().unwrap().send_input(&cmd.target, cmd.ev);
+            }
+        });
+    }
+
     let grab_ctx: Arc<GrabCtx> = Arc::new(GrabCtx {
         net: net.clone(),
         layout: layout.clone(),
@@ -188,6 +202,7 @@ fn main() -> anyhow::Result<()> {
         mode: Mutex::new(CaptureMode::Local),
         my_name: my_name.clone(),
         primary_name: primary_name.clone(),
+        input_tx: Some(input_tx),
     });
 
     // Shared clipboard state. It records the last value *we* put on the local clipboard (from

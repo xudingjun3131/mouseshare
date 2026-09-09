@@ -20,6 +20,7 @@ use crate::layout::{Layout, Screen, Side};
 use crate::network::Net;
 use crate::protocol::{InputEvent, Message, MsButton};
 use rdev::Key;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 /// A platform-neutral input event handed to the control plane by the capture layer.
@@ -98,6 +99,12 @@ pub struct HotkeyState {
     pub alt: bool,
 }
 
+/// An input event the capture callback wants sent to a peer.
+pub struct OutboundInput {
+    pub target: String,
+    pub ev: InputEvent,
+}
+
 /// Everything the capture layer + control plane need, shared across threads.
 pub struct GrabCtx {
     pub net: Arc<Mutex<Net>>,
@@ -106,6 +113,19 @@ pub struct GrabCtx {
     pub mode: Mutex<CaptureMode>,
     pub my_name: String,
     pub primary_name: String,
+    /// Lock-free send path for forwarded input.
+    ///
+    /// **Why this exists.** Forwarded mouse motion is produced inside the macOS event-tap
+    /// callback, which runs in the OS input pipeline. Sending it meant locking `net`, and any
+    /// wait on that lock stalls the tap; macOS then declares it unresponsive and disables it
+    /// (`TapDisabledByTimeout`). A disabled tap stops *dropping* events while we are still in
+    /// `Forwarding`, so the local cursor starts moving again while the remote one keeps being
+    /// driven — the "both cursors move at once" bug.
+    ///
+    /// With this channel the callback only does an unbounded, allocation-light `send` (no locks
+    /// that anything else holds for long), and a pump thread does the real `net`-locked send.
+    /// `None` in tests, which have no event tap to stall and so send inline.
+    pub input_tx: Option<Sender<OutboundInput>>,
 }
 
 /// A remote counts as attached just beyond an edge when its gap is within this distance. Generous
@@ -267,17 +287,32 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
 
 /// Forward a single input event to the secondary we're controlling. Returns `true` if we are
 /// forwarding (so the caller should drop the local event), `false` otherwise.
+///
+/// The send itself goes through `GrabCtx::input_tx` when there is one, so the event-tap callback
+/// never has to take the `net` lock (see that field's docs).
 fn forward_if_forwarding(ctx: &GrabCtx, mode: &CaptureMode, ev: InputEvent) -> bool {
     if let CaptureMode::Forwarding(name) = mode {
-        ctx.net.lock().unwrap().send_input(&name, ev);
+        forward_to(ctx, name, ev);
         true
     } else {
         false
     }
 }
 
+/// Queue (or, in tests, directly send) one input event to `name`.
+fn forward_to(ctx: &GrabCtx, name: &str, ev: InputEvent) {
+    match &ctx.input_tx {
+        Some(tx) => {
+            // Unbounded channel: this cannot block. A dropped receiver means we are shutting
+            // down, and losing a forwarded event then is harmless.
+            let _ = tx.send(OutboundInput { target: name.to_string(), ev });
+        }
+        None => ctx.net.lock().unwrap().send_input(name, ev),
+    }
+}
+
 fn forward_motion(ctx: &GrabCtx, name: &str, dx: f64, dy: f64) {
-    ctx.net.lock().unwrap().send_input(name, InputEvent::MouseMotion { dx, dy });
+    forward_to(ctx, name, InputEvent::MouseMotion { dx, dy });
 }
 
 fn screen_rect(s: &Screen) -> (f64, f64, f64, f64) {
@@ -468,14 +503,13 @@ fn leave_forwarding(
     loc: Option<(f64, f64)>,
 ) {
     // Release held keys/buttons on the remote so it never keeps a "ghost" modifier down.
-    {
-        let net = ctx.net.lock().unwrap();
-        for k in c.held_keys.drain(..) {
-            net.send_input(name, InputEvent::KeyUp { key: k });
-        }
-        for b in c.held_buttons.drain(..) {
-            net.send_input(name, InputEvent::MouseUp { button: b });
-        }
+    // Queued rather than sent under the `net` lock: this runs on the event-tap thread whenever
+    // the tap is disabled mid-forward, which is exactly when we must not stall on a lock.
+    for k in c.held_keys.drain(..) {
+        forward_to(ctx, name, InputEvent::KeyUp { key: k });
+    }
+    for b in c.held_buttons.drain(..) {
+        forward_to(ctx, name, InputEvent::MouseUp { button: b });
     }
     let side = c.remote.as_ref().map(|r| r.side);
     c.remote = None;
@@ -541,6 +575,24 @@ pub fn return_control(ctx: &GrabCtx) {
     // holding is what turns one momentary timeout into sustained, visible lag (and can disable
     // the tap again, which is how a brief hiccup becomes "it stutters and both cursors move").
     // `layout_snap` is the lock-free copy kept for exactly this path.
+    let snap = c.layout_snap.clone();
+    if let Some(r) = c.remote.clone() {
+        let loc = c.parked;
+        leave_forwarding(ctx, &mut c, &snap, &r.name, loc);
+    }
+}
+
+/// Tap-safe [`return_control`]: gives up instead of blocking when `ctrl` is held.
+///
+/// Called from the event-tap callback the instant macOS disables the tap. That callback is
+/// already in the OS's bad books — waiting on a lock here keeps it unresponsive for longer and
+/// earns another disable, which is how one hiccup turns into sustained "both cursors move".
+/// Skipping the recovery is safe: the next timeout, or the user simply moving back, rights it.
+pub fn try_return_control(ctx: &GrabCtx) {
+    let Ok(mut c) = ctx.ctrl.try_lock() else {
+        crate::diag::log("TAP DISABLED mid-forward — ctrl busy, deferred return");
+        return;
+    };
     let snap = c.layout_snap.clone();
     if let Some(r) = c.remote.clone() {
         let loc = c.parked;
@@ -1050,6 +1102,7 @@ mod integration {
             mode: Mutex::new(CaptureMode::Local),
             my_name: "A".to_string(),
             primary_name: "A".to_string(),
+            input_tx: None,
         };
         std::fs::write("/tmp/mstep.txt", "made primary").ok();
         let secondary = GrabCtx {
@@ -1073,6 +1126,7 @@ mod integration {
             mode: Mutex::new(CaptureMode::Local),
             my_name: "B".to_string(),
             primary_name: "A".to_string(),
+            input_tx: None,
         };
         std::fs::write("/tmp/mstep.txt", "made secondary").ok();
         (primary, secondary, srx, prx)
@@ -1535,6 +1589,7 @@ mod integration {
             mode: Mutex::new(CaptureMode::Local),
             my_name: "A".to_string(),
             primary_name: "A".to_string(),
+            input_tx: None,
         };
         let secondary = GrabCtx {
             net: net_secondary,
@@ -1546,6 +1601,7 @@ mod integration {
             mode: Mutex::new(CaptureMode::Local),
             my_name: "B".to_string(),
             primary_name: "A".to_string(),
+            input_tx: None,
         };
         (primary, secondary, srx, prx)
     }
