@@ -40,6 +40,10 @@ mod imp {
 
     /// `public.file-url` — the modern (10.10+) pasteboard type for copied files.
     const FILE_URL_TYPE: &str = "public.file-url";
+    /// `NSFilenamesPboardType` — the pre-10.10 type. Finder still populates it, and some apps
+    /// (and some cross-platform toolkits) write *only* this one, so reading it as well is the
+    /// difference between "file copy works" and "file copy silently does nothing".
+    const FILENAMES_TYPE: &str = "NSFilenamesPboardType";
 
     unsafe fn nsstring(s: &str) -> *mut Object {
         let c = match CString::new(s) {
@@ -114,33 +118,83 @@ mod imp {
         out
     }
 
+    /// Every path currently on the pasteboard, tried through each representation macOS may use.
+    ///
+    /// There is no single reliable way to ask "is a file on the clipboard?": Finder populates
+    /// `pasteboardItems` with `public.file-url` *and* the legacy `NSFilenamesPboardType`, but
+    /// other apps (and some cross-platform toolkits) write only one of them. Reading just one
+    /// representation — the obvious implementation — makes file copy work from Finder and
+    /// silently do nothing everywhere else. So try each in turn and return the first hit.
     pub fn read_files() -> Vec<PathBuf> {
         objc::rc::autoreleasepool(|| unsafe {
             let pb: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
             if pb.is_null() {
                 return Vec::new();
             }
-            let items: *mut Object = msg_send![pb, pasteboardItems];
-            if items.is_null() {
-                return Vec::new();
+
+            // 1. Per-item `public.file-url` (the modern, multi-file representation).
+            let mut out = read_item_urls(pb);
+            if !out.is_empty() {
+                return out;
             }
-            let count: usize = msg_send![items, count];
+
+            // 2. A single `public.file-url` written directly on the pasteboard (old-style API).
             let ty = nsstring(FILE_URL_TYPE);
-            if ty.is_null() {
-                return Vec::new();
-            }
-            let mut out = Vec::new();
-            for i in 0..count {
-                let item: *mut Object = msg_send![items, objectAtIndex: i];
-                let s: *mut Object = msg_send![item, stringForType: ty];
-                if let Some(url) = to_string(s) {
-                    if let Some(p) = url_to_path(&url) {
-                        out.push(p);
-                    }
+            if !ty.is_null() {
+                let s: *mut Object = msg_send![pb, stringForType: ty];
+                if let Some(p) = to_string(s).and_then(|u| url_to_path(&u)) {
+                    out.push(p);
+                    return out;
                 }
             }
+
+            // 3. The legacy `NSFilenamesPboardType`: an NSArray of plain path strings.
+            out = read_filenames(pb);
             out
         })
+    }
+
+    /// Walk `pasteboardItems`, pulling a `public.file-url` out of each.
+    unsafe fn read_item_urls(pb: *mut Object) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let items: *mut Object = msg_send![pb, pasteboardItems];
+        if items.is_null() {
+            return out;
+        }
+        let count: usize = msg_send![items, count];
+        let ty = nsstring(FILE_URL_TYPE);
+        if ty.is_null() {
+            return out;
+        }
+        for i in 0..count {
+            let item: *mut Object = msg_send![items, objectAtIndex: i];
+            let s: *mut Object = msg_send![item, stringForType: ty];
+            if let Some(p) = to_string(s).and_then(|u| url_to_path(&u)) {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// Read the legacy `NSFilenamesPboardType` (an `NSArray<NSString*>` of absolute paths).
+    unsafe fn read_filenames(pb: *mut Object) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let ty = nsstring(FILENAMES_TYPE);
+        if ty.is_null() {
+            return out;
+        }
+        let arr: *mut Object = msg_send![pb, propertyListForType: ty];
+        if arr.is_null() {
+            return out;
+        }
+        let count: usize = msg_send![arr, count];
+        for i in 0..count {
+            let s: *mut Object = msg_send![arr, objectAtIndex: i];
+            if let Some(p) = to_string(s) {
+                out.push(PathBuf::from(p));
+            }
+        }
+        out
     }
 
     pub fn write_files(paths: &[PathBuf]) -> bool {
@@ -168,6 +222,23 @@ mod imp {
             }
             let _: isize = msg_send![pb, clearContents];
             let ok: bool = msg_send![pb, writeObjects: arr];
+
+            // Also publish the legacy `NSFilenamesPboardType` so apps that only look for the
+            // pre-10.10 type can paste what we received. This must come *after* `writeObjects:`,
+            // which clears the pasteboard as part of writing and would otherwise wipe it again.
+            if ok {
+                let legacy = nsstring(FILENAMES_TYPE);
+                let names: *mut Object = msg_send![class!(NSMutableArray), array];
+                if !legacy.is_null() && !names.is_null() {
+                    for p in paths {
+                        let s = nsstring(&p.to_string_lossy());
+                        if !s.is_null() {
+                            let _: () = msg_send![names, addObject: s];
+                        }
+                    }
+                    let _: bool = msg_send![pb, setPropertyList: names forType: legacy];
+                }
+            }
             ok
         })
     }

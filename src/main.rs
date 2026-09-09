@@ -78,6 +78,10 @@ fn main() -> anyhow::Result<()> {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // Must happen before any window exists: hiding/minimising the window is exactly when macOS
+    // would otherwise put us into App Nap and start throttling the event tap.
+    capture::disable_app_nap();
+
     // Refuse to run twice (two copies would fight over the capture tap + listen port).
     let _instance_guard = match single_instance::acquire() {
         Some(g) => g,
@@ -269,6 +273,21 @@ fn main() -> anyhow::Result<()> {
                             let n = paths.len();
                             if clipboard::apply_remote_files(&clip_state, &paths) {
                                 crate::app::notify(crate::i18n::tr_file_received(n));
+                                crate::diag::log(&format!(
+                                    "FILE-APPLIED n={} first={}",
+                                    n,
+                                    paths
+                                        .first()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_default()
+                                ));
+                            } else {
+                                // Reassembly succeeded but the pasteboard write did not — without
+                                // this line the copy just silently does nothing.
+                                crate::diag::log(&format!(
+                                    "FILE-APPLY-FAILED n={} (pasteboard write rejected the paths)",
+                                    n
+                                ));
                             }
                         }
                     }

@@ -77,6 +77,80 @@ pub fn grab_active() -> bool {
     cfg!(all(not(test), target_os = "macos"))
 }
 
+// ---- macOS: keep App Nap from throttling us while the window is hidden ----
+
+/// Keeps the token returned by `beginActivityWithOptions:reason:` alive. Dropping it (or letting
+/// it be released) ends the activity and App Nap switches straight back on.
+#[cfg(target_os = "macos")]
+static APP_NAP_TOKEN: OnceLock<usize> = OnceLock::new();
+
+/// Opt this process out of macOS App Nap.
+///
+/// **Why this exists — it is the hidden cause of two separate user-visible bugs:**
+///
+/// * *"it gets laggy once I minimise/hide the window"*, and
+/// * *"both cursors move at once"*.
+///
+/// When the app's window is not visible macOS treats the process as idle and puts it into
+/// **App Nap**: it coalesces timers, throttles scheduling, and — critically — declares the
+/// event tap inactive. The tap then receives `TapDisabledByTimeout` and stops running our
+/// callback. While the tap is disabled every mouse event goes straight to the system, so the
+/// local cursor moves freely; the moment the tap re-arms we are still in `Forwarding` mode and
+/// start dropping + forwarding again. To the user that reads as stuttering *and* as two
+/// cursors tracking the same hand movement.
+///
+/// `NSProcessInfo.beginActivityWithOptions:reason:` marks the process user-initiated and
+/// latency-critical, which opts it out of App Nap for as long as we hold the returned token.
+#[cfg(target_os = "macos")]
+pub fn disable_app_nap() {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel};
+    use std::ffi::CString;
+
+    // NSActivityOptions (Foundation):
+    //   NSActivityIdleDisplaySleepDisabled     = 1 << 40
+    //   NSActivityIdleSystemSleepDisabled      = 1 << 20
+    //   NSActivitySuddenTerminationDisabled    = 1 << 14
+    //   NSActivityAutomaticTerminationDisabled = 1 << 15
+    //   NSActivityUserInitiated                = 0x00FFFFFF | NSActivityIdleSystemSleepDisabled
+    //   NSActivityLatencyCritical              = 0xFF00000000
+    const NS_ACTIVITY_USER_INITIATED: u64 = 0x00FF_FFFF;
+    const NS_ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED: u64 = 1 << 20;
+    const NS_ACTIVITY_LATENCY_CRITICAL: u64 = 0xFF00_0000_00;
+
+    let options =
+        NS_ACTIVITY_USER_INITIATED | NS_ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED | NS_ACTIVITY_LATENCY_CRITICAL;
+
+    objc::rc::autoreleasepool(|| unsafe {
+        let pi: *mut Object = msg_send![class!(NSProcessInfo), processInfo];
+        if pi.is_null() {
+            return;
+        }
+        let c = match CString::new("MouseShare forwards input and clipboard in real time") {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let reason: *mut Object =
+            msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()];
+        if reason.is_null() {
+            return;
+        }
+        let token: *mut Object = msg_send![pi, beginActivityWithOptions: options reason: reason];
+        if token.is_null() {
+            log::warn!("could not begin App Nap activity; hiding the window may cause lag");
+            return;
+        }
+        // The token comes back retained; keeping the pointer in a static is enough to stop it
+        // from ever being released, so the activity lasts for the whole process lifetime.
+        let _ = APP_NAP_TOKEN.set(token as usize);
+        log::info!("App Nap disabled (latency-critical activity begun)");
+        crate::diag::log("app nap disabled");
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn disable_app_nap() {}
+
 /// Start the global input capture. Blocks its own thread running the OS event loop.
 ///
 /// `failed` is a shared flag the UI polls: it is set when the capture layer cannot obtain the

@@ -21,6 +21,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -73,14 +74,34 @@ fn collect_one(root: &Path, p: &Path, out: &mut Vec<(String, PathBuf)>) {
 /// copy would otherwise block the clipboard monitor for seconds.
 pub fn send_paths(net: Arc<Mutex<Net>>, paths: Vec<PathBuf>) {
     std::thread::spawn(move || {
-        let files = collect(&paths);
-        if files.is_empty() {
+        let all = collect(&paths);
+        if all.is_empty() {
+            crate::diag::log("FILE-SEND aborted: nothing to send (empty selection)");
             return;
         }
-        let total: u64 = files
-            .iter()
-            .map(|(_, abs)| std::fs::metadata(abs).map(|m| m.len()).unwrap_or(0))
-            .sum();
+        // Open every file *before* building the manifest. The receiver sizes each file from the
+        // manifest and walks the chunk stream in order, so a file we later fail to open would
+        // leave it expecting bytes that never arrive — every subsequent file in the copy would
+        // then be written with the wrong contents. Rejecting unreadable files up front keeps the
+        // manifest and the payload exactly in step.
+        let mut opened: Vec<(String, File, u64)> = Vec::new();
+        for (rel, abs) in all {
+            match File::open(&abs).and_then(|f| {
+                let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                Ok((f, size))
+            }) {
+                Ok((f, size)) => opened.push((rel, f, size)),
+                Err(e) => {
+                    log::warn!("skip {}: {}", abs.display(), e);
+                    crate::diag::log(&format!("FILE-SEND skip {}: {}", abs.display(), e));
+                }
+            }
+        }
+        if opened.is_empty() {
+            crate::diag::log("FILE-SEND aborted: every file was unreadable");
+            return;
+        }
+        let total: u64 = opened.iter().map(|(_, _, s)| *s).sum();
         if total > MAX_FILE_BYTES {
             log::warn!(
                 "file copy too large ({} bytes, limit {}); skipped",
@@ -91,42 +112,46 @@ pub fn send_paths(net: Arc<Mutex<Net>>, paths: Vec<PathBuf>) {
             return;
         }
         let token = next_token();
-        let entries: Vec<FileEntry> = files
+        let entries: Vec<FileEntry> = opened
             .iter()
-            .map(|(rel, abs)| FileEntry {
+            .map(|(rel, _, size)| FileEntry {
                 path: rel.clone(),
-                size: std::fs::metadata(abs).map(|m| m.len()).unwrap_or(0),
+                size: *size,
             })
             .collect();
-        let n = files.len();
+        let n = entries.len();
         log::info!("sending {} file(s), {} bytes (token {})", n, total, token);
-        {
-            let net = net.lock().unwrap();
-            net.broadcast_all(Message::ClipboardFiles { token, entries });
-            let mut seq = 0u64;
-            let mut buf = vec![0u8; FILE_CHUNK];
-            for (_, abs) in &files {
-                let mut f = match File::open(abs) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::warn!("skip {}: {}", abs.display(), e);
-                        continue;
-                    }
-                };
-                loop {
-                    match f.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => {
-                            let data = base64_encode(&buf[..read]);
-                            net.broadcast_all(Message::FileChunk { token, seq, data });
-                            seq += 1;
-                        }
+        // One lock per frame, never held across a file read.
+        //
+        // The macOS event-tap callback locks the same `net` mutex to forward mouse motion, and a
+        // callback that blocks for long gets the tap disabled by the OS — which is exactly the
+        // "laggy, and both cursors move" symptom. Holding the lock for the whole copy (easy to
+        // write, and what this used to do) blocks input for seconds on a large selection, so each
+        // frame takes the lock only for the duration of its own send.
+        let send = |msg: Message| {
+            net.lock().unwrap().broadcast_all(msg);
+        };
+        send(Message::ClipboardFiles { token, entries });
+        let mut seq = 0u64;
+        let mut buf = vec![0u8; FILE_CHUNK];
+        for (_, f, _) in opened.iter_mut() {
+            loop {
+                match f.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        let data = base64_encode(&buf[..read]);
+                        send(Message::FileChunk { token, seq, data });
+                        seq += 1;
                     }
                 }
             }
-            net.broadcast_all(Message::FileEnd { token });
         }
-        crate::diag::log(&format!("FILE-SEND token={} files={} bytes={}", token, n, total));
+        send(Message::FileEnd { token });
+        log::info!("file copy sent (token {}, {} chunks)", token, n);
+        crate::diag::log(&format!(
+            "FILE-SEND token={} files={} bytes={}",
+            token, n, total
+        ));
     });
 }
 
@@ -169,10 +194,21 @@ impl Receiver {
 
     fn begin(&mut self, token: u64, entries: Vec<FileEntry>) {
         let root = inbox_root().join(token.to_string());
-        // Keep the inbox from growing without bound: drop any older transfer's directory.
+        // Sweep abandoned transfer directories — but only ones old enough that they cannot be a
+        // copy still in flight. Deleting *every* other directory (the previous behaviour) would
+        // pull the files out from under a second transfer that started a moment ago.
         if let Ok(dir) = std::fs::read_dir(inbox_root()) {
+            let stale = Duration::from_secs(30 * 60);
             for e in dir.flatten() {
-                if e.path() != root {
+                if e.path() == root {
+                    continue;
+                }
+                let old = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| t.elapsed().map(|d| d > stale).unwrap_or(false))
+                    .unwrap_or(false);
+                if old {
                     let _ = std::fs::remove_dir_all(e.path());
                 }
             }
@@ -277,8 +313,18 @@ impl Receiver {
         if let Some((_, mut w)) = t.current.take() {
             let _ = w.flush();
         }
-        crate::diag::log(&format!("FILE-RECV token={} items={}", token, t.top.len()));
-        Some(std::mem::take(&mut t.top))
+        // Only hand back paths that really landed on disk. A truncated or dropped chunk leaves a
+        // zero-length or missing file, and putting a non-existent path on the pasteboard makes
+        // Cmd/Ctrl+V fail silently — which reads to the user as "file copy doesn't work".
+        let top: Vec<PathBuf> = std::mem::take(&mut t.top)
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
+        if top.is_empty() {
+            log::warn!("file transfer {} produced no usable files", token);
+        }
+        crate::diag::log(&format!("FILE-RECV token={} items={}", token, top.len()));
+        Some(top)
     }
 }
 

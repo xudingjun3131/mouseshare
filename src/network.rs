@@ -51,50 +51,33 @@ fn read_msg(stream: &mut impl Read) -> std::io::Result<Message> {
 /// make us allocate gigabytes.
 const MAX_FRAME: usize = 8 << 20;
 
-/// Drain `rx` into a single batched write.
+/// Drain `rx` and write every frame out immediately.
 ///
-/// Two things happen here, both purely about latency:
-/// * every queued message goes out in **one** `write` syscall instead of one per message;
-/// * *adjacent* `MouseMotion` frames are summed into one frame. Motion is additive, so
-///   merging is lossless — and when the link (or the receiver) hiccups it stops a backlog
-///   of hundreds of tiny moves from arriving late as a visible stutter.
+/// Frames are **never coalesced**: a burst of 20 mouse moves goes out as 20 `MouseMotion` frames,
+/// not one summed frame. Collapsing them (which this used to do) keeps the total displacement
+/// identical but cuts the number of cursor updates the receiving machine performs, and that is
+/// exactly what a user perceives as a stuttery remote cursor — the delta arrives in fewer, larger
+/// jumps instead of tracking the hand smoothly.
 ///
-/// Non-motion events are never reordered relative to motion: only runs of consecutive
-/// motion collapse, so a click still lands where the preceding moves put the cursor.
+/// What *is* batched is only the syscall: everything already queued is encoded into one buffer and
+/// handed to a single `write`, so a busy trackpad does not cost one syscall per event. The wire
+/// still carries each frame separately.
 fn pump_writes(mut ws: TcpStream, rx: Receiver<Message>) {
-    let mut batch: Vec<Message> = Vec::with_capacity(WRITE_BATCH);
-    let mut merged: Vec<Message> = Vec::with_capacity(WRITE_BATCH);
+    let mut pending: Vec<Message> = Vec::with_capacity(WRITE_BATCH);
     let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
     while let Ok(first) = rx.recv() {
-        batch.clear();
-        batch.push(first);
-        while batch.len() < WRITE_BATCH {
+        pending.clear();
+        pending.push(first);
+        // Take only what is *already* queued — never wait for more, or a single move would sit
+        // in the buffer until the next one arrived.
+        while pending.len() < WRITE_BATCH {
             match rx.try_recv() {
-                Ok(m) => batch.push(m),
+                Ok(m) => pending.push(m),
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
-        // Collapse runs of consecutive MouseMotion into a single additive frame.
-        merged.clear();
-        for m in batch.drain(..) {
-            let merge = match (merged.last_mut(), &m) {
-                (
-                    Some(Message::Input(InputEvent::MouseMotion { dx, dy })),
-                    Message::Input(InputEvent::MouseMotion { dx: ddx, dy: ddy }),
-                ) => {
-                    *dx += *ddx;
-                    *dy += *ddy;
-                    true
-                }
-                _ => false,
-            };
-            if !merge {
-                merged.push(m);
-            }
-        }
-        // One syscall for the whole burst.
         out.clear();
-        for m in &merged {
+        for m in &pending {
             encode_into(&mut out, m);
         }
         if ws.write_all(&out).is_err() {

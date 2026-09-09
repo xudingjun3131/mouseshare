@@ -69,6 +69,20 @@ pub fn apply_remote_files(state: &Arc<Mutex<ClipState>>, paths: &[PathBuf]) -> b
 }
 
 /// Monitor the local clipboard (text **and** files) and push every genuine change to the peers.
+///
+/// ## Why text and files are read *together*
+///
+/// A single paste is one pasteboard state that happens to have several representations: copying
+/// a file in Finder puts both a `public.file-url` **and** a plain-text form (usually the file
+/// name) on the pasteboard. Comparing the two independently — the obvious implementation — makes
+/// them fight: the text branch fires, clears `files`, and broadcasts the name; the file branch
+/// then sees `files` as "changed", clears `text`, and sends the file; next tick the text branch
+/// fires again … forever. The user sees the remote clipboard flip between a file and the string
+/// "report.pdf" every 200 ms, pasting usually lands on the text form, and the machine is busy
+/// re-encoding and re-sending the same copy — which also shows up as input lag.
+///
+/// So: read both, and let **files win**. When a paste carries files we record the text we saw
+/// alongside it, so the text branch cannot mistake that same text for a fresh copy.
 pub fn start_monitor(state: Arc<Mutex<ClipState>>, net: Arc<Mutex<Net>>) {
     std::thread::spawn(move || {
         let mut cb = match arboard::Clipboard::new() {
@@ -81,8 +95,31 @@ pub fn start_monitor(state: Arc<Mutex<ClipState>>, net: Arc<Mutex<Net>>) {
         loop {
             std::thread::sleep(Duration::from_millis(POLL_MS));
 
-            // ---- text ----
-            if let Ok(t) = cb.get_text() {
+            // One snapshot of the pasteboard — see the note above about why these two reads
+            // must be considered together rather than as independent channels.
+            let text: Option<String> = cb.get_text().ok();
+            let files = clipfile::read_files();
+
+            if !files.is_empty() {
+                // ---- a file paste (files win) ----
+                let changed = {
+                    let st = state.lock().unwrap();
+                    st.files != files
+                };
+                if changed {
+                    {
+                        let mut st = state.lock().unwrap();
+                        st.files = files.clone();
+                        // Remember the text that rides along with the file paste (usually the
+                        // file name) so it is not re-detected as a new copy on the next tick.
+                        st.text = text;
+                    }
+                    log::info!("clipboard files changed ({} item(s))", files.len());
+                    crate::diag::log(&format!("CLIP-FILES-DETECTED n={}", files.len()));
+                    crate::transfer::send_paths(net.clone(), files);
+                }
+            } else if let Some(t) = text {
+                // ---- a text paste ----
                 let changed = {
                     let st = state.lock().unwrap();
                     st.text.as_deref() != Some(t.as_str())
@@ -94,29 +131,7 @@ pub fn start_monitor(state: Arc<Mutex<ClipState>>, net: Arc<Mutex<Net>>) {
                         st.files.clear();
                     }
                     log::debug!("clipboard text changed ({} bytes)", t.len());
-                    net.lock()
-                        .unwrap()
-                        .broadcast_clipboard(&t, None);
-                }
-            }
-
-            // ---- files ----
-            // A copy replaces whatever was on the pasteboard, so an empty list is the normal
-            // case (text or nothing is copied) and is simply ignored.
-            let files = clipfile::read_files();
-            if !files.is_empty() {
-                let changed = {
-                    let st = state.lock().unwrap();
-                    st.files != files
-                };
-                if changed {
-                    {
-                        let mut st = state.lock().unwrap();
-                        st.files = files.clone();
-                        st.text = None;
-                    }
-                    log::info!("clipboard files changed ({} item(s))", files.len());
-                    crate::transfer::send_paths(net.clone(), files);
+                    net.lock().unwrap().broadcast_clipboard(&t, None);
                 }
             }
         }

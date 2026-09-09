@@ -536,17 +536,25 @@ fn attached_side(s: &Screen, bbox: (f64, f64, f64, f64)) -> Option<Side> {
 /// the primary rather than rotating to the next machine.
 pub fn return_control(ctx: &GrabCtx) {
     let mut c = ctx.ctrl.lock().unwrap();
-    let l = ctx.layout.lock().unwrap();
+    // Deliberately *not* `ctx.layout.lock()`: this runs on the event-tap thread — the tap calls
+    // it the moment the OS disables the tap — and blocking there on a lock the GUI thread may be
+    // holding is what turns one momentary timeout into sustained, visible lag (and can disable
+    // the tap again, which is how a brief hiccup becomes "it stutters and both cursors move").
+    // `layout_snap` is the lock-free copy kept for exactly this path.
+    let snap = c.layout_snap.clone();
     if let Some(r) = c.remote.clone() {
         let loc = c.parked;
-        leave_forwarding(ctx, &mut c, &l, &r.name, loc);
+        leave_forwarding(ctx, &mut c, &snap, &r.name, loc);
     }
 }
 
 /// Rotate control: local → each secondary → back to local. Invoked by the hotkey on the primary.
 pub fn cycle_control(ctx: &GrabCtx) {
     let mut c = ctx.ctrl.lock().unwrap();
-    let l = ctx.layout.lock().unwrap();
+    // Same lock-free layout as `return_control`: the hotkey is detected inside the event-tap
+    // callback, so this also runs on the tap thread.
+    let snap = c.layout_snap.clone();
+    let l: &Layout = &snap;
     if l.screens.len() <= 1 {
         return;
     }
