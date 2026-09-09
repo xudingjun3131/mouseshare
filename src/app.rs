@@ -699,13 +699,21 @@ impl eframe::App for MouseShareApp {
 
         let theme = UiTheme::from_ctx(ctx);
 
-        // ---- Unified toolbar: brand on the left, live status + language toggle on the right ----
+        // ---- Unified toolbar: brand on the left, live status pill on the right ----
         // With the macOS full-size content view this panel sits *under* the native title bar, so
         // we clear the traffic-light zone on the left and let the red/yellow/green buttons float
         // above — the standard Big Sur+ "unified" window look. The old toolbar also carried the
         // product tagline here; it crowded the brand and is now the page subtitle instead.
+        //
+        // The language toggle used to live in this top bar too, but on macOS the fullsize-content
+        // layout puts the panel's right edge underneath the window's rounded corner / traffic-light
+        // inset, so the toggle was clipped to a sliver users couldn't click. It now lives in the
+        // sidebar's bottom-anchored group, just above "Quit".
+        //
+        // Same reason for the generous right margin: with `fullsize_content_view` the panel runs
+        // to the very edge of the glass, and anything hugging it gets eaten by the rounded corner.
         egui::TopBottomPanel::top("titlebar")
-            .frame(egui::Frame::NONE.fill(theme.toolbar_bg).inner_margin(egui::Margin { left: 0, right: 22, top: 14, bottom: 14 }))
+            .frame(egui::Frame::NONE.fill(theme.toolbar_bg).inner_margin(egui::Margin { left: 0, right: 34, top: 14, bottom: 14 }))
             .show(ctx, |ui| {
                 let panel_rect = ui.max_rect();
                 ui.horizontal(|ui| {
@@ -723,29 +731,6 @@ impl eframe::App for MouseShareApp {
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Extra padding from the window edge so the rightmost chip is never clipped
-                        // by macOS full-size-content-view title-bar insets / rounded corners.
-                        ui.add_space(6.0);
-
-                        // Language toggle — a small bordered chip (macOS toolbar-item look).
-                        // Width is driven by the label text so "中/En" / "En/中" is never truncated.
-                        let lang_btn = egui::Button::new(
-                            egui::RichText::new(self.lang.toggle_label())
-                                .size(11.0)
-                                .strong()
-                                .color(theme.text),
-                        )
-                        .min_size(vec2(0.0, 30.0))
-                        .corner_radius(8)
-                        .fill(theme.btn_bg)
-                        .stroke(egui::Stroke::new(1.0, theme.hairline));
-                        if ui.add(lang_btn).clicked() {
-                            self.lang = self.lang.toggled();
-                            self.config.lang = self.lang.code().to_string();
-                            save_config(&self.config); // persist immediately
-                        }
-                        ui.add_space(10.0);
-
                         // Live connection status pill: coloured dot + short label on a tint.
                         let (dot_color, status_text, tint) = match &*self.net.lock().unwrap() {
                             Net::Primary { .. } => (theme.accent, t.conn_primary, theme.accent_tint),
@@ -886,6 +871,8 @@ impl eframe::App for MouseShareApp {
                 }
 
                 // Bottom-anchored: keep "Quit" pinned to the foot of the rail on tall windows.
+                // Language toggle sits just above "Quit" — out of reach of the macOS traffic-light
+                // / window-corner clip zone that hid it when it lived in the title bar.
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
                     ui.add_space(6.0);
@@ -895,6 +882,12 @@ impl eframe::App for MouseShareApp {
                             save_config(&self.config);
                         }
                         std::process::exit(0);
+                    }
+                    ui.add_space(4.0);
+                    if lang_toggle_btn(ui, theme, self.lang.toggle_label()) {
+                        self.lang = self.lang.toggled();
+                        self.config.lang = self.lang.code().to_string();
+                        save_config(&self.config);
                     }
                 });
             });
@@ -1591,6 +1584,38 @@ fn nav_item(
             Color32::WHITE,
         );
     }
+    resp.clicked()
+}
+
+/// Sidebar bottom-anchored language toggle. Sits above "Quit" — out of the macOS window-corner
+/// clip zone that hid the old top-bar version. Styled like a quiet toolbar chip so it reads as a
+/// utility, not a primary action.
+fn lang_toggle_btn(ui: &mut egui::Ui, theme: UiTheme, label: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), egui::Sense::click());
+    let bg = if resp.hovered() || resp.clicked() {
+        theme.nav_hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(8), bg);
+    }
+    // Small "A文" mark on the left so the row is visually anchored to the sidebar column.
+    ui.painter().text(
+        pos2(rect.min.x + 14.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        "A文",
+        FontId::proportional(12.0),
+        theme.muted,
+    );
+    // Toggle label (always the *other* language, so it reads as an action).
+    ui.painter().text(
+        pos2(rect.min.x + 38.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.0),
+        theme.text,
+    );
     resp.clicked()
 }
 
