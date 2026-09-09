@@ -238,6 +238,12 @@ fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
         let tap_port: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
         let tap_port_cb = Arc::clone(&tap_port);
 
+        // NOTE: TapDisabledByTimeout / TapDisabledByUserInput must NOT go in this list.
+        // The mask bit is `1u64 << event_type`, and those two pseudo-events have values
+        // 0xFFFFFFFF / 0xFFFFFFFE — shifting by them overflows: debug builds panic (the
+        // capture thread dies instantly, so a dev build never captures), release builds
+        // silently wrap and corrupt the mask. macOS always delivers tap-disabled events
+        // to the callback regardless of the mask, so they need no entry here either.
         let events_of_interest: Vec<CGEventType> = vec![
             CGEventType::MouseMoved,
             CGEventType::LeftMouseDragged,

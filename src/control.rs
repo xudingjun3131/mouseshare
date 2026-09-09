@@ -129,6 +129,14 @@ pub struct GrabCtx {
     /// that anything else holds for long), and a pump thread does the real `net`-locked send.
     /// `None` in tests, which have no event tap to stall and so send inline.
     pub input_tx: Option<Sender<OutboundInput>>,
+    /// Screen-space rect of MouseShare's own main window, published by the GUI every frame.
+    ///
+    /// While a secondary controls this machine, every local click is dropped and forwarded —
+    /// which used to make MouseShare's own window (and everything around it) unclickable until
+    /// control came back, the "the app's UI is dead" complaint. A click that lands inside this
+    /// rect instead returns control and is delivered locally (ShareMouse behaves the same).
+    /// Read with `try_lock` from the tap callback; the GUI only ever holds it for an assign.
+    pub ui_window_rect: Mutex<Option<(f64, f64, f64, f64)>>,
 }
 
 /// A remote counts as attached just beyond an edge when its gap is within this distance. Generous
@@ -248,6 +256,25 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
             }
         }
         RawInput::ButtonDown(b) => {
+            // While a secondary has control, a click that lands inside MouseShare's own window
+            // returns control instead of being swallowed and forwarded — otherwise the app's
+            // UI (language toggle, Quit, …) is unclickable for as long as forwarding lasts,
+            // which read as "the button is broken". The remote gets a MouseUp for the button
+            // we never let down remotely, so it is not left with a stuck press.
+            if let CaptureMode::Forwarding(name) = &mode {
+                let inside_ui = location
+                    .zip(ctx.ui_window_rect.try_lock().ok().and_then(|g| *g))
+                    .is_some_and(|((x, y), (l, t, r, btm))| x >= l && x <= r && y >= t && y <= btm);
+                if inside_ui {
+                    let mut c = ctx.ctrl.lock().unwrap();
+                    let snap = c.layout_snap.clone();
+                    // leave_forwarding releases any remotely-held buttons/keys, so the remote
+                    // is never left with a stuck press.
+                    leave_forwarding(ctx, &mut c, &snap, name, location);
+                    crate::diag::log("CLICK INSIDE UI WINDOW while forwarding — control returned");
+                    return false;
+                }
+            }
             let dropped = forward_if_forwarding(ctx, &mode, InputEvent::MouseDown { button: b.clone() });
             if dropped {
                 ctx.ctrl.lock().unwrap().held_buttons.push(b);
@@ -1121,6 +1148,7 @@ mod integration {
             my_name: "A".to_string(),
             primary_name: "A".to_string(),
             input_tx: None,
+            ui_window_rect: Mutex::new(None),
         };
         let secondary = GrabCtx {
             net: net_secondary,
@@ -1137,6 +1165,7 @@ mod integration {
             my_name: "B".to_string(),
             primary_name: "A".to_string(),
             input_tx: None,
+            ui_window_rect: Mutex::new(None),
         };
         (primary, secondary, srx, prx)
     }
@@ -1329,6 +1358,53 @@ mod integration {
             "secondary receives LeaveScreen after ReturnControl"
         );
         assert!(p.ctrl.lock().unwrap().remote.is_none(), "primary back to local");
+    }
+
+    /// While forwarding, a click that lands inside MouseShare's own window must return control
+    /// and be delivered locally instead of being swallowed and forwarded to the secondary.
+    #[test]
+    fn click_inside_ui_window_returns_control() {
+        let (p, s, _srx, _prx) = setup_pair(19216);
+        seed_layout_snap(&p, &s);
+
+        // The GUI publishes its window rect (a small window parked near the shared edge,
+        // the worst case: the parked cursor sits right on top of it).
+        *p.ui_window_rect.lock().unwrap() = Some((1800.0, 0.0, 1900.0, 200.0));
+
+        on_capture(
+            &p,
+            RawInput::Motion { dx: 100.0, dy: 0.0 },
+            Some((1918.0, 100.0)),
+        );
+        assert!(
+            matches!(*p.mode.lock().unwrap(), CaptureMode::Forwarding(ref n) if n == "B"),
+            "hand-off must be active before the UI click"
+        );
+
+        // Click inside the published UI window rect: returns control, click delivered locally.
+        let dropped = on_capture(&p, RawInput::ButtonDown(MsButton::Left), Some((1850.0, 100.0)));
+        assert!(!dropped, "UI-window click must be delivered locally, not forwarded");
+        assert!(
+            matches!(*p.mode.lock().unwrap(), CaptureMode::Local),
+            "control must be back to local after the UI click"
+        );
+        assert!(p.ctrl.lock().unwrap().cooldown_until.is_some(), "return arms the re-cross cooldown");
+
+        // A click outside the window while forwarding is still forwarded (dropped locally).
+        // Wait out the re-cross cooldown first — it exists precisely to block an instant
+        // re-hand-off after returning.
+        std::thread::sleep(Duration::from_millis(750));
+        on_capture(
+            &p,
+            RawInput::Motion { dx: 100.0, dy: 0.0 },
+            Some((1918.0, 500.0)),
+        );
+        assert!(
+            matches!(*p.mode.lock().unwrap(), CaptureMode::Forwarding(ref n) if n == "B"),
+            "hand-off re-engaged away from the UI window"
+        );
+        let dropped = on_capture(&p, RawInput::ButtonDown(MsButton::Left), Some((500.0, 500.0)));
+        assert!(dropped, "ordinary clicks stay forwarded while a secondary has control");
     }
 
     #[test]
@@ -1599,6 +1675,7 @@ mod integration {
             my_name: "A".to_string(),
             primary_name: "A".to_string(),
             input_tx: None,
+            ui_window_rect: Mutex::new(None),
         };
         let secondary = GrabCtx {
             net: net_secondary,
@@ -1611,6 +1688,7 @@ mod integration {
             my_name: "B".to_string(),
             primary_name: "A".to_string(),
             input_tx: None,
+            ui_window_rect: Mutex::new(None),
         };
         (primary, secondary, srx, prx)
     }

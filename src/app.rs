@@ -699,6 +699,15 @@ impl eframe::App for MouseShareApp {
 
         let theme = UiTheme::from_ctx(ctx);
 
+        // Publish the window's screen rect so the event-tap can hand control back when the
+        // user clicks inside MouseShare's own UI while a secondary has control (see
+        // `GrabCtx::ui_window_rect`).
+        if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+            if let Ok(mut g) = self.grab_ctx.ui_window_rect.lock() {
+                *g = Some((r.min.x as f64, r.min.y as f64, r.max.x as f64, r.max.y as f64));
+            }
+        }
+
         // ---- Unified toolbar: brand on the left, live status pill on the right ----
         // With the macOS full-size content view this panel sits *under* the native title bar, so
         // we clear the traffic-light zone on the left and let the red/yellow/green buttons float

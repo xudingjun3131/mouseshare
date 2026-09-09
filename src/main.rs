@@ -203,6 +203,7 @@ fn main() -> anyhow::Result<()> {
         my_name: my_name.clone(),
         primary_name: primary_name.clone(),
         input_tx: Some(input_tx),
+        ui_window_rect: Mutex::new(None),
     });
 
     // Shared clipboard state. It records the last value *we* put on the local clipboard (from
