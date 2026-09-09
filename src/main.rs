@@ -475,10 +475,18 @@ fn main() -> anyhow::Result<()> {
     // macOS: treat the window as a native "unified toolbar" app — let the content draw edge to
     // edge under the title bar and float the red/yellow/green traffic lights over it. This is
     // what makes MouseShare read as a first-class macOS app instead of a generic GL canvas.
+    //
+    // `with_titlebar_shown(false)` is what actually makes the title bar *transparent* (it maps
+    // to `NSWindow.titlebarAppearsTransparent`). Without it macOS paints an opaque title-bar
+    // strip over the top ~28 pt of the window, which covers the upper-right corner — exactly
+    // where the language toggle / status pill live — and clips them to a sliver. The toolbar
+    // already reserves a left inset for the traffic lights and a right/top inset for the
+    // rounded corner, so with a transparent title bar everything stays visible.
     #[cfg(target_os = "macos")]
     {
         viewport = viewport
             .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
             .with_title_shown(false)
             .with_titlebar_buttons_shown(true);
     }

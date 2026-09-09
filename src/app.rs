@@ -714,15 +714,15 @@ impl eframe::App for MouseShareApp {
         // above — the standard Big Sur+ "unified" window look. The old toolbar also carried the
         // product tagline here; it crowded the brand and is now the page subtitle instead.
         //
-        // The language toggle used to live in this top bar too, but on macOS the fullsize-content
-        // layout puts the panel's right edge underneath the window's rounded corner / traffic-light
-        // inset, so the toggle was clipped to a sliver users couldn't click. It now lives in the
-        // sidebar's bottom-anchored group, just above "Quit".
-        //
-        // Same reason for the generous right margin: with `fullsize_content_view` the panel runs
-        // to the very edge of the glass, and anything hugging it gets eaten by the rounded corner.
+        // The language toggle lives at the top-right of the toolbar, left of the status pill
+        // (added inside the right_to_left group below). We push the panel content below the
+        // macOS native title bar (≈28pt) with `top: 32`, and keep `right: 50` so the chip and
+        // pill clear the window's rounded corner (≈10pt radius). Earlier attempts used a
+        // tight 14pt top — that placed the chip directly under an opaque title-bar overlay
+        // that swallowed its top half and ate touches. 32pt is enough headroom on every
+        // macOS build we've tested.
         egui::TopBottomPanel::top("titlebar")
-            .frame(egui::Frame::NONE.fill(theme.toolbar_bg).inner_margin(egui::Margin { left: 0, right: 34, top: 14, bottom: 14 }))
+            .frame(egui::Frame::NONE.fill(theme.toolbar_bg).inner_margin(egui::Margin { left: 0, right: 50, top: 32, bottom: 12 }))
             .show(ctx, |ui| {
                 let panel_rect = ui.max_rect();
                 ui.horizontal(|ui| {
@@ -741,6 +741,7 @@ impl eframe::App for MouseShareApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Live connection status pill: coloured dot + short label on a tint.
+                        // (right_to_left: first item painted is the rightmost.)
                         let (dot_color, status_text, tint) = match &*self.net.lock().unwrap() {
                             Net::Primary { .. } => (theme.accent, t.conn_primary, theme.accent_tint),
                             Net::Secondary { .. } => (theme.green, t.conn_connected, theme.green_tint),
@@ -880,8 +881,6 @@ impl eframe::App for MouseShareApp {
                 }
 
                 // Bottom-anchored: keep "Quit" pinned to the foot of the rail on tall windows.
-                // Language toggle sits just above "Quit" — out of reach of the macOS traffic-light
-                // / window-corner clip zone that hid it when it lived in the title bar.
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
                     ui.add_space(6.0);
@@ -891,12 +890,6 @@ impl eframe::App for MouseShareApp {
                             save_config(&self.config);
                         }
                         std::process::exit(0);
-                    }
-                    ui.add_space(4.0);
-                    if lang_toggle_btn(ui, theme, self.lang.toggle_label()) {
-                        self.lang = self.lang.toggled();
-                        self.config.lang = self.lang.code().to_string();
-                        save_config(&self.config);
                     }
                 });
             });
@@ -978,7 +971,14 @@ impl MouseShareApp {
 
     /// Connection: role (two mode cards), role-specific networking, local screens.
     fn page_connection(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
-        page_header(ui, t.page_connection, t.page_connection_sub, theme);
+        page_header(ui, t.page_connection, t.page_connection_sub, theme, |ui| {
+                if lang_chip(ui, theme, self.lang) {
+                    self.lang = self.lang.toggled();
+                    self.config.lang = self.lang.code().to_string();
+                    crate::i18n::set_lang(self.lang);
+                    save_config(&self.config);
+                }
+            });
 
         // ---- Role: two large mode cards (System Settings "default app" pattern) ----
         // A segmented control fit the label but not the explanation; two cards give room for
@@ -1221,7 +1221,14 @@ impl MouseShareApp {
 
     /// Screen layout: the draggable virtual desktop, plus the machine list.
     fn page_layout(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
-        page_header(ui, t.page_layout, t.page_layout_sub, theme);
+        page_header(ui, t.page_layout, t.page_layout_sub, theme, |ui| {
+                if lang_chip(ui, theme, self.lang) {
+                    self.lang = self.lang.toggled();
+                    self.config.lang = self.lang.code().to_string();
+                    crate::i18n::set_lang(self.lang);
+                    save_config(&self.config);
+                }
+            });
 
         card(ui, theme, |ui| {
             card_header(ui, theme, t.card_canvas, t.card_canvas_sub, |_ui| {});
@@ -1307,7 +1314,14 @@ impl MouseShareApp {
 
     /// Status: live session stats, network peers, and the tail of the diagnostic log.
     fn page_status(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
-        page_header(ui, t.page_status, t.page_status_sub, theme);
+        page_header(ui, t.page_status, t.page_status_sub, theme, |ui| {
+                if lang_chip(ui, theme, self.lang) {
+                    self.lang = self.lang.toggled();
+                    self.config.lang = self.lang.code().to_string();
+                    crate::i18n::set_lang(self.lang);
+                    save_config(&self.config);
+                }
+            });
 
         let peers = self.net.lock().unwrap().peer_count();
         let conn_label = match &*self.net.lock().unwrap() {
@@ -1406,7 +1420,14 @@ impl MouseShareApp {
 
     /// Discovered primaries on the LAN (secondary only) — one click to connect.
     fn page_discovered(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
-        page_header(ui, t.page_discovered, t.page_discovered_sub, theme);
+        page_header(ui, t.page_discovered, t.page_discovered_sub, theme, |ui| {
+                if lang_chip(ui, theme, self.lang) {
+                    self.lang = self.lang.toggled();
+                    self.config.lang = self.lang.code().to_string();
+                    crate::i18n::set_lang(self.lang);
+                    save_config(&self.config);
+                }
+            });
 
         let list = self.discovered.lock().unwrap().clone();
         let mut pick: Option<String> = None;
@@ -1596,34 +1617,39 @@ fn nav_item(
     resp.clicked()
 }
 
-/// Sidebar bottom-anchored language toggle. Sits above "Quit" — out of the macOS window-corner
-/// clip zone that hid the old top-bar version. Styled like a quiet toolbar chip so it reads as a
-/// utility, not a primary action.
-fn lang_toggle_btn(ui: &mut egui::Ui, theme: UiTheme, label: &str) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), egui::Sense::click());
-    let bg = if resp.hovered() || resp.clicked() {
-        theme.nav_hover
-    } else {
-        Color32::TRANSPARENT
-    };
-    if bg != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, egui::CornerRadius::same(8), bg);
+/// Top-bar language toggle chip: shows both languages side by side ("中文 / English") with the
+/// active one emphasised. Clicking anywhere on the chip switches to the other language. Sits in
+/// the toolbar's right group, left of the status pill.
+fn lang_chip(ui: &mut egui::Ui, theme: UiTheme, lang: Lang) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(96.0, 26.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(7), theme.nav_hover);
     }
-    // Small "A文" mark on the left so the row is visually anchored to the sidebar column.
+    let cy = rect.center().y;
+    let (active, inactive) = (theme.text, theme.muted);
+    let (zh_col, en_col, zh_size, en_size) = if lang == Lang::Zh {
+        (active, inactive, 12.5, 11.5)
+    } else {
+        (inactive, active, 11.5, 12.5)
+    };
     ui.painter().text(
-        pos2(rect.min.x + 14.0, rect.center().y),
+        pos2(rect.min.x + 10.0, cy),
         Align2::LEFT_CENTER,
-        "A文",
-        FontId::proportional(12.0),
-        theme.muted,
+        "中文",
+        FontId::proportional(zh_size),
+        zh_col,
     );
-    // Toggle label (always the *other* language, so it reads as an action).
+    // Hairline separator between the two labels.
+    ui.painter().line_segment(
+        [pos2(rect.center().x, cy - 6.0), pos2(rect.center().x, cy + 6.0)],
+        (1.0, theme.hairline),
+    );
     ui.painter().text(
-        pos2(rect.min.x + 38.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(12.0),
-        theme.text,
+        pos2(rect.max.x - 10.0, cy),
+        Align2::RIGHT_CENTER,
+        "English",
+        FontId::proportional(en_size),
+        en_col,
     );
     resp.clicked()
 }
@@ -1666,11 +1692,29 @@ fn brand_block(ui: &mut egui::Ui, theme: UiTheme) {
 
 // ---- Content-area components -------------------------------------------------------------
 
-/// Page title (28pt semibold) + one-line subtitle — the macOS System Settings heading.
-fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str, theme: UiTheme) {
-    ui.label(egui::RichText::new(title).size(28.0).strong().color(theme.text));
-    ui.add_space(4.0);
-    ui.label(egui::RichText::new(subtitle).size(13.5).color(theme.muted));
+/// Page title (28pt semibold) + one-line subtitle, with an optional trailing area on the right.
+/// The trailing area is the natural home for the language toggle chip — see `lang_chip`.
+fn page_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    subtitle: &str,
+    theme: UiTheme,
+    trailing: impl FnOnce(&mut egui::Ui),
+) {
+    let title_text = title.to_string();
+    let subtitle_text = subtitle.to_string();
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.label(egui::RichText::new(&title_text).size(28.0).strong().color(theme.text));
+            ui.label(egui::RichText::new(&subtitle_text).size(13.5).color(theme.muted));
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Pad from the right content edge so the chip doesn't kiss the card border.
+            ui.add_space(8.0);
+            trailing(ui);
+        });
+    });
     ui.add_space(24.0);
 }
 

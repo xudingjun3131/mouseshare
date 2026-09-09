@@ -68,15 +68,6 @@ impl Lang {
         }
     }
 
-    /// Label shown on the toggle button — always the *other* language,
-    /// so the button reads as an action ("switch to English / 切换到中文").
-    pub fn toggle_label(self) -> &'static str {
-        match self {
-            Lang::Zh => "English",
-            Lang::En => "中文",
-        }
-    }
-
     pub fn toggled(self) -> Lang {
         match self {
             Lang::Zh => Lang::En,
