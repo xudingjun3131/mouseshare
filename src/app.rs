@@ -708,55 +708,6 @@ impl eframe::App for MouseShareApp {
             }
         }
 
-        // ---- Unified toolbar: brand on the left, live status pill on the right ----
-        // With the macOS full-size content view this panel sits *under* the native title bar, so
-        // we clear the traffic-light zone on the left and let the red/yellow/green buttons float
-        // above — the standard Big Sur+ "unified" window look. The old toolbar also carried the
-        // product tagline here; it crowded the brand and is now the page subtitle instead.
-        //
-        // The language toggle lives at the top-right of the toolbar, left of the status pill
-        // (added inside the right_to_left group below). We push the panel content below the
-        // macOS native title bar (≈28pt) with `top: 32`, and keep `right: 50` so the chip and
-        // pill clear the window's rounded corner (≈10pt radius). Earlier attempts used a
-        // tight 14pt top — that placed the chip directly under an opaque title-bar overlay
-        // that swallowed its top half and ate touches. 32pt is enough headroom on every
-        // macOS build we've tested.
-        egui::TopBottomPanel::top("titlebar")
-            .frame(egui::Frame::NONE.fill(theme.toolbar_bg).inner_margin(egui::Margin { left: 0, right: 50, top: 32, bottom: 12 }))
-            .show(ctx, |ui| {
-                let panel_rect = ui.max_rect();
-                ui.horizontal(|ui| {
-                    // Clear the macOS traffic-light cluster (≈78px) so the brand doesn't collide
-                    // with the red/yellow/green buttons. No-op on Windows/Linux.
-                    #[cfg(target_os = "macos")]
-                    ui.add_space(82.0);
-
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new("MouseShare")
-                            .size(13.5)
-                            .strong()
-                            .color(theme.text),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Live connection status pill: coloured dot + short label on a tint.
-                        // (right_to_left: first item painted is the rightmost.)
-                        let (dot_color, status_text, tint) = match &*self.net.lock().unwrap() {
-                            Net::Primary { .. } => (theme.accent, t.conn_primary, theme.accent_tint),
-                            Net::Secondary { .. } => (theme.green, t.conn_connected, theme.green_tint),
-                            Net::Idle => (theme.orange, t.conn_idle, theme.orange_tint),
-                        };
-                        status_pill(ui, dot_color, tint, status_text);
-                    });
-                });
-                // Hairline under the toolbar.
-                ui.painter().line_segment(
-                    [pos2(panel_rect.left(), panel_rect.bottom()), pos2(panel_rect.right(), panel_rect.bottom())],
-                    (1.0, theme.hairline),
-                );
-            });
-
         // ---- Startup failure banner (network error at boot) ----
         let mut retry_clicked = false;
         if self.startup_error.is_some() {
@@ -880,10 +831,13 @@ impl eframe::App for MouseShareApp {
                     }
                 }
 
-                // Bottom-anchored: keep "Quit" pinned to the foot of the rail on tall windows.
+                // Bottom-anchored footer block: status pill, language chip, then Quit — all
+                // pinned to the foot of the rail on tall windows, separated by hairlines.
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     ui.add_space(6.0);
+
+                    // Quit row.
                     if nav_item(ui, theme, false, t.exit_app, NavIcon::Power, None) {
                         if self.config.mode == "primary" {
                             self.config.layout = self.shared_layout.lock().unwrap().clone();
@@ -891,6 +845,41 @@ impl eframe::App for MouseShareApp {
                         }
                         std::process::exit(0);
                     }
+                    ui.add_space(8.0);
+
+                    // Hairline above the lang chip.
+                    let r1 = ui.available_rect_before_wrap();
+                    ui.painter().line_segment(
+                        [pos2(r1.min.x, r1.min.y), pos2(r1.max.x, r1.min.y)],
+                        (1.0, theme.hairline),
+                    );
+                    ui.add_space(8.0);
+
+                    // Language chip row.
+                    if lang_chip(ui, theme, self.lang) {
+                        self.lang = self.lang.toggled();
+                        self.config.lang = self.lang.code().to_string();
+                        crate::i18n::set_lang(self.lang);
+                        save_config(&self.config);
+                    }
+                    ui.add_space(8.0);
+
+                    // Hairline above the status row.
+                    let r2 = ui.available_rect_before_wrap();
+                    ui.painter().line_segment(
+                        [pos2(r2.min.x, r2.min.y), pos2(r2.max.x, r2.min.y)],
+                        (1.0, theme.hairline),
+                    );
+                    ui.add_space(10.0);
+
+                    // Status row: coloured dot + short label on a tint.
+                    let (dot_color, status_text, tint) = match &*self.net.lock().unwrap() {
+                        Net::Primary { .. } => (theme.accent, t.conn_primary, theme.accent_tint),
+                        Net::Secondary { .. } => (theme.green, t.conn_connected, theme.green_tint),
+                        Net::Idle => (theme.orange, t.conn_idle, theme.orange_tint),
+                    };
+                    status_pill(ui, dot_color, tint, status_text);
+                    ui.add_space(4.0);
                 });
             });
 
@@ -971,14 +960,7 @@ impl MouseShareApp {
 
     /// Connection: role (two mode cards), role-specific networking, local screens.
     fn page_connection(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
-        page_header(ui, t.page_connection, t.page_connection_sub, theme, |ui| {
-                if lang_chip(ui, theme, self.lang) {
-                    self.lang = self.lang.toggled();
-                    self.config.lang = self.lang.code().to_string();
-                    crate::i18n::set_lang(self.lang);
-                    save_config(&self.config);
-                }
-            });
+        page_header(ui, t.page_connection, t.page_connection_sub, theme);
 
         // ---- Role: two large mode cards (System Settings "default app" pattern) ----
         // A segmented control fit the label but not the explanation; two cards give room for
@@ -1221,14 +1203,7 @@ impl MouseShareApp {
 
     /// Screen layout: the draggable virtual desktop, plus the machine list.
     fn page_layout(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
-        page_header(ui, t.page_layout, t.page_layout_sub, theme, |ui| {
-                if lang_chip(ui, theme, self.lang) {
-                    self.lang = self.lang.toggled();
-                    self.config.lang = self.lang.code().to_string();
-                    crate::i18n::set_lang(self.lang);
-                    save_config(&self.config);
-                }
-            });
+        page_header(ui, t.page_layout, t.page_layout_sub, theme);
 
         card(ui, theme, |ui| {
             card_header(ui, theme, t.card_canvas, t.card_canvas_sub, |_ui| {});
@@ -1314,14 +1289,7 @@ impl MouseShareApp {
 
     /// Status: live session stats, network peers, and the tail of the diagnostic log.
     fn page_status(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
-        page_header(ui, t.page_status, t.page_status_sub, theme, |ui| {
-                if lang_chip(ui, theme, self.lang) {
-                    self.lang = self.lang.toggled();
-                    self.config.lang = self.lang.code().to_string();
-                    crate::i18n::set_lang(self.lang);
-                    save_config(&self.config);
-                }
-            });
+        page_header(ui, t.page_status, t.page_status_sub, theme);
 
         let peers = self.net.lock().unwrap().peer_count();
         let conn_label = match &*self.net.lock().unwrap() {
@@ -1420,14 +1388,7 @@ impl MouseShareApp {
 
     /// Discovered primaries on the LAN (secondary only) — one click to connect.
     fn page_discovered(&mut self, ui: &mut egui::Ui, t: Tr, theme: UiTheme) {
-        page_header(ui, t.page_discovered, t.page_discovered_sub, theme, |ui| {
-                if lang_chip(ui, theme, self.lang) {
-                    self.lang = self.lang.toggled();
-                    self.config.lang = self.lang.code().to_string();
-                    crate::i18n::set_lang(self.lang);
-                    save_config(&self.config);
-                }
-            });
+        page_header(ui, t.page_discovered, t.page_discovered_sub, theme);
 
         let list = self.discovered.lock().unwrap().clone();
         let mut pick: Option<String> = None;
@@ -1693,42 +1654,28 @@ fn brand_block(ui: &mut egui::Ui, theme: UiTheme) {
 // ---- Content-area components -------------------------------------------------------------
 
 /// Page title (28pt semibold) + one-line subtitle, with an optional trailing area on the right.
-/// The trailing area is the natural home for the language toggle chip — see `lang_chip`.
-fn page_header(
-    ui: &mut egui::Ui,
-    title: &str,
-    subtitle: &str,
-    theme: UiTheme,
-    trailing: impl FnOnce(&mut egui::Ui),
-) {
-    let title_text = title.to_string();
-    let subtitle_text = subtitle.to_string();
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            ui.label(egui::RichText::new(&title_text).size(28.0).strong().color(theme.text));
-            ui.label(egui::RichText::new(&subtitle_text).size(13.5).color(theme.muted));
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Pad from the right content edge so the chip doesn't kiss the card border.
-            ui.add_space(8.0);
-            trailing(ui);
-        });
-    });
-    ui.add_space(24.0);
+/// Page heading: large title + muted subtitle. Trailing widgets (e.g. action buttons) used to
+/// live here; the language toggle has moved to the sidebar footer and other actions live next
+/// to the thing they act on, so this header is just typography now.
+fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str, theme: UiTheme) {
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new(title).size(28.0).strong().color(theme.text));
+    if !subtitle.is_empty() {
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(subtitle).size(13.5).color(theme.muted));
+    }
+    ui.add_space(28.0);
 }
 
-/// A grouped card: white (light) / secondarySystemFill (dark), hairline border, 12pt radius.
-fn card(ui: &mut egui::Ui, theme: UiTheme, body: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(14.0);
-    egui::Frame::NONE
-        .fill(theme.card_bg)
-        .corner_radius(12)
-        .stroke(egui::Stroke::new(1.0, theme.card_stroke))
-        .show(ui, body);
+/// A grouped section: no visible frame, just generous vertical rhythm. Earlier versions drew a
+/// filled rounded card here; the user asked for a flatter look, so sections are now separated
+/// by whitespace and typography rather than borders.
+fn card(ui: &mut egui::Ui, _theme: UiTheme, body: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(20.0);
+    body(ui);
 }
 
-/// Card header: 14pt semibold title + 11.5pt subtitle, with optional trailing actions.
+/// Section title: 16pt semibold, with a muted 12pt subtitle underneath.
 fn card_header(
     ui: &mut egui::Ui,
     theme: UiTheme,
@@ -1736,48 +1683,34 @@ fn card_header(
     subtitle: &str,
     action: impl FnOnce(&mut egui::Ui),
 ) {
-    egui::Frame::NONE
-        .inner_margin(egui::Margin { left: 24, right: 24, top: 18, bottom: 8 })
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(
-                        egui::RichText::new(title).size(14.0).strong().color(theme.text),
-                    );
-                    if !subtitle.is_empty() {
-                        ui.label(
-                            egui::RichText::new(subtitle).size(11.5).color(theme.muted),
-                        );
-                    }
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    action(ui);
-                });
-            });
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(
+                egui::RichText::new(title).size(16.0).strong().color(theme.text),
+            );
+            if !subtitle.is_empty() {
+                ui.label(
+                    egui::RichText::new(subtitle).size(12.0).color(theme.muted),
+                );
+            }
         });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            action(ui);
+        });
+    });
+    ui.add_space(14.0);
 }
 
-/// Card body: standard 24px horizontal padding, more vertical breathing room.
+/// Section body: standard 4px horizontal padding, roomy vertical breathing room.
 fn card_body(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::NONE
-        .inner_margin(egui::Margin { left: 24, right: 24, top: 12, bottom: 22 })
-        .show(ui, body);
+    body(ui);
+    ui.add_space(16.0);
 }
 
-/// Card footer for the action buttons, separated from the body by the row rhythm.
-fn card_footer(ui: &mut egui::Ui, theme: UiTheme, body: impl FnOnce(&mut egui::Ui)) {
-    let r = egui::Frame::NONE
-        .inner_margin(egui::Margin { left: 24, right: 24, top: 4, bottom: 18 })
-        .show(ui, |ui| {
-            ui.horizontal(body);
-        })
-        .response
-        .rect;
-    ui.painter().line_segment(
-        [pos2(r.min.x, r.min.y - 4.0), pos2(r.max.x, r.min.y - 4.0)],
-        (1.0, theme.divider),
-    );
+/// Footer area for actions — same treatment as body, no top divider.
+fn card_footer(ui: &mut egui::Ui, _theme: UiTheme, body: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(body);
 }
 
 /// A settings row: 110px label column, then the control, with an optional hairline below.
