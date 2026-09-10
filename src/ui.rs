@@ -609,6 +609,60 @@ pub fn dot_grid(painter: &egui::Painter, rect: Rect, color: Color32) {
     }
 }
 
+/// Identity colours for the machines that are *not* this one and *not* the primary.
+///
+/// Slot `n` belongs to the `n`-th entry of [`crate::layout::Layout::peer_slots`]. The list is
+/// deliberately colourful rather than a ramp of one hue: the question the canvas exists to answer
+/// — "which tile is which computer?" — cannot be answered by any monochrome scheme, and a ramp of
+/// greys (what this replaced) made every peer look like the same machine.
+///
+/// Three properties are load-bearing:
+///
+/// * **No blue.** The accent *means* "this machine" everywhere else in the UI, so a peer in the
+///   accent's hue would be read as a second copy of yourself the moment the sidebar lists reuse
+///   these colours — which they do.
+/// * **Mid-tone, with a darker bottom stop.** The tiles have to work as a gradient in both
+///   appearances and hold white caption text over a black scrim, on top of a light or a dark card.
+/// * **Far apart in hue.** Adjacent slots are at least ~35° apart on the wheel in the regions that
+///   are free of the accent, because the whole point is telling neighbours apart at a glance on a
+///   tile that may be 40 pt wide. Two of them land near the semantic green/orange/red, which is
+///   acceptable: those appear as small dots and pills with text next to them, never as a surface.
+///
+/// More peers than slots wrap around; at that point two machines share a hue and the name printed
+/// on each tile is the discriminator. Seven machines is already far past any real KVM.
+const PEER_PALETTE: [(Color32, Color32); 7] = [
+    // teal        green        olive
+    (
+        Color32::from_rgb(36, 158, 152),
+        Color32::from_rgb(14, 114, 110),
+    ),
+    (
+        Color32::from_rgb(84, 166, 84),
+        Color32::from_rgb(50, 124, 52),
+    ),
+    (
+        Color32::from_rgb(146, 172, 56),
+        Color32::from_rgb(104, 124, 28),
+    ),
+    // amber       terracotta   magenta      violet
+    (
+        Color32::from_rgb(214, 146, 44),
+        Color32::from_rgb(166, 104, 16),
+    ),
+    (
+        Color32::from_rgb(186, 94, 74),
+        Color32::from_rgb(146, 62, 46),
+    ),
+    (
+        Color32::from_rgb(198, 88, 148),
+        Color32::from_rgb(152, 54, 108),
+    ),
+    (
+        Color32::from_rgb(142, 108, 212),
+        Color32::from_rgb(104, 72, 176),
+    ),
+];
+
 /// Gradient endpoints for a screen tile, keyed by role.
 ///
 /// `is_hub` marks the panels of the machine acting as primary (`Screen::is_local`, which the hub
@@ -618,14 +672,102 @@ pub fn dot_grid(painter: &egui::Painter, rect: Rect, color: Color32) {
 /// with several monitors, where *every* panel is `is_mine`.
 ///
 /// `is_mine` wins, because "which tile is my computer" is the question the canvas has to answer
-/// first; telling the hub apart is the fallback that keeps the remaining greys readable.
-pub fn tile_colors(is_hub: bool, is_mine: bool) -> (Color32, Color32) {
+/// first. The primary comes second and keeps a reserved neutral, so it is never mistaken for one
+/// of the peers and never collides with the palette. Everything else is a peer, and peers are told
+/// apart by hue — `slot` is that machine's place in [`crate::layout::Layout::peer_slots`], and is
+/// ignored (though it is still passed, for a single call shape) by the two reserved roles.
+pub fn tile_colors(is_hub: bool, is_mine: bool, slot: usize) -> (Color32, Color32) {
     if is_mine {
         (Color32::from_rgb(64, 156, 255), Color32::from_rgb(0, 106, 224))
     } else if is_hub {
         (Color32::from_rgb(120, 130, 150), Color32::from_rgb(84, 94, 112))
     } else {
-        (Color32::from_rgb(146, 156, 176), Color32::from_rgb(108, 118, 138))
+        PEER_PALETTE[slot % PEER_PALETTE.len()]
+    }
+}
+
+/// One machine's identity colour as a single value — the tile gradient's top stop, or the reserved
+/// colour of "mine" / the primary.
+///
+/// The sidebar lists draw a machine name next to a small chip; tinting that chip with the same
+/// value as the tile on the canvas is what turns the colour into a *label* you can use, instead of
+/// a decoration that means something only in the one place it is drawn.
+pub fn machine_tint(is_hub: bool, is_mine: bool, slot: usize) -> Color32 {
+    tile_colors(is_hub, is_mine, slot).0
+}
+
+// ---------------------------------------------------------------------------------------------
+// Palette tests
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole reason the palette exists: seven peers, seven different colours. Two machines
+    /// sharing a hue is the bug this replaced ("three clients, all grey") wearing a disguise.
+    #[test]
+    fn every_peer_slot_looks_different() {
+        let tops: Vec<Color32> = (0..PEER_PALETTE.len())
+            .map(|i| tile_colors(false, false, i).0)
+            .collect();
+        for (i, a) in tops.iter().enumerate() {
+            for b in tops.iter().skip(i + 1) {
+                assert_ne!(a, b, "slots {i} and a later slot share a colour");
+            }
+        }
+    }
+
+    /// The reserved roles must not be reachable from the peer palette — otherwise "this machine"
+    /// or "the primary" stops being recognisable, which is what they are for.
+    #[test]
+    fn peer_colours_stay_clear_of_the_reserved_ones() {
+        let mine = tile_colors(false, true, 0);
+        let hub = tile_colors(true, false, 0);
+        for i in 0..PEER_PALETTE.len() {
+            assert_ne!(tile_colors(false, false, i), mine);
+            assert_ne!(tile_colors(false, false, i), hub);
+        }
+        assert_ne!(mine, hub);
+    }
+
+    /// The roles outrank the slot: a machine's own panel is the accent and the primary's is the
+    /// neutral *whatever* slot it happens to occupy, which is what makes the mapping total.
+    #[test]
+    fn the_reserved_roles_ignore_the_slot() {
+        assert_eq!(tile_colors(false, true, 0), tile_colors(false, true, 5));
+        assert_eq!(tile_colors(true, false, 0), tile_colors(true, false, 5));
+        // And "mine" outranks the primary, which is the case of the hub looking at itself.
+        assert_eq!(tile_colors(true, true, 3), tile_colors(false, true, 3));
+    }
+
+    /// Past the end of the palette a peer repeats a hue rather than panicking — a KVM with more
+    /// than eight machines is a thought experiment, but an index out of bounds in the paint pass
+    /// is a crash.
+    #[test]
+    fn slots_wrap_instead_of_panicking() {
+        assert_eq!(
+            tile_colors(false, false, PEER_PALETTE.len()),
+            tile_colors(false, false, 0)
+        );
+        assert_eq!(
+            tile_colors(false, false, PEER_PALETTE.len() * 3 + 2),
+            tile_colors(false, false, 2)
+        );
+    }
+
+    /// The three roles are mutually distinguishable, and the tint the sidebar lists use is the
+    /// tile's own colour rather than something adjacent to it.
+    #[test]
+    fn the_list_chip_agrees_with_the_tile() {
+        for slot in 0..PEER_PALETTE.len() + 1 {
+            assert_eq!(
+                machine_tint(false, false, slot),
+                tile_colors(false, false, slot).0
+            );
+        }
+        assert_eq!(machine_tint(false, true, 0), tile_colors(false, true, 0).0);
+        assert_eq!(machine_tint(true, false, 0), tile_colors(true, false, 0).0);
     }
 }
 

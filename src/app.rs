@@ -796,17 +796,23 @@ impl MouseShareApp {
                     return;
                 }
                 let removable = layout.screens.len() > 1;
+                let slots = layout.peer_slots();
                 for (i, s) in layout.screens.iter().enumerate() {
                     let meta = screen_meta(s);
                     ui::list_row(
                         ui,
                         &theme,
                         Icon::Monitor,
-                        if s.is_local {
-                            theme.accent
-                        } else {
-                            theme.muted
-                        },
+                        // The chip carries the machine's identity colour — the same one its tile
+                        // has on the canvas above, so the list and the layout can be read against
+                        // each other. Which screen is the primary is still legible: it is the
+                        // accent on the hub, the reserved neutral on a client, and the one row
+                        // without a delete button.
+                        ui::machine_tint(
+                            s.is_local,
+                            s.host() == self.my_name,
+                            peer_slot(&slots, s.host()),
+                        ),
                         &s.name,
                         &meta,
                         |ui| {
@@ -909,14 +915,40 @@ impl MouseShareApp {
                 ui::empty_note(ui, &theme, t.screens_empty);
                 return;
             }
+            let slots = layout.peer_slots();
             for s in layout.screens.iter() {
                 let meta = screen_meta(s);
-                let live = s.name == self.my_name || s.is_local;
+                // Present right now. The machine this instance runs on always is, and the hub's own
+                // screens are (its panels are what the canvas is drawn in). A *peer* is present
+                // while the primary still has its connection registered — which is also what makes
+                // a screen left behind by a machine that has gone read as offline, instead of
+                // staying online forever. `has_peer` answers only on the hub; on a client every
+                // other peer therefore reads as offline, which is what it did before and is the
+                // honest answer given a client is never told who else is connected.
+                //
+                // Keyed on the *machine*: `s.name == my_name` matched only the first monitor of a
+                // two-monitor machine, so a client's own second display showed as offline.
+                let live = s.host() == self.my_name
+                    || s.is_local
+                    || self.net.lock().unwrap().has_peer(s.host());
+                // The chip is the machine's identity colour, matching its tile on the canvas;
+                // liveness stays where it is legible in words — the badge. A machine that is not
+                // live keeps its hue but is pulled towards the muted grey, so the colour still
+                // identifies it without claiming it is here.
+                let tint = ui::machine_tint(
+                    s.is_local,
+                    s.host() == self.my_name,
+                    peer_slot(&slots, s.host()),
+                );
                 ui::list_row(
                     ui,
                     &theme,
                     Icon::Monitor,
-                    if live { theme.green } else { theme.muted },
+                    if live {
+                        tint
+                    } else {
+                        ui::mix(tint, theme.faint, 0.55)
+                    },
                     &s.name,
                     &meta,
                     |ui| {
@@ -1259,6 +1291,10 @@ fn draw_layout(
     }
 
     // ---- Paint pass.
+    // One slot table for the whole frame, built *after* the apply pass so it describes the layout
+    // that is about to be drawn. It is the same table on every machine (see `Layout::peer_slots`),
+    // which is what makes a colour mean the same thing on the hub and on a client.
+    let slots = layout.peer_slots();
     let mut dragged: Option<usize> = None;
     for (i, s) in layout.screens.iter().enumerate() {
         let rect = tile_rect(s, offx, offy, scale);
@@ -1273,7 +1309,7 @@ fn draw_layout(
         let is_hub = s.is_local;
         let resp = &responses[i];
         let hover = resp.hovered() || resp.dragged();
-        let (top, bottom) = ui::tile_colors(is_hub, is_mine);
+        let (top, bottom) = tile_palette(s, my_name, &slots);
         // A dragged tile is deferred to the end of the loop so it floats above the others
         // instead of sliding underneath them.
         if resp.dragged() {
@@ -1309,7 +1345,7 @@ fn draw_layout(
     if let Some(i) = dragged {
         let s = &layout.screens[i];
         let is_mine = s.host() == my_name;
-        let (top, bottom) = ui::tile_colors(s.is_local, is_mine);
+        let (top, bottom) = tile_palette(s, my_name, &slots);
         let rect = tile_rect(s, offx, offy, scale);
         ui::soft_shadow(ui.painter(), rect, 16.0, theme.shadow, 2.0);
         paint_tile(
@@ -1358,6 +1394,32 @@ fn draw_layout(
 
     let _ = t;
     changed
+}
+
+/// The colours of one screen tile, as seen from this instance.
+///
+/// Three roles, decided in this order: the machine running this instance (the accent), the primary
+/// (a reserved neutral), everybody else (that machine's own slot in the peer palette). The slot is
+/// looked up rather than passed in, so the canvas, the layout list and the client list cannot
+/// disagree about which colour a machine is — they all call this.
+fn tile_palette(
+    s: &crate::layout::Screen,
+    my_name: &str,
+    slots: &[(&str, usize)],
+) -> (Color32, Color32) {
+    let is_mine = s.host() == my_name;
+    ui::tile_colors(s.is_local, is_mine, peer_slot(slots, s.host()))
+}
+
+/// The palette slot a machine owns.
+///
+/// `0` for a machine that is not in the list — one with a reserved colour (the roles ignore the
+/// slot anyway) or a stale panel of a peer that has left.
+fn peer_slot(slots: &[(&str, usize)], host: &str) -> usize {
+    slots
+        .iter()
+        .find(|(h, _)| *h == host)
+        .map_or(0, |(_, slot)| *slot)
 }
 
 /// Where one panel's tile lands on the canvas, in screen coordinates.
@@ -1863,5 +1925,87 @@ mod tests {
         assert_eq!(at("pc"), (920, 250));
         assert_eq!(at("pc #2"), (2840, 250), "the sibling moves with it");
         assert_eq!(at("other"), (5760, 0), "another machine is untouched");
+    }
+
+    /// A panel of `host` — the multi-monitor case, where the panel name and the machine name differ.
+    fn screen_on(host: &str, name: &str, ox: i32, oy: i32) -> Screen {
+        Screen {
+            host: host.into(),
+            ..screen(name, ox, oy, 1920, 1080)
+        }
+    }
+
+    /// Three machines, two of them with two monitors each — the case that made "every peer is the
+    /// same grey tile" obvious. A peer's colour has to be identical whichever machine is looking,
+    /// because the canvas is the *shared* layout: a colour that means one machine on the hub and
+    /// another on a client is worse than no colour at all.
+    ///
+    /// What legitimately differs per viewer is only the two reserved roles — the accent belongs to
+    /// whoever is looking, and the primary is the primary on everyone's screen.
+    #[test]
+    fn a_peer_keeps_its_colour_whichever_machine_is_looking() {
+        let l = Layout {
+            screens: vec![
+                Screen {
+                    is_local: true,
+                    ..screen_on("air", "air", 0, 0)
+                },
+                Screen {
+                    is_local: true,
+                    ..screen_on("air", "air #2", 1920, -124)
+                },
+                screen_on("pc", "pc", 3840, 0),
+                screen_on("pc", "pc #2", 5760, 0),
+                screen_on("work", "work", 7680, 0),
+            ],
+        };
+        // The tile colours a machine would paint, as `(panel name, top colour)`.
+        let seen_from = |viewer: &str| -> Vec<(String, Color32)> {
+            let slots = l.peer_slots();
+            l.screens
+                .iter()
+                .map(|s| (s.name.clone(), tile_palette(s, viewer, &slots).0))
+                .collect()
+        };
+        let color = |view: &[(String, Color32)], panel: &str| {
+            view.iter().find(|(n, _)| n == panel).unwrap().1
+        };
+
+        let from_hub = seen_from("air");
+        for viewer in ["air", "pc", "work"] {
+            let theirs = seen_from(viewer);
+            for s in l.screens.iter() {
+                // Skip the two roles that are decided by *who is looking*.
+                if s.host() == viewer || s.host() == "air" {
+                    continue;
+                }
+                assert_eq!(
+                    color(&theirs, &s.name),
+                    color(&from_hub, &s.name),
+                    "{} sees {} (of {}) in a different colour",
+                    viewer,
+                    s.name,
+                    s.host()
+                );
+            }
+        }
+
+        // Distinct machines, distinct colours — and one machine's two monitors share one colour.
+        assert_ne!(color(&from_hub, "pc"), color(&from_hub, "work"));
+        assert_eq!(color(&from_hub, "pc"), color(&from_hub, "pc #2"));
+
+        // The roles switch with the viewer, and never collide with a peer colour.
+        assert_eq!(color(&from_hub, "air"), ui::tile_colors(false, true, 0).0);
+        let from_pc = seen_from("pc");
+        assert_eq!(
+            color(&from_pc, "pc"),
+            ui::tile_colors(false, true, 0).0,
+            "a client's own tile is the accent"
+        );
+        assert_eq!(
+            color(&from_pc, "air"),
+            ui::tile_colors(true, false, 0).0,
+            "and the primary keeps its reserved neutral on a client"
+        );
     }
 }

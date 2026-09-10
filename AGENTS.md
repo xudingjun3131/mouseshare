@@ -133,6 +133,14 @@ cargo fmt
 17. **panel 偏移由 `main::hello_panels` 归一化到本机包围盒原点（min 恒为 0）。**
     `ensure_host` 的锚点算术依赖这一点。别在别处构造 `PanelSpec` 而绕过它；`ensure_host` 里已经做了防御性减法，但语义上仍以"min=0"为准。
 
+18. **对端（既不是本机、也不是主机）的颜色由 `Layout::peer_slots` 统一分配，不能各处自己算。**
+    它只决定"哪台机器是哪个槽"，颜色由 `ui::tile_colors` 查 `PEER_PALETTE`。三条规则都和直觉写法相反：**按机器名排序**而不是布局顺序（`screens` 是连接顺序，两台机器很可能不同，否则同一台对端在主机上是绿的在副机上是蓝的）；**每台机器一个槽**而不是每块屏（否则一台双屏机在画布上看起来像两台电脑，且后面所有对端串位）；**主机不占槽**（它有保留色，占槽等于白烧一个色板位）。返回的表**与观察者无关**——本机自己也在表里（副机看自己是"对端之一"），它那一格只是不显示，这正是其它机器槽位能对齐的原因。accent 蓝 = 本机，是保留语义，不在 `PEER_PALETTE` 里。
+
+19. **「在线/离线」的判据是 `Net::has_peer(host)`，不是 `s.name == my_name || s.is_local`。**
+    老写法让**已连接的副机显示「离线」**（只有本机和主机算在线）。`has_peer` 只有主机能回答——它拥有连接表；副机只知道"自己和主机"，布局里还可能留着已离开机器的残屏，所以在副机上其余对端一律「离线」是诚实的答案，不是 bug。另外判据按 `host` 而不是 `name`，否则双屏机器只算第一块（同第 13 条）。
+
+20. **一个 chip / 一个色块只承担一件事。** 侧栏列表的 chip 颜色 = 画布上那台机器的颜色（`ui::machine_tint`，离线时向灰压 55%），身份用**颜色**；在线状态用**文字徽标**。两者不要用一个字段同时表达——`live` 曾经既当颜色又当徽标，结果一处判错两处都错。
+
 ---
 
 ## 6. 运行期路径
@@ -178,10 +186,12 @@ cargo fmt
 # 5. 清脚手架：确认没有临时开关/调试分支混进发布
 grep -rn "TEMP-PROBE\|TEMP-DEV\|MS_DEV\|LANG-BTN" src/    # 必须为空
 
-# 6. 提交 + 打 tag + 推 —— 两个都要推
+# 6. 提交 + 打 tag + 推 —— 两个都要推，但 tag 要**点名**
 git commit -m "vX.Y.Z: ..."
 git tag -a vX.Y.Z -m "vX.Y.Z — ..."
-git push origin main --tags          # 只 push main 会漏 tag，历史上真的漏过
+git push origin main && git push origin vX.Y.Z
+# 别用 `git push origin main --tags`：它会把**所有**本地陈旧的 tag 一起发布。
+# v0.9.1 就是这么误发了一个 2026-09-10 才上线的 v0.7.1 Release。
 
 # 7. 验证 CI：三平台全绿 + Release 5 个资产
 #    mouseshare-linux.tar.gz / mouseshare-linux.deb /

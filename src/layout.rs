@@ -154,6 +154,46 @@ impl Layout {
         Some((b.0 as i32, b.1 as i32))
     }
 
+    /// Every machine in the layout that is **not** the primary, with the colour slot it owns.
+    ///
+    /// This is the single source of truth for "which colour is that machine", and it has to give
+    /// the same answer on every machine in the LAN — otherwise the canvas contradicts itself and a
+    /// colour stops being something you can point at. Three rules follow from that, and each one is
+    /// the opposite of the obvious implementation:
+    ///
+    /// * **Sorted by name, not by layout position.** The layout is broadcast, so the *set* of peers
+    ///   is shared, but `screens` order is connection order — two clients that joined in a
+    ///   different sequence would otherwise colour the same peer differently.
+    /// * **One slot per machine, not per panel.** A two-monitor peer is two tiles and one colour;
+    ///   keying on the screen would make its own two monitors look like two different computers.
+    /// * **The primary is excluded, not skipped.** It has a reserved colour ([`crate::ui::tile_colors`]),
+    ///   so leaving it *in* the list would burn a slot on a machine that never uses one and shift
+    ///   every later peer's colour. The machine this instance runs on stays in the list even though
+    ///   it also has a reserved colour, because whether *it* is a peer depends on who is looking:
+    ///   a client sees itself here and the hub does not. Keeping the list viewer-independent is
+    ///   exactly what makes the other machines' slots line up across the LAN.
+    pub fn peer_slots(&self) -> Vec<(&str, usize)> {
+        let hub: Vec<&str> = self
+            .screens
+            .iter()
+            .filter(|s| s.is_local)
+            .map(|s| s.host())
+            .collect();
+        let mut hosts: Vec<&str> = self
+            .screens
+            .iter()
+            .map(|s| s.host())
+            .filter(|h| !hub.contains(h))
+            .collect();
+        hosts.sort_unstable();
+        hosts.dedup();
+        hosts
+            .into_iter()
+            .enumerate()
+            .map(|(slot, host)| (host, slot))
+            .collect()
+    }
+
     /// Index of the screen that contains the point, if any.
     pub fn screen_at(&self, x: f64, y: f64) -> Option<usize> {
         self.screens.iter().position(|s| s.contains(x, y))
@@ -639,5 +679,99 @@ mod tests {
             (2560, 1440, 2.0),
             "geometry is refreshed"
         );
+    }
+
+    fn remote(host: &str, name: &str) -> Screen {
+        Screen {
+            name: name.into(),
+            host: host.into(),
+            ox: 0,
+            oy: 0,
+            w: 1920,
+            h: 1080,
+            is_local: false,
+            scale: 1.0,
+        }
+    }
+
+    /// The machine-and-slot table the canvas colours from — one slot per machine, in a canonical
+    /// order, with the primary left out (it has a colour of its own).
+    #[test]
+    fn peer_slots_give_every_machine_one_slot_in_name_order() {
+        let l = Layout {
+            screens: vec![
+                local("hub", 0, 1920),
+                remote("zulu", "zulu"),
+                remote("alpha", "alpha"),
+                remote("mike", "mike"),
+            ],
+        };
+        assert_eq!(l.peer_slots(), [("alpha", 0), ("mike", 1), ("zulu", 2)]);
+    }
+
+    /// `screens` is in connection order, which is not the same on every machine in the LAN. The
+    /// slot has to be, or the same peer would be one colour on the hub and another on a client.
+    #[test]
+    fn peer_slots_ignore_the_order_screens_arrived_in() {
+        let before = Layout {
+            screens: vec![local("hub", 0, 1920), remote("b", "b"), remote("a", "a")],
+        };
+        let after = Layout {
+            screens: vec![remote("a", "a"), remote("b", "b"), local("hub", 0, 1920)],
+        };
+        assert_eq!(before.peer_slots(), after.peer_slots());
+    }
+
+    /// Two monitors of one machine are two tiles and *one* colour: keying on the screen instead of
+    /// the machine would make a peer's own two displays look like two different computers, and
+    /// would push every later machine down a slot.
+    #[test]
+    fn a_multi_monitor_machine_takes_one_slot() {
+        let l = Layout {
+            screens: vec![
+                local("hub", 0, 1920),
+                remote("pc", "pc"),
+                remote("pc", "pc #2"),
+                remote("mac", "mac"),
+            ],
+        };
+        assert_eq!(l.peer_slots(), [("mac", 0), ("pc", 1)]);
+    }
+
+    /// The primary never takes a slot. Leaving it in would burn a palette entry on a machine that
+    /// shows one of the two reserved colours anyway, and shift every peer after it.
+    #[test]
+    fn the_primary_never_takes_a_peer_slot() {
+        let l = Layout {
+            screens: vec![
+                local("hub", 0, 1920),
+                local("hub", 1920, 1920),
+                remote("a", "a"),
+                remote("b", "b"),
+            ],
+        };
+        assert_eq!(l.peer_slots(), [("a", 0), ("b", 1)]);
+    }
+
+    /// A config written before `Screen::host` existed has an empty `host`, so a `"pc #2"` panel
+    /// falls back to its *panel* name and would claim a machine of its own. Normalisation happens
+    /// on load; this pins the consequence at the palette, where it would be visible.
+    #[test]
+    fn peer_slots_follow_host_not_panel_name() {
+        let mut l = Layout {
+            screens: vec![
+                local("hub", 0, 1920),
+                Screen {
+                    host: String::new(),
+                    ..remote("", "pc")
+                },
+                Screen {
+                    host: String::new(),
+                    ..remote("", "pc #2")
+                },
+            ],
+        };
+        l.normalize_hosts();
+        assert_eq!(l.peer_slots(), [("pc", 0)]);
     }
 }
