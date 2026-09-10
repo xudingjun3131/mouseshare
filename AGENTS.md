@@ -118,6 +118,21 @@ cargo fmt
 12. **`Screen.host` + `RemoteCtrl.panel` 的两级路由不能塌缩成按屏幕名路由。**
     一台多显示器机器在布局里是多块 panel；从哪块屏、哪条边返回必须靠 `panel` 决定，按 bbox 猜会在死区误判。
 
+13. **「我的机器」的判据是 `Screen::host() == my_name`，不是 `s.name == my_name`，也不是 `s.is_local`。**
+    一台机器的第二块屏叫 `<machine> #2`（`main::name_panels`），所以 `name == my_name` 只命中第一块（v0.9.1 修的就是这个）；而 `is_local` 的含义随角色变化——布局是主机广播的，副机拿到的那份里 `is_local=true` 的是**主机**的屏。`host` 在两台机器上都表示"这块 panel 属于哪台机器"，是唯一稳的判据。
+
+14. **panel 名必须唯一，且「主屏」独占裸机器名。**
+    两块屏同名 = egui 里两个 tile 共用一个交互 id（拖一个会带动另一个）+ 一块屏宣称属于一台不存在的机器（`host()` 回退到 `name`）+ 副机 `crossing_back` 按名查 panel 时产生歧义。命名在 `main::name_panels`，判据是 OS 的主屏**而不是排序第一个**（外接屏在左/上时会排到前面）。
+
+15. **拖动一个 tile 必须移动整台机器（`Layout::move_host`）。**
+    机器内部的排布是那台机器自己 OS 的事实，不是主机能决定的；只移一块会把机器在画布上撕成两半，并让穿越几何与两端都不符。本机屏不可拖（位置由系统决定）。
+
+16. **文件传输 token 必须跨机唯一。**
+    主机用**一个** `Receiver` 按 token 收所有对端的传输，且中转的包保留原发送方的 token。每个进程各自从 1 计数会让两台机器同时复制时撞到同一个 token（第二个 `begin` 会接管第一个的目录和进行中状态）。`transfer::set_machine_name(&my_name)` 必须在启动时调用，token 高位是机器名哈希。
+
+17. **panel 偏移由 `main::hello_panels` 归一化到本机包围盒原点（min 恒为 0）。**
+    `ensure_host` 的锚点算术依赖这一点。别在别处构造 `PanelSpec` 而绕过它；`ensure_host` 里已经做了防御性减法，但语义上仍以"min=0"为准。
+
 ---
 
 ## 6. 运行期路径
