@@ -235,6 +235,15 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
             let l: &Layout = &snap;
             match mode {
                 CaptureMode::Local => {
+                    // Publish where the real cursor is. The canvas draws it (and the layout page
+                    // tells the user the orange dot *is* the live position), so it has to be
+                    // refreshed on every motion. It used to be written only when control came back,
+                    // which left the dot frozen at the origin until the first crossing — reading as
+                    // "the layout does not match my screens" even when it did. Free to do here:
+                    // this branch already holds the `ctrl` lock and already has the coordinates.
+                    if let Some(loc) = location {
+                        c.last_real = loc;
+                    }
                     if let Some(t) = c.cooldown_until {
                         if std::time::Instant::now() < t {
                             return false;

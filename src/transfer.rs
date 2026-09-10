@@ -10,8 +10,15 @@
 //! FileEnd        { token }            -- reassembly is complete
 //! ```
 //!
-//! `token` makes concurrent copies from different machines independent, and `seq` lets the
-//! receiver drop a chunk that arrived out of order rather than silently corrupting a file.
+//! `token` makes concurrent copies independent, and `seq` lets the receiver drop a chunk that
+//! arrived out of order rather than silently corrupting a file.
+//!
+//! The token has to be unique across the whole LAN, not merely within one process. The hub funnels
+//! every peer's transfers through a *single* [`Receiver`] keyed by token, and a relayed copy keeps
+//! its sender's token — so if each machine numbered its copies from 1, the second machine's first
+//! copy would land on the first machine's token, take over its inbox directory and replace the
+//! in-flight `Transfer` state. [`set_machine_name`] mixes a hash of the machine name into the high
+//! half of every token to make that impossible.
 
 use crate::network::Net;
 use crate::protocol::{FileEntry, Message, FILE_CHUNK, MAX_FILE_BYTES};
@@ -19,14 +26,37 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+/// High 32 bits of every token: a hash of this machine's name. Zero until [`set_machine_name`] is
+/// called, which `main` does at startup.
+static MACHINE_TAG: AtomicU32 = AtomicU32::new(0);
+
+/// Tell the transfer layer which machine it is, so its transfer tokens cannot collide with another
+/// machine's. Must be called before the first copy is sent.
+pub fn set_machine_name(name: &str) {
+    MACHINE_TAG.store(fnv1a32(name), Ordering::Relaxed);
+}
+
+/// FNV-1a. Any stable hash will do — it only needs to spread machine names apart, not resist
+/// attack, and it must not depend on `RandomState` (which differs per process and so would defeat
+/// the point).
+fn fnv1a32(s: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in s.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
 fn next_token() -> u64 {
-    NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
+    let seq = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed) & 0xFFFF_FFFF;
+    ((MACHINE_TAG.load(Ordering::Relaxed) as u64) << 32) | seq
 }
 
 /// Where a received copy is reassembled. Kept outside the app's config directory so a huge
@@ -786,5 +816,36 @@ mod tests {
         );
         assert_eq!(std::fs::metadata(&out[0]).unwrap().len(), 0);
         let _ = std::fs::remove_dir_all(inbox_root().join(token.to_string()));
+    }
+
+    /// A token must be unique across the LAN, not just within one process. The hub funnels every
+    /// peer's transfers through one `Receiver` keyed by token and relayed copies keep the sender's
+    /// token, so if each machine counted from 1 then two machines starting a copy at the same time
+    /// would both pick token 1: the second `begin` would take over the first's inbox directory and
+    /// replace its in-flight state, and chunks from the two files would interleave.
+    #[test]
+    fn tokens_are_namespaced_per_machine() {
+        set_machine_name("machine-a");
+        let a: Vec<u64> = (0..4).map(|_| next_token()).collect();
+        set_machine_name("machine-b");
+        let b: Vec<u64> = (0..4).map(|_| next_token()).collect();
+
+        for x in &a {
+            for y in &b {
+                assert_ne!(x, y, "token {x} collides across machines");
+            }
+        }
+        // Still a monotonic sequence within one machine, so ordering is preserved.
+        assert!(a[0] < a[1] && a[1] < a[2] && a[2] < a[3]);
+        assert!(b[0] < b[1]);
+        // The machine half is what separates them, and it is a real signature of the name.
+        assert_ne!(a[0] >> 32, b[0] >> 32);
+        assert_eq!(a[0] >> 32, fnv1a32("machine-a") as u64);
+        // A different name gives a different tag, so the namespace is not accidental.
+        set_machine_name("machine-c");
+        assert_ne!(next_token() >> 32, a[0] >> 32);
+
+        // Leave a defined tag behind: `main` always sets one before any copy is sent.
+        set_machine_name("machine-a");
     }
 }

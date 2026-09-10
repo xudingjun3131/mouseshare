@@ -610,10 +610,19 @@ pub fn dot_grid(painter: &egui::Painter, rect: Rect, color: Color32) {
 }
 
 /// Gradient endpoints for a screen tile, keyed by role.
-pub fn tile_colors(is_primary: bool, is_me: bool) -> (Color32, Color32) {
-    if is_me {
+///
+/// `is_hub` marks the panels of the machine acting as primary (`Screen::is_local`, which the hub
+/// sets and the broadcast layout preserves, so it means the same thing on every machine);
+/// `is_mine` marks the panels of the machine *running this instance* (`Screen::host() == my_name`).
+/// The two differ on a client — its own display is `is_mine` but not `is_hub` — and on a machine
+/// with several monitors, where *every* panel is `is_mine`.
+///
+/// `is_mine` wins, because "which tile is my computer" is the question the canvas has to answer
+/// first; telling the hub apart is the fallback that keeps the remaining greys readable.
+pub fn tile_colors(is_hub: bool, is_mine: bool) -> (Color32, Color32) {
+    if is_mine {
         (Color32::from_rgb(64, 156, 255), Color32::from_rgb(0, 106, 224))
-    } else if is_primary {
+    } else if is_hub {
         (Color32::from_rgb(120, 130, 150), Color32::from_rgb(84, 94, 112))
     } else {
         (Color32::from_rgb(146, 156, 176), Color32::from_rgb(108, 118, 138))

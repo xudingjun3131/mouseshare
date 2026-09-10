@@ -18,7 +18,7 @@ use crate::layout::{Layout, Screen};
 use crate::network::{connect_client, Net};
 use crate::protocol::Message;
 use crate::ui::{self, Btn, Icon, Theme};
-use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Rect, Sense};
+use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Pos2, Rect, Sense};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -873,7 +873,10 @@ impl MouseShareApp {
                 );
                 ui.set_clip_rect(rect);
 
-                let cur = self.ctrl.lock().unwrap().last_real;
+                // Only the hub knows a cursor position in the coordinate space the canvas draws
+                // (see `draw_layout`); a client's own position belongs to its own desktop.
+                let cur =
+                    (self.config.mode == "primary").then(|| self.ctrl.lock().unwrap().last_real);
                 let mut layout = self.shared_layout.lock().unwrap();
                 if layout.screens.is_empty() {
                     layout.screens.push(crate::layout::Screen {
@@ -1130,7 +1133,7 @@ fn draw_layout(
     t: Tr,
     theme: Theme,
     canvas_rect: Rect,
-    cur: (f64, f64),
+    cur: Option<(f64, f64)>,
 ) -> bool {
     let mut changed = false;
     // The caller has already reserved the exact rectangle left in the central panel after the
@@ -1172,19 +1175,17 @@ fn draw_layout(
     // Canvas texture: a faint dot grid so the empty area reads as a surface, not a void.
     ui::dot_grid(ui.painter(), canvas_rect, theme.grid);
 
-    // The tile currently being dragged, painted last so it floats above the others.
-    // We store the *logical* resolution (w, h) so the label matches the connected-clients list.
-    let mut dragged: Option<(Rect, bool, bool, String, (u32, u32), f32)> = None;
-
-    for s in layout.screens.iter_mut() {
-        let x = offx + s.ox as f32 * scale;
-        let y = offy + s.oy as f32 * scale;
-        let w = s.w as f32 * scale;
-        let h = s.h as f32 * scale;
-        let rect = Rect::from_min_size(pos2(x, y), vec2(w, h));
-
-        let is_primary = s.is_local;
-        let is_me = s.name == my_name;
+    // ---- Interaction pass. Nothing moves here: a drag is resolved for the whole *machine*
+    // (below) before anything is painted, so the canvas never shows a torn machine for a frame.
+    //
+    // The drag is anchored to the **absolute pointer position**, not to `drag_delta()`. A per-frame
+    // delta has to be converted from screen points into layout units before it can be applied, and
+    // the canvas is zoomed far out (a 3.4-metre virtual desktop lands at ~0.11), so a one-frame
+    // delta of a few points truncates to zero: slow drags moved nothing at all and faster ones
+    // moved in visible jumps. Anchoring to the pointer is exact at any speed.
+    let mut drag: Option<(usize, String, i32, i32)> = None; // (index, host, dx, dy)
+    let mut responses: Vec<egui::Response> = Vec::with_capacity(layout.screens.len());
+    for (i, s) in layout.screens.iter().enumerate() {
         // Only remote tiles are draggable. A local display's position belongs to the OS — the
         // primary re-detects it on every start — so letting the user drag it would desynchronise
         // the canvas from reality, and with it the edge geometry the cursor actually crosses on.
@@ -1195,21 +1196,12 @@ fn draw_layout(
         } else {
             Sense::drag()
         };
-        let resp = ui.interact(rect, Id::new(("screen", &s.name)), sense);
-        if resp.dragged() {
-            let d = resp.drag_delta();
-            s.ox += (d.x / scale) as i32;
-            s.oy += (d.y / scale) as i32;
-            changed = true;
-        }
-        // Magnetic snap. Two things must line up for the cursor to cross, and getting only the
-        // first is the usual reason "it won't cross": the tiles must be *flush* on the crossing
-        // axis **and** must actually *overlap* on the other one — a tile sitting beside the
-        // display but above it is a neighbour `predict_cross` never finds. So snap flush on one
-        // axis and pull into alignment on the other, for all four directions.
-        if !s.is_local && resp.dragged() {
-            snap_remote_to_locals(s, &locals);
-        }
+        let anchor_id = Id::new(("screen-drag", &s.name));
+        let resp = ui.interact(
+            tile_rect(s, offx, offy, scale),
+            Id::new(("screen", &s.name)),
+            sense,
+        );
         let resp = if s.is_local {
             // Explain why this tile will not move, instead of leaving the user tugging at it.
             resp.on_hover_cursor(CursorIcon::Default)
@@ -1219,13 +1211,73 @@ fn draw_layout(
         } else {
             resp
         };
-        let hover = resp.hovered() || resp.dragged();
+        if !s.is_local && resp.dragged() {
+            // Record where the pointer grabbed the tile, so every later frame can place the tile
+            // from the pointer's absolute position instead of from a rounded frame delta.
+            if resp.drag_started() {
+                ui.memory_mut(|m| {
+                    m.data
+                        .insert_temp(anchor_id, (resp.interact_pointer_pos(), s.ox, s.oy))
+                });
+            }
+            if let Some((Some(p0), ox0, oy0)) =
+                ui.memory(|m| m.data.get_temp::<(Option<Pos2>, i32, i32)>(anchor_id))
+            {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let dx = (ox0 as f32 + (p.x - p0.x) / scale).round() as i32 - s.ox;
+                    let dy = (oy0 as f32 + (p.y - p0.y) / scale).round() as i32 - s.oy;
+                    drag = Some((i, s.host().to_string(), dx, dy));
+                }
+            }
+        }
+        responses.push(resp);
+    }
 
-        let (top, bottom) = ui::tile_colors(is_primary, is_me);
+    // ---- Apply pass. A drag moves the whole machine: the arrangement *inside* a machine is a
+    // fact of its own OS, not a choice the hub gets to make, so pulling one tile out of a
+    // two-monitor peer would desynchronise the canvas from reality — and with it the geometry the
+    // cursor crosses on.
+    //
+    // The magnetic snap is resolved for the tile the user is actually holding, then applied to the
+    // group as a whole. Snapping matters because two things must line up for the cursor to cross,
+    // and getting only the first is the usual reason "it won't cross": the tiles must be *flush* on
+    // the crossing axis **and** must actually *overlap* on the other one — a tile placed beside the
+    // display but above it is a neighbour `predict_cross` never finds.
+    if let Some((i, host, dx, dy)) = drag {
+        if dx != 0 || dy != 0 {
+            let mut probe = layout.screens[i].clone();
+            probe.ox += dx;
+            probe.oy += dy;
+            snap_remote_to_locals(&mut probe, &locals);
+            let (gx, gy) = (
+                probe.ox - layout.screens[i].ox,
+                probe.oy - layout.screens[i].oy,
+            );
+            layout.move_host(&host, gx, gy);
+            changed = true;
+        }
+    }
+
+    // ---- Paint pass.
+    let mut dragged: Option<usize> = None;
+    for (i, s) in layout.screens.iter().enumerate() {
+        let rect = tile_rect(s, offx, offy, scale);
+        // "Mine" is the *machine*, not the panel: a machine with two monitors owns two tiles and
+        // both are this machine's. Keying the badge on `s.name == my_name` marked only the first
+        // panel, so a machine's second display looked exactly like a remote machine — precisely the
+        // "one computer, several screens" case the layout exists to explain.
+        let is_mine = s.host() == my_name;
+        // `is_local` is set by the hub and travels with the broadcast layout, so on every machine
+        // it marks the hub's own panels: the tile palette means the same thing on the primary and
+        // on a client.
+        let is_hub = s.is_local;
+        let resp = &responses[i];
+        let hover = resp.hovered() || resp.dragged();
+        let (top, bottom) = ui::tile_colors(is_hub, is_mine);
         // A dragged tile is deferred to the end of the loop so it floats above the others
         // instead of sliding underneath them.
         if resp.dragged() {
-            dragged = Some((rect, is_primary, is_me, s.name.clone(), (s.w, s.h), s.scale));
+            dragged = Some(i);
             continue;
         }
         ui::soft_shadow(
@@ -1242,8 +1294,8 @@ fn draw_layout(
             &s.name,
             (s.w, s.h),
             s.scale,
-            is_primary,
-            is_me,
+            is_hub,
+            is_mine,
             hover,
             theme,
             top,
@@ -1252,19 +1304,23 @@ fn draw_layout(
         );
     }
 
-    // The actively dragged tile, painted on top of everything.
-    if let Some((rect, is_primary, is_me, name, logical, sc)) = dragged {
-        let (top, bottom) = ui::tile_colors(is_primary, is_me);
+    // The actively dragged tile, painted on top of everything — at the position it was just moved
+    // to, so it tracks the pointer instead of trailing it by a frame.
+    if let Some(i) = dragged {
+        let s = &layout.screens[i];
+        let is_mine = s.host() == my_name;
+        let (top, bottom) = ui::tile_colors(s.is_local, is_mine);
+        let rect = tile_rect(s, offx, offy, scale);
         ui::soft_shadow(ui.painter(), rect, 16.0, theme.shadow, 2.0);
         paint_tile(
             ui,
             ui.painter(),
             rect,
-            &name,
-            logical,
-            sc,
-            is_primary,
-            is_me,
+            &s.name,
+            (s.w, s.h),
+            s.scale,
+            s.is_local,
+            is_mine,
             true,
             theme,
             top,
@@ -1273,31 +1329,47 @@ fn draw_layout(
         );
     }
 
-    // Shared edges: where this machine's displays meet a secondary's, the cursor can cross.
+    // Shared edges: where two machines' displays meet, the cursor can cross.
     // Making them visible turns "why can't I cross?" into something you can see at a glance —
     // a missing or misaligned shared edge is the usual answer.
     paint_shared_edges(ui.painter(), layout, offx, offy, scale, theme);
 
-    // Live cursor dot: the control plane's idea of where the real cursor is. While you move
-    // the mouse on this machine the dot must track it 1:1 — if it doesn't (or sits elsewhere)
-    // the reported coordinates don't match the layout, which is the #1 crossing killer and
-    // now visible at a glance.
-    let cx = offx + cur.0 as f32 * scale;
-    let cy = offy + cur.1 as f32 * scale;
-    let in_view = cx >= canvas_rect.min.x - 8.0
-        && cx <= canvas_rect.max.x + 8.0
-        && cy >= canvas_rect.min.y - 8.0
-        && cy <= canvas_rect.max.y + 8.0;
-    if in_view {
-        let p = pos2(cx, cy);
-        ui.painter()
-            .circle_filled(p, 7.0, Color32::from_rgba_unmultiplied(255, 170, 0, 90));
-        ui.painter()
-            .circle_filled(p, 3.5, Color32::from_rgb(255, 170, 0));
+    // Live cursor dot: the control plane's idea of where the real cursor is. While you move the
+    // mouse the dot must track it 1:1 — if it doesn't (or sits elsewhere) the reported coordinates
+    // don't match the layout, which is the #1 crossing killer, so it is worth showing. `None` on a
+    // client: the canvas there draws the *hub's* coordinate space, and plotting the client's own
+    // cursor into it would be a lie. (The position is refreshed by the capture path; it used to be
+    // written only when control came back, so the dot sat at the origin until the first crossing.)
+    if let Some((cur_x, cur_y)) = cur {
+        let cx = offx + cur_x as f32 * scale;
+        let cy = offy + cur_y as f32 * scale;
+        let in_view = cx >= canvas_rect.min.x - 8.0
+            && cx <= canvas_rect.max.x + 8.0
+            && cy >= canvas_rect.min.y - 8.0
+            && cy <= canvas_rect.max.y + 8.0;
+        if in_view {
+            let p = pos2(cx, cy);
+            ui.painter()
+                .circle_filled(p, 7.0, Color32::from_rgba_unmultiplied(255, 170, 0, 90));
+            ui.painter()
+                .circle_filled(p, 3.5, Color32::from_rgb(255, 170, 0));
+        }
     }
 
     let _ = t;
     changed
+}
+
+/// Where one panel's tile lands on the canvas, in screen coordinates.
+///
+/// Shared by the interaction and paint passes so both agree on the rectangle: they run over the
+/// same `layout`, but the paint pass must see the positions the apply pass produced, and computing
+/// the rect in two places is how those two drift apart.
+fn tile_rect(s: &Screen, offx: f32, offy: f32, scale: f32) -> Rect {
+    Rect::from_min_size(
+        pos2(offx + s.ox as f32 * scale, offy + s.oy as f32 * scale),
+        vec2(s.w as f32 * scale, s.h as f32 * scale),
+    )
 }
 
 /// Paint one screen tile as a **display**: a darker bezel, the screen surface inset inside it,
@@ -1419,8 +1491,8 @@ fn paint_tile(
     }
 }
 
-/// Draw every place this machine's displays meet a secondary's, on **all four** sides — these
-/// are the only places the cursor can cross.
+/// Draw every place two machines' displays meet, on **all four** sides — these are the only
+/// places the cursor can cross between machines.
 ///
 /// Making them visible turns "why can't I cross?" into something you can see at a glance: a
 /// missing or misaligned shared edge is the usual answer. The horizontal (above/below) case is
@@ -1442,10 +1514,20 @@ fn paint_shared_edges(
         painter.line_segment([p0, p1], (2.5, solid));
     };
 
-    for a in layout.screens.iter().filter(|s| s.is_local) {
-        let (al, at) = (a.ox as f64, a.oy as f64);
-        let (ar_, ab_) = (al + a.w as f64, at + a.h as f64);
-        for b in layout.screens.iter().filter(|s| !s.is_local) {
+    // Every pair of panels owned by *different* machines is a potential crossing, drawn once.
+    // Keying this on `is_local` (hub vs. not) happened to be the same set on the hub, but on a
+    // client it drew the hub's own internal edges and skipped the one the user actually cares
+    // about — where the client's own display meets the hub's. "Different machine" is the rule that
+    // is correct everywhere, and it also excludes two monitors of one machine, where the cursor
+    // simply moves natively and there is no hand-off to mark.
+    for i in 0..layout.screens.len() {
+        for j in (i + 1)..layout.screens.len() {
+            let (a, b) = (&layout.screens[i], &layout.screens[j]);
+            if a.host() == b.host() {
+                continue;
+            }
+            let (al, at) = (a.ox as f64, a.oy as f64);
+            let (ar_, ab_) = (al + a.w as f64, at + a.h as f64);
             let (bl, bt) = (b.ox as f64, b.oy as f64);
             let (br, bb) = (bl + b.w as f64, bt + b.h as f64);
 
@@ -1509,11 +1591,17 @@ fn snap_remote_to_locals(s: &mut Screen, locals: &[(f64, f64, f64, f64)]) {
     let r = l + s.w as f64;
     let b = t + s.h as f64;
 
-    // Nearest local panel, by the sum of the gaps on each axis (0 when overlapping on that axis).
+    // Nearest local panel, by the sum of the *separations* on each axis — 0 on an axis the tile
+    // already overlaps. `max(0.0)` is what makes this a distance: a tile being dragged against a
+    // multi-monitor machine must be measured against the display it is actually next to, and
+    // clamping the overlapping (negative) case to zero is what identifies that one. Inverting this
+    // — keeping only the overlap — scores *every* separated panel 0, so the search returns whichever
+    // local panel happens to come first and a tile dragged up against the **second** display snaps
+    // against the wrong one, or not at all.
+    let gap = |(pl, pt, pr, pb): (f64, f64, f64, f64)| {
+        (pl - r).max(l - pr).max(0.0) + (pt - b).max(t - pb).max(0.0)
+    };
     let nearest = locals.iter().copied().min_by(|p, q| {
-        let gap = |(pl, pt, pr, pb): (f64, f64, f64, f64)| {
-            (pl - r).max(l - pr).min(0.0).abs() + (pt - b).max(t - pb).min(0.0).abs()
-        };
         gap(*p)
             .partial_cmp(&gap(*q))
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -1644,28 +1732,28 @@ mod tests {
         // Right: a few pixels shy of the edge, and offset vertically for good measure.
         let mut s = screen("R", 1940, 40, 1920, 1080);
         snap_remote_to_locals(&mut s, &locals);
-        let (l, t, r, b) = rect(&s);
+        let (l, t, _, b) = rect(&s);
         assert_eq!(l, pr, "left edge should be flush with the display's right");
         assert!(t < pb && b > pt, "must overlap vertically, got {t}..{b}");
 
         // Left.
         let mut s = screen("L", -1935, -30, 1920, 1080);
         snap_remote_to_locals(&mut s, &locals);
-        let (l, t, r, b) = rect(&s);
+        let (_, t, r, b) = rect(&s);
         assert_eq!(r, pl, "right edge should be flush with the display's left");
         assert!(t < pb && b > pt, "must overlap vertically, got {t}..{b}");
 
         // Below.
         let mut s = screen("B", 25, 1095, 1920, 1080);
         snap_remote_to_locals(&mut s, &locals);
-        let (l, t, r, b) = rect(&s);
+        let (l, t, r, _) = rect(&s);
         assert_eq!(t, pb, "top edge should be flush with the display's bottom");
         assert!(l < pr && r > pl, "must overlap horizontally, got {l}..{r}");
 
         // Above.
         let mut s = screen("T", -25, -1090, 1920, 1080);
         snap_remote_to_locals(&mut s, &locals);
-        let (l, t, r, b) = rect(&s);
+        let (l, _, r, b) = rect(&s);
         assert_eq!(b, pt, "bottom edge should be flush with the display's top");
         assert!(l < pr && r > pl, "must overlap horizontally, got {l}..{r}");
     }
@@ -1706,5 +1794,74 @@ mod tests {
         };
         let (minx, miny, maxx, maxy) = bounds(&l);
         assert!(maxx > minx && maxy > miny, "{minx},{miny},{maxx},{maxy}");
+    }
+
+    /// The snap has to measure the tile against the display it is actually next to. Scoring only
+    /// the *overlap* gave every separated display the same score (0), so the search returned
+    /// whichever local panel came first in the layout: a tile dragged up against a machine's
+    /// **second** monitor was measured against its first, found nothing within reach, and was left
+    /// exactly where it was — no flush edge, so no crossing. Driving both local panels makes the
+    /// difference visible.
+    #[test]
+    fn snap_measures_against_the_nearest_local_display() {
+        // Two local displays side by side: 0..1920 and 1920..3840.
+        let locals = vec![(0.0, 0.0, 1920.0, 1080.0), (1920.0, 0.0, 3840.0, 1080.0)];
+
+        // To the right of the *second* display: the far panel is 1940 away, the near one 20.
+        let mut s = screen("R", 3860, 40, 1920, 1080);
+        snap_remote_to_locals(&mut s, &locals);
+        assert_eq!(
+            s.ox, 3840,
+            "must snap flush against the display it is next to"
+        );
+        assert!(s.oy < 1080, "and overlap it vertically, got oy={}", s.oy);
+
+        // Above the *second* display: the bottom edge goes flush with its top.
+        let mut s = screen("T", 2000, -1090, 1920, 1080);
+        snap_remote_to_locals(&mut s, &locals);
+        let (_, _, _, b) = rect(&s);
+        assert_eq!(b, 0.0, "bottom edge flush with the nearest display's top");
+        assert!(
+            s.ox < 3840,
+            "and stays horizontally overlapping it, got ox={}",
+            s.ox
+        );
+
+        // And it still works against the *first* display, so the fix did not just invert the bug.
+        let mut s = screen("L", -1935, 40, 1920, 1080);
+        snap_remote_to_locals(&mut s, &locals);
+        assert_eq!(
+            rect(&s).2,
+            0.0,
+            "right edge flush with the first display's left"
+        );
+    }
+
+    /// A drag moves the whole machine: the arrangement *inside* a machine is its own OS's business,
+    /// so pulling one tile out of a two-monitor peer must carry its sibling along. Without this the
+    /// canvas showed a machine torn in two, and the geometry the cursor crosses on no longer
+    /// matched either the canvas or the peer.
+    #[test]
+    fn dragging_one_tile_moves_the_whole_machine() {
+        // Two panels of the *same* machine share one `host`; the third screen is a different one.
+        let mut mine = screen("pc", 1920, 0, 1920, 1080);
+        mine.host = "pc".into();
+        let mut sibling = screen("pc #2", 3840, 0, 1920, 1080);
+        sibling.host = "pc".into();
+        let other = screen("other", 5760, 0, 1920, 1080);
+        let mut l = Layout {
+            screens: vec![mine, sibling, other],
+        };
+        l.move_host("pc", -1000, 250);
+        let at = |name: &str| {
+            l.screens
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| (s.ox, s.oy))
+                .unwrap()
+        };
+        assert_eq!(at("pc"), (920, 250));
+        assert_eq!(at("pc #2"), (2840, 250), "the sibling moves with it");
+        assert_eq!(at("other"), (5760, 0), "another machine is untouched");
     }
 }

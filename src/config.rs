@@ -82,7 +82,12 @@ pub fn config_path() -> PathBuf {
 pub fn load_config() -> Config {
     let p = config_path();
     if let Ok(s) = std::fs::read_to_string(&p) {
-        if let Ok(c) = serde_json::from_str::<Config>(&s) {
+        if let Ok(mut c) = serde_json::from_str::<Config>(&s) {
+            // A layout written before `Screen::host` existed carries an empty `host` on every
+            // panel. Repair it here — the single place a layout can enter the process from disk —
+            // so a multi-monitor peer cannot come back as duplicated panels (see
+            // `Layout::normalize_hosts`).
+            c.layout.normalize_hosts();
             return c;
         }
     }

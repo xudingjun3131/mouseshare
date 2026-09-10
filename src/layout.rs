@@ -260,6 +260,13 @@ impl Layout {
             return false;
         }
         let known = self.screens.iter().any(|s| s.host() == host);
+        // `Hello` reports panel offsets normalised against the peer's own bounding-box origin, so
+        // the minimum is already 0 and these are no-ops. Subtracting it anyway keeps the anchor
+        // arithmetic below correct for *any* caller, instead of silently depending on that
+        // guarantee: without it, a panel list whose offsets start below zero would be placed
+        // partly underneath the hub (new host) or drift further left on every refresh (known host).
+        let min_ox = panels.iter().map(|p| p.ox).min().unwrap_or(0);
+        let min_oy = panels.iter().map(|p| p.oy).min().unwrap_or(0);
         if !known {
             // Flush against the right edge of everything already placed, top-aligned with the
             // local screens when there are any (so a freshly connected peer is reachable from the
@@ -279,8 +286,8 @@ impl Layout {
                 self.screens.push(Screen {
                     name: p.name.clone(),
                     host: host.to_string(),
-                    ox: max_x + p.ox,
-                    oy: top + p.oy,
+                    ox: max_x + (p.ox - min_ox),
+                    oy: top + (p.oy - min_oy),
                     w: p.w,
                     h: p.h,
                     is_local: false,
@@ -306,16 +313,16 @@ impl Layout {
                     s.w = p.w;
                     s.h = p.h;
                     s.scale = p.scale;
-                    s.ox = ax + p.ox;
-                    s.oy = ay + p.oy;
+                    s.ox = ax + (p.ox - min_ox);
+                    s.oy = ay + (p.oy - min_oy);
                 }
                 None => {
                     // A monitor that was not there last time (or a renamed one).
                     let s = Screen {
                         name: p.name.clone(),
                         host: host.to_string(),
-                        ox: ax + p.ox,
-                        oy: ay + p.oy,
+                        ox: ax + (p.ox - min_ox),
+                        oy: ay + (p.oy - min_oy),
                         w: p.w,
                         h: p.h,
                         is_local: false,
@@ -371,5 +378,266 @@ impl Layout {
             s.ox += dx;
             s.oy += dy;
         }
+    }
+
+    /// Fill in a missing [`Screen::host`] on panels saved before the field existed.
+    ///
+    /// Back then a machine could only contribute one display, so a panel's *name* was its machine
+    /// name — and a multi-display machine's extra panels were named `<machine> #N` (see
+    /// `main::name_panels`). Recovering the machine from the name is therefore exact, not a guess.
+    ///
+    /// Leaving the field empty is not harmless: `Screen::host` falls back to `name`, so a restored
+    /// `"X #2"` panel claims to be owned by a machine literally called `"X #2"`. When peer `X`
+    /// reconnects, `ensure_host` looks for `name == "X #2" && host == "X"`, finds nothing, and
+    /// **adds a second copy of that panel** — two tiles with one egui id (dragging one moves the
+    /// other) and two overlapping crossing candidates. Normalising on load closes that hole.
+    pub fn normalize_hosts(&mut self) {
+        for s in self.screens.iter_mut() {
+            if !s.host.is_empty() {
+                continue;
+            }
+            s.host = match s.name.rfind(" #") {
+                // `" #"` followed by digits only, and at least one digit present.
+                Some(i)
+                    if i + 2 < s.name.len()
+                        && s.name[i + 2..].chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    s.name[..i].to_string()
+                }
+                _ => s.name.clone(),
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local(name: &str, ox: i32, w: u32) -> Screen {
+        Screen {
+            name: name.into(),
+            host: name.into(),
+            ox,
+            oy: 0,
+            w,
+            h: 1080,
+            is_local: true,
+            scale: 1.0,
+        }
+    }
+
+    /// A config written before `Screen::host` existed has an empty `host` on every panel. Left
+    /// alone, `Screen::host` falls back to `name`, so a `"X #2"` panel claims to belong to a
+    /// machine literally called `"X #2"`.
+    #[test]
+    fn normalize_hosts_recovers_the_machine_from_the_panel_name() {
+        let mut l = Layout {
+            screens: vec![
+                Screen {
+                    host: String::new(),
+                    ..local("mac", 0, 1470)
+                },
+                Screen {
+                    name: "mac #2".into(),
+                    host: String::new(),
+                    ox: 1470,
+                    oy: -124,
+                    w: 1920,
+                    h: 1080,
+                    is_local: true,
+                    scale: 2.0,
+                },
+                Screen {
+                    name: "pc".into(),
+                    host: String::new(),
+                    ox: 3390,
+                    oy: 0,
+                    w: 1920,
+                    h: 1080,
+                    is_local: false,
+                    scale: 1.0,
+                },
+            ],
+        };
+        l.normalize_hosts();
+        let hosts: Vec<&str> = l.screens.iter().map(|s| s.host()).collect();
+        assert_eq!(hosts, ["mac", "mac", "pc"]);
+
+        // Idempotent — and re-running it must not eat part of a name.
+        let before = hosts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        l.normalize_hosts();
+        let after: Vec<String> = l.screens.iter().map(|s| s.host().to_string()).collect();
+        assert_eq!(before, after);
+    }
+
+    /// Only a purely numeric `#N` suffix is a panel index. A name that merely contains a hash, or
+    /// has text after it, must survive intact.
+    #[test]
+    fn normalize_hosts_only_strips_a_numeric_panel_suffix() {
+        let mut l = Layout {
+            screens: ["adam #2", "mac #2x", "box #", "plain", "odd #1 #2"]
+                .iter()
+                .enumerate()
+                .map(|(i, n)| Screen {
+                    name: (*n).into(),
+                    host: String::new(),
+                    ox: i as i32 * 100,
+                    ..local(*n, 0, 100)
+                })
+                .collect(),
+        };
+        l.normalize_hosts();
+        let hosts: Vec<&str> = l.screens.iter().map(|s| s.host()).collect();
+        assert_eq!(hosts, ["adam", "mac #2x", "box #", "plain", "odd #1"]);
+    }
+
+    /// `Hello` reports panel offsets normalised so the minimum is 0, but `ensure_host` must not
+    /// silently depend on that. With a list that starts below zero the old `max_x + p.ox` placed a
+    /// machine *partly on top of the hub* — the two machines would overlap on the canvas and
+    /// `predict_cross` would find spans that cannot physically exist.
+    #[test]
+    fn ensure_host_places_a_new_machine_flush_even_with_negative_offsets() {
+        let mut l = Layout {
+            screens: vec![local("hub", 0, 1920)],
+        };
+        // A peer with a monitor to the left of the one it calls its main display.
+        let panels = [
+            PanelSpec {
+                name: "pc".into(),
+                ox: -1920,
+                oy: -200,
+                w: 1920,
+                h: 1080,
+                scale: 1.0,
+            },
+            PanelSpec {
+                name: "pc #2".into(),
+                ox: 0,
+                oy: 0,
+                w: 1920,
+                h: 1080,
+                scale: 1.0,
+            },
+        ];
+        assert!(l.ensure_host("pc", &panels));
+
+        let (bl, bt, br, bb) = l.host_bbox("pc").unwrap();
+        assert_eq!(
+            bl, 1920.0,
+            "the group's left edge must sit on the hub's right edge"
+        );
+        assert_eq!(
+            br - bl,
+            3840.0,
+            "the group keeps the peer's own arrangement"
+        );
+        assert_eq!(bb - bt, 1280.0, "including the vertical spread");
+        for s in l.panels_of("pc") {
+            assert!(s.ox >= 1920, "{} overlaps the hub (ox={})", s.name, s.ox);
+        }
+    }
+
+    /// The anchor is the group's bounding box, so a refresh must reproduce it exactly. When the
+    /// anchor was instead used as "the offset of whatever panel has offset 0", each hello shifted
+    /// the machine by the group's extent again — it marched off the canvas.
+    #[test]
+    fn ensure_host_reanchor_is_stable_across_refreshes() {
+        let mut l = Layout {
+            screens: vec![local("hub", 0, 1920)],
+        };
+        let panels = [
+            PanelSpec {
+                name: "pc".into(),
+                ox: -1920,
+                oy: 0,
+                w: 1920,
+                h: 1080,
+                scale: 1.0,
+            },
+            PanelSpec {
+                name: "pc #2".into(),
+                ox: 0,
+                oy: 0,
+                w: 2560,
+                h: 1440,
+                scale: 2.0,
+            },
+        ];
+        l.ensure_host("pc", &panels);
+        let first: Vec<(String, i32, i32)> = l
+            .panels_of("pc")
+            .map(|s| (s.name.clone(), s.ox, s.oy))
+            .collect();
+
+        // Simulate the 400 ms layout snapshots / repeated hellos a live peer produces.
+        for _ in 0..5 {
+            l.ensure_host("pc", &panels);
+        }
+        let after: Vec<(String, i32, i32)> = l
+            .panels_of("pc")
+            .map(|s| (s.name.clone(), s.ox, s.oy))
+            .collect();
+        assert_eq!(first, after, "a refresh must not move the machine");
+        assert_eq!(first.len(), 2);
+    }
+
+    /// A user's placement has to survive the peer changing resolution, and a monitor that is no
+    /// longer reported must be dropped rather than left as a phantom panel.
+    #[test]
+    fn ensure_host_refreshes_geometry_and_drops_unplugged_panels() {
+        let mut l = Layout {
+            screens: vec![local("hub", 0, 1920)],
+        };
+        let two = [
+            PanelSpec {
+                name: "pc".into(),
+                ox: 0,
+                oy: 0,
+                w: 1920,
+                h: 1080,
+                scale: 1.0,
+            },
+            PanelSpec {
+                name: "pc #2".into(),
+                ox: 1920,
+                oy: 0,
+                w: 1920,
+                h: 1080,
+                scale: 1.0,
+            },
+        ];
+        l.ensure_host("pc", &two);
+        // The user parks the machine above the hub.
+        l.move_host("pc", -1920, -1080);
+        let anchored = l.machine_origin("pc").unwrap();
+
+        // Monitor #2 is unplugged, and monitor #1 now runs at a different size.
+        let one = [PanelSpec {
+            name: "pc".into(),
+            ox: 0,
+            oy: 0,
+            w: 2560,
+            h: 1440,
+            scale: 2.0,
+        }];
+        l.ensure_host("pc", &one);
+
+        assert_eq!(
+            l.panels_of("pc").count(),
+            1,
+            "the unplugged panel must be dropped"
+        );
+        assert_eq!(
+            l.machine_origin("pc"),
+            Some(anchored),
+            "placement is preserved"
+        );
+        let s = l.panels_of("pc").next().unwrap();
+        assert_eq!(
+            (s.w, s.h, s.scale),
+            (2560, 1440, 2.0),
+            "geometry is refreshed"
+        );
     }
 }

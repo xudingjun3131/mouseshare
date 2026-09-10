@@ -98,6 +98,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut config: Config = load_config();
     let my_name = config.name.clone();
+    // Namespace every file-transfer token with this machine's name. The hub reassembles every
+    // peer's copies through one receiver keyed by token, and relayed copies keep the sender's
+    // token, so two machines numbering their copies from 1 would collide (see `transfer`).
+    transfer::set_machine_name(&my_name);
     // Background threads (file transfer) need a language for their notifications; mirror the
     // configured one once here so they never have to touch the GUI.
     crate::i18n::set_lang(Lang::from_code(&config.lang));
@@ -610,6 +614,32 @@ pub fn hello_panels(own: &Layout) -> (u32, u32, f32, Vec<PanelSpec>) {
     (w, h, scale, panels)
 }
 
+/// Name every detected display: the OS's main display keeps the bare machine name, the rest are
+/// numbered `#2`, `#3`, … in detection order.
+///
+/// The bare name goes to the **main** display, not to whichever display happens to sort first.
+/// A laptop whose external monitor sits to the left of (or above) the built-in panel sorts ahead
+/// of it, and the old `disp.is_primary || i == 0` rule then gave *both* of them the machine name.
+/// Two panels sharing one name is not cosmetic: egui derives each tile's interaction id from the
+/// name (dragging one would drag the other), `Screen::host` falls back to `name` so one panel
+/// would claim a machine that does not exist, and the client's `crossing_back` panel lookup
+/// becomes ambiguous — the cursor would be unable to come back from one of the two displays.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn name_panels(machine: &str, is_main: &[bool]) -> Vec<String> {
+    let main = is_main.iter().position(|m| *m).unwrap_or(0);
+    let mut extra = 0;
+    (0..is_main.len())
+        .map(|i| {
+            if i == main {
+                machine.to_string()
+            } else {
+                extra += 1;
+                format!("{} #{}", machine, extra + 1)
+            }
+        })
+        .collect()
+}
+
 /// Build the primary's initial layout from the machine's real displays.
 ///
 /// On macOS this enumerates every attached screen via `display-info`, placing each at its true
@@ -623,13 +653,10 @@ fn detect_primary_layout(primary_name: &str) -> Layout {
             Ok(displays) if !displays.is_empty() => {
                 let mut d: Vec<_> = displays.into_iter().collect();
                 d.sort_by(|a, b| a.x.cmp(&b.x).then_with(|| a.y.cmp(&b.y)));
+                let flags: Vec<bool> = d.iter().map(|disp| disp.is_primary).collect();
+                let names = name_panels(primary_name, &flags);
                 let mut screens = Vec::with_capacity(d.len());
-                for (i, disp) in d.iter().enumerate() {
-                    let name = if disp.is_primary || i == 0 {
-                        primary_name.to_string()
-                    } else {
-                        format!("{} #{}", primary_name, i + 1)
-                    };
+                for (disp, name) in d.iter().zip(names) {
                     screens.push(Screen {
                         name,
                         host: primary_name.to_string(),
@@ -688,5 +715,52 @@ fn detect_primary_layout(primary_name: &str) -> Layout {
             is_local: true,
             scale: 1.0,
         }],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_panels;
+
+    /// The bare machine name belongs to the **main** display, whatever order the displays happen
+    /// to sort in.
+    ///
+    /// The old rule (`disp.is_primary || i == 0`) handed the machine name to the first display in
+    /// the list *and* to the OS's main display. A laptop with an external monitor to its left sorts
+    /// the external first, so both displays ended up named after the machine — one egui interaction
+    /// id for two tiles (dragging one moved the other), one panel claiming a machine that does not
+    /// exist, and an ambiguous `crossing_back` panel lookup on the client.
+    #[test]
+    fn names_are_unique_whatever_the_display_order() {
+        // External monitor (x < 0) sorts first; the built-in panel is the main display.
+        assert_eq!(name_panels("mac", &[false, true]), ["mac #2", "mac"]);
+        // The everyday case: the main display comes first.
+        assert_eq!(name_panels("mac", &[true, false]), ["mac", "mac #2"]);
+        // Main display in the middle of three.
+        assert_eq!(
+            name_panels("mac", &[false, true, false]),
+            ["mac #2", "mac", "mac #3"]
+        );
+        // No display claims to be main (enumeration quirk): the first stands in.
+        assert_eq!(name_panels("mac", &[false, false]), ["mac", "mac #2"]);
+        // Single display.
+        assert_eq!(name_panels("mac", &[true]), ["mac"]);
+    }
+
+    #[test]
+    fn names_never_collide_for_any_display_count() {
+        for n in 1..=5usize {
+            for main in 0..n {
+                let mut flags = vec![false; n];
+                flags[main] = true;
+                let names = name_panels("m", &flags);
+                assert_eq!(names.len(), n);
+                assert_eq!(names[main], "m", "the main display keeps the bare name");
+                let mut uniq = names.clone();
+                uniq.sort();
+                uniq.dedup();
+                assert_eq!(uniq.len(), n, "duplicate names for {flags:?}: {names:?}");
+            }
+        }
     }
 }
