@@ -41,6 +41,7 @@ mod single_instance;
 mod transfer;
 #[cfg(target_os = "windows")]
 mod tray;
+mod ui;
 
 // `app.rs` historically referenced `crate::Ctrl`; keep that path working after the move.
 pub use control::Ctrl;
@@ -502,8 +503,8 @@ fn main() -> anyhow::Result<()> {
         "MouseShare",
         options,
         Box::new(move |cc| {
-            app::setup_fonts(&cc.egui_ctx);
-            app::setup_style(&cc.egui_ctx);
+            ui::setup_fonts(&cc.egui_ctx);
+            ui::setup_style(&cc.egui_ctx);
             Ok::<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>>(Box::new(gui_app))
         }),
     );

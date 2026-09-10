@@ -52,6 +52,129 @@ pub fn tr_file_sent(n: usize) -> String {
     }
 }
 
+/// How an activity-feed entry should be coloured.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Ok,
+    Info,
+    Warn,
+    Error,
+}
+
+/// Translate one diagnostic-log line into a readable activity-feed entry, or `None` to leave it
+/// out of the feed.
+///
+/// The diagnostic log is written for debugging: a machine name, a port number, a bounding box,
+/// a full screen list, all on one line. Rendering it verbatim — which is what the previous
+/// design did — produced a feed of machine noise where the one line that mattered was six
+/// identical startup banners deep. Anything a user would not act on is dropped here.
+///
+/// The trade-off: a newly added diagnostic event stays invisible until it is listed below.
+/// Unrecognised lines that announce a failure are the exception — those are always surfaced,
+/// because a silent failure in a tool whose whole job is invisible background work is the worst
+/// possible outcome.
+pub fn tr_event(lang: Lang, line: &str) -> Option<(String, Severity)> {
+    let zh = lang == Lang::Zh;
+    let lower = line.to_ascii_lowercase();
+    let has = |n: &str| lower.contains(n);
+    let t = |z: &str, e: &str| -> String {
+        if zh { z.to_string() } else { e.to_string() }
+    };
+
+    if has("capture failed") {
+        return Some((
+            t(
+                "输入捕获失败：缺少「辅助功能 / 输入监控」权限",
+                "Input capture failed — Accessibility / Input Monitoring permission missing",
+            ),
+            Severity::Error,
+        ));
+    }
+    if has("app nap disabled") {
+        return Some((
+            t("已关闭系统节能休眠，避免后台卡顿", "Disabled system power nap to prevent stalls"),
+            Severity::Ok,
+        ));
+    }
+    if has("capture thread started") {
+        return Some((
+            t("输入捕获已启动", "Input capture started"),
+            Severity::Ok,
+        ));
+    }
+    if has("startup mode=") {
+        let role = if zh { "主机" } else { "primary" };
+        return Some((
+            t(&format!("已作为{role}启动"), "Started as primary"),
+            Severity::Info,
+        ));
+    }
+    if has("file-recv-first-chunk") || has("file-recv token=") {
+        return Some((
+            t("正在接收文件…", "Receiving files…"),
+            Severity::Info,
+        ));
+    }
+    if has("file-send aborted") {
+        return Some((
+            t("文件发送已中止", "File send aborted"),
+            Severity::Warn,
+        ));
+    }
+    if has("file-apply-failed") {
+        return Some((
+            t("写入系统剪贴板失败", "Could not write to the system clipboard"),
+            Severity::Error,
+        ));
+    }
+    if has("click inside ui window") {
+        return Some((
+            t(
+                "点击了 MouseShare 窗口，鼠标控制权已收回",
+                "Clicked the MouseShare window — mouse control returned",
+            ),
+            Severity::Info,
+        ));
+    }
+    if has("tap disabled") {
+        return Some((
+            t(
+                "系统暂停了输入捕获，已自动恢复",
+                "macOS paused input capture — recovered automatically",
+            ),
+            Severity::Warn,
+        ));
+    }
+    if has("leave") && has("->") {
+        return Some((
+            t("鼠标已跨到另一台设备", "Mouse crossed to the other machine"),
+            Severity::Info,
+        ));
+    }
+    if has("return <-") {
+        return Some((
+            t("鼠标已回到本机", "Mouse returned to this machine"),
+            Severity::Info,
+        ));
+    }
+    if has("hand-off") || has("enter screen") {
+        return Some((
+            t("鼠标已跨到另一台设备", "Mouse crossed to the other machine"),
+            Severity::Info,
+        ));
+    }
+
+    // Unknown. Surface it only if it reports a problem.
+    let severe = ["error", "fail", "panic", "refused", "denied"]
+        .iter()
+        .any(|k| has(k));
+    if severe {
+        let trimmed: String = line.chars().take(140).collect();
+        return Some((trimmed, Severity::Error));
+    }
+    None
+}
+
 impl Lang {
     pub fn from_code(s: &str) -> Lang {
         if s.eq_ignore_ascii_case("en") {
@@ -110,6 +233,7 @@ pub struct Tr {
     pub tagline: &'static str,
     pub section_basic: &'static str,
     pub machine_name: &'static str,
+    pub machine_name_hint: &'static str,
     pub role: &'static str,
     pub role_primary: &'static str,
     pub role_secondary: &'static str,
@@ -154,6 +278,9 @@ pub struct Tr {
     pub conn_idle: &'static str,
     pub ctrl_status: &'static str,
     pub ctrl_local: &'static str,
+    /// Short form for the stat tile — the long sentence goes in the tile's footnote, because a
+    /// stat value has one line and would otherwise be truncated mid-sentence.
+    pub ctrl_local_short: &'static str,
     pub ctrl_remote: &'static str,
     pub ctrl_pushing: &'static str,
     pub hotkey_hint: &'static str,
@@ -234,7 +361,8 @@ pub struct Tr {
 pub const ZH: Tr = Tr {
     tagline: "通过局域网共享鼠标、键盘与剪贴板",
     section_basic: "基本设置",
-    machine_name: "本机名称（需唯一）:",
+    machine_name: "本机名称",
+    machine_name_hint: "需唯一，用于在局域网中标识这台机器",
     role: "角色",
     role_primary: "主机（服务端，接真实鼠标键盘）",
     role_secondary: "副机（接收输入）",
@@ -260,7 +388,7 @@ pub const ZH: Tr = Tr {
     discovered_empty: "正在搜索局域网中的主机…",
     discovered_connect: "连接",
     peers: "已连接设备: ",
-    local_name: "本机名称: ",
+    local_name: "本机名称",
     layout_title: "屏幕布局 — 拖动屏幕调整位置",
     layout_hint: "按桌面上的实际摆放排布各块屏幕。主机（高亮）是真实光标所在，光标越过边缘即把控制权交给相邻机器。",
     layout_tip: "提示：副机色块拖到主机屏幕边上（允许小误差）即可跨屏；把鼠标贴住该边缘保持不动约半秒、或向边缘一推即跨。橙色圆点 = 实时鼠标位置。",
@@ -279,6 +407,7 @@ pub const ZH: Tr = Tr {
     conn_idle: "未连接",
     ctrl_status: "鼠标控制权",
     ctrl_local: "本机（推向副机一侧的屏幕边缘即跨屏）",
+    ctrl_local_short: "本机",
     ctrl_remote: "当前在 {}（本机光标已隐藏；向主机方向推回边缘即返回）",
     ctrl_pushing: "贴边推进 {n}/{total}，继续向外推…",
     hotkey_hint: "切换鼠标控制权快捷键：Ctrl+Alt+空格 或 ScrollLock，在主机与各副机之间轮换（Mac、Windows 两端均可按）。",
@@ -358,7 +487,8 @@ pub const ZH: Tr = Tr {
 pub const EN: Tr = Tr {
     tagline: "Share mouse, keyboard & clipboard over LAN",
     section_basic: "Basic",
-    machine_name: "This machine's name (unique):",
+    machine_name: "Machine name",
+    machine_name_hint: "Must be unique — it identifies this machine on the LAN",
     role: "Role",
     role_primary: "Primary (server, has the real mouse/keyboard)",
     role_secondary: "Secondary (receives input)",
@@ -384,7 +514,7 @@ pub const EN: Tr = Tr {
     discovered_empty: "Searching for a primary on the LAN…",
     discovered_connect: "Connect",
     peers: "Connected peers: ",
-    local_name: "Local name: ",
+    local_name: "Local name",
     layout_title: "Screen layout — drag a screen to reposition it",
     layout_hint: "Place screens the way they sit on your desk. The primary (highlighted) is where your real cursor lives; cross an edge to hand control to a neighbour.",
     layout_tip: "Tip: drag a secondary roughly against the primary's edge (small offsets fine); rest or push the mouse into that edge to cross. Orange dot = live cursor.",
@@ -403,6 +533,7 @@ pub const EN: Tr = Tr {
     conn_idle: "Not connected",
     ctrl_status: "Mouse control",
     ctrl_local: "This machine (push into a secondary's edge to cross over)",
+    ctrl_local_short: "This machine",
     ctrl_remote: "On {} (local cursor hidden; push back toward the primary's edge to return)",
     ctrl_pushing: "Edge push {n}/{total} — keep pushing…",
     hotkey_hint: "Switch-hotkey: Ctrl+Alt+Space or ScrollLock rotates the mouse between the primary and each secondary (works on both sides).",
