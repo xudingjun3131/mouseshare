@@ -23,6 +23,19 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// Vertical clearance for the macOS traffic-light cluster (close / minimise / zoom).
+///
+/// The window runs with `fullsize_content_view(true)` + `titlebar_shown(false)`, so the traffic
+/// lights float *on top of* the egui canvas rather than living in a reserved strip. They occupy
+/// roughly y ∈ [8, 24] and x ∈ [12, 76]. Anything drawn in the sidebar's top-left corner without
+/// this clearance ends up underneath them — unreadable and, worse, unclickable, because the
+/// buttons take the hit. 38pt puts content comfortably below the cluster on every macOS build
+/// we've seen. Windows and Linux draw a normal title bar, so they need no clearance at all.
+#[cfg(target_os = "macos")]
+const TITLEBAR_CLEARANCE: i8 = 38;
+#[cfg(not(target_os = "macos"))]
+const TITLEBAR_CLEARANCE: i8 = 14;
+
 /// Notifications queued by background threads (file transfers) for the GUI to toast.
 /// The GUI can only be touched from its own thread, so workers push strings here instead.
 static NOTIFICATIONS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
@@ -771,7 +784,13 @@ impl eframe::App for MouseShareApp {
             .frame(
                 egui::Frame::NONE
                     .fill(theme.sidebar_bg)
-                    .inner_margin(egui::Margin { left: 14, right: 14, top: 16, bottom: 14 }),
+                    .inner_margin(egui::Margin {
+                        left: 14,
+                        right: 14,
+                        // Clears the macOS traffic lights — see `TITLEBAR_CLEARANCE`.
+                        top: TITLEBAR_CLEARANCE,
+                        bottom: 14,
+                    }),
             )
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 4.0;

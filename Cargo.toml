@@ -1,6 +1,6 @@
 [package]
 name = "mouseshare"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 description = "Share mouse, keyboard and clipboard across computers over LAN, with a draggable screen-layout. Cross-platform (Windows/Linux/macOS)."
 license = "MIT OR Apache-2.0"
