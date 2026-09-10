@@ -1615,40 +1615,18 @@ fn lang_chip(ui: &mut egui::Ui, theme: UiTheme, lang: Lang) -> bool {
     resp.clicked()
 }
 
-/// Sidebar brand block: gradient mark + wordmark + version line.
+/// Sidebar header: a single muted line of "MouseShare" — nothing more. The earlier version had
+/// a 38×38 gradient mark + "MouseShare" wordmark + version number, which read as a logo block
+/// rather than a section heading and was the only decoration left in the flat UI.
 fn brand_block(ui: &mut egui::Ui, theme: UiTheme) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 12.0;
-        let (mark, _) = ui.allocate_exact_size(vec2(38.0, 38.0), egui::Sense::hover());
-        fill_gradient(
-            ui.painter(),
-            mark,
-            9.0,
-            Color32::from_rgb(79, 157, 255),
-            Color32::from_rgb(88, 86, 214),
-        );
-        ui.painter().text(
-            mark.center(),
-            Align2::CENTER_CENTER,
-            "M",
-            FontId::proportional(18.0),
-            Color32::WHITE,
-        );
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 1.0;
-            ui.label(
-                egui::RichText::new("MouseShare")
-                    .size(15.5)
-                    .strong()
-                    .color(theme.text),
-            );
-            ui.label(
-                egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                    .size(11.0)
-                    .color(theme.muted),
-            );
-        });
-    });
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("MouseShare")
+            .size(13.0)
+            .strong()
+            .color(theme.text),
+    );
+    ui.add_space(10.0);
 }
 
 // ---- Content-area components -------------------------------------------------------------
@@ -1799,6 +1777,10 @@ fn wrap_lines(ui: &egui::Ui, text: &str, font: &FontId, max_w: f32) -> Vec<Strin
 ///
 /// Everything is drawn by the painter on top of a single click target, so there is no inner
 /// widget competing for the click (which is what made the old segmented control fiddly).
+/// Role selection row: inline icon + title + wrapped description, with a subtle accent tint
+/// behind the selected row. Earlier versions wrapped each option in a filled box with a stroke
+/// border, an icon tile, and a filled-circle checkmark — those all read as 'cards' and the
+/// user asked for less of that. The accent tint alone is enough to mark the chosen option.
 fn mode_card(
     ui: &mut egui::Ui,
     width: f32,
@@ -1807,65 +1789,59 @@ fn mode_card(
     title: &str,
     desc: &str,
     icon: NavIcon,
-    id: &str,
+    _id: &str,
 ) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 148.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 96.0), egui::Sense::click());
     let hovered = resp.hovered();
-    let fill = if selected { theme.accent_tint } else { theme.card_bg };
-    let (sw, sc) = if selected {
-        (1.5, theme.accent)
+
+    // Background: accent tint for the chosen row, hover tint while the user is mousing over the
+    // other one. No stroke. The radius is generous so the rect still reads as a discrete row
+    // rather than a flat slab, but there is no outer border line.
+    if selected {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(8), theme.accent_tint);
     } else if hovered {
-        (1.5, theme.accent)
-    } else {
-        (1.0, theme.card_stroke)
-    };
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(10), fill);
-    ui.painter().rect_stroke(
-        rect,
-        egui::CornerRadius::same(10),
-        (sw, sc),
-        egui::StrokeKind::Inside,
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(8), theme.nav_hover);
+    }
+
+    let icon_color = if selected { theme.accent } else { theme.muted };
+    // Inline icon — no tile behind it.
+    let icon_rect = Rect::from_center_size(
+        pos2(rect.min.x + 26.0, rect.min.y + 24.0),
+        vec2(20.0, 20.0),
+    );
+    draw_nav_icon(ui.painter(), icon_rect, icon, icon_color);
+
+    // Title row.
+    ui.painter().text(
+        pos2(rect.min.x + 50.0, rect.min.y + 24.0),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::proportional(15.0),
+        if selected { theme.text } else { theme.text },
     );
 
-    // Icon tile.
-    let tile = Rect::from_min_size(pos2(rect.min.x + 16.0, rect.min.y + 16.0), vec2(38.0, 38.0));
-    ui.painter()
-        .rect_filled(tile, egui::CornerRadius::same(9), theme.accent_tint_strong);
-    draw_nav_icon(ui.painter(), tile.shrink(9.0), icon, theme.accent);
-
-    // Selected check, top-right.
+    // Selected indicator: a small accent dot at the right edge, not a filled circle with a check.
     if selected {
-        let c = pos2(rect.max.x - 26.0, rect.min.y + 26.0);
-        ui.painter().circle_filled(c, 10.0, theme.accent);
-        ui.painter().text(
-            c,
-            Align2::CENTER_CENTER,
-            "✓",
-            FontId::proportional(11.0),
-            Color32::WHITE,
+        ui.painter().circle_filled(
+            pos2(rect.max.x - 18.0, rect.min.y + 24.0),
+            4.5,
+            theme.accent,
         );
     }
 
-    // Title + wrapped description.
-    let pad = 16.0;
+    // Description text wrapped to the row width.
+    let pad = 18.0;
     let text_w = (rect.width() - pad * 2.0).max(20.0);
     let cp = ui.painter().with_clip_rect(rect);
-    cp.text(
-        pos2(rect.min.x + pad, rect.min.y + 66.0),
-        Align2::LEFT_TOP,
-        title,
-        FontId::proportional(15.0),
-        theme.text,
-    );
-    let desc_font = FontId::proportional(12.5);
-    let mut y = rect.min.y + 88.0;
-    for line in wrap_lines(ui, desc, &desc_font, text_w) {
+    let mut y = rect.min.y + 52.0;
+    for line in wrap_lines(ui, desc, &FontId::proportional(12.5), text_w) {
         cp.text(
             pos2(rect.min.x + pad, y),
             Align2::LEFT_TOP,
             line,
-            desc_font.clone(),
+            FontId::proportional(12.5),
             theme.muted,
         );
         y += 17.0;
