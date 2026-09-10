@@ -70,11 +70,35 @@ pub fn apply_remote_text(state: &Arc<Mutex<ClipState>>, text: &str) {
 
 /// Same as [`apply_remote_text`] for a finished file transfer: write the paths onto the local
 /// pasteboard and remember them so the monitor stays quiet.
+///
+/// The write is retried, because the clipboard is a shared and transiently-locked resource: on
+/// Windows any other process may hold it open, and a pasteboard write can be refused while a
+/// drag is in progress. A single attempt fails often enough to matter, and a failed write loses
+/// the received copy outright — the user then pastes their own stale clipboard and concludes
+/// that cross-machine copy is broken.
 pub fn apply_remote_files(state: &Arc<Mutex<ClipState>>, paths: &[PathBuf]) -> bool {
-    let ok = clipfile::write_files(paths);
+    let mut ok = clipfile::write_files(paths);
+    // Only retry where a write can actually succeed. On Linux `write_files` is a no-op that
+    // always fails, so retrying would stall the reader thread — and the forwarded input sharing
+    // it — for hundreds of milliseconds on every received copy, for a feature that is absent
+    // there anyway.
+    if clipfile::supports_files() {
+        for _ in 0..4 {
+            if ok {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+            ok = clipfile::write_files(paths);
+        }
+    }
     let mut st = state.lock().unwrap();
-    st.files = paths.to_vec();
-    st.text = None;
+    if ok {
+        // Only claim the pasteboard when we really own it. Recording the paths after a failed
+        // write would make the monitor's snapshot describe content that is not on the clipboard,
+        // and would suppress the detection that a later generation bump should trigger.
+        st.files = paths.to_vec();
+        st.text = None;
+    }
     st.gen = clipfile::generation();
     ok
 }

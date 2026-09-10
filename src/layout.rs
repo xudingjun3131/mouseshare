@@ -30,8 +30,18 @@ impl Side {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Screen {
-    /// Unique machine name (must match that machine's `Config.name`).
+    /// Unique name of this *panel*. For a local display this is the machine name (or
+    /// `"<machine> #2"`), for a remote panel it is the name the owning machine gave it.
     pub name: String,
+    /// The machine this panel physically belongs to (`Config.name` of that host). Equals `name`
+    /// for a single-display machine, which is why the field defaults to empty and
+    /// [`Screen::host`] falls back to `name`.
+    ///
+    /// This is the field that makes "one computer, several monitors" work: input is routed to a
+    /// *machine* (one TCP peer) but crossing is decided per *panel*, so a peer with two monitors
+    /// is two draggable tiles that both forward to the same socket.
+    #[serde(default)]
+    pub host: String,
     /// Top-left corner in virtual-desktop coordinates.
     pub ox: i32,
     pub oy: i32,
@@ -63,6 +73,15 @@ fn default_scale() -> f32 {
 }
 
 impl Screen {
+    /// The machine that owns this panel (see [`Screen::host`]).
+    pub fn host(&self) -> &str {
+        if self.host.is_empty() {
+            &self.name
+        } else {
+            &self.host
+        }
+    }
+
     /// Physical pixel size (logical size × UI scale) — what the panel actually renders.
     /// Equals `(w, h)` on non-HiDPI displays and on Windows after DPI awareness.
     pub fn physical_size(&self) -> (u32, u32) {
@@ -80,12 +99,61 @@ impl Screen {
     }
 }
 
+/// One display as reported by the machine that owns it, in that machine's **own** coordinate
+/// space (the origin is that machine's local virtual-desktop origin, not the shared one).
+///
+/// A peer sends its full list of these in `Message::Hello`, which is what lets the hub model a
+/// two-monitor Windows box as two separate tiles — and, crucially, know about the dead space in
+/// an L-shaped arrangement so it never hands the cursor off into a region with no panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelSpec {
+    pub name: String,
+    pub ox: i32,
+    pub oy: i32,
+    pub w: u32,
+    pub h: u32,
+    #[serde(default = "default_scale")]
+    pub scale: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Layout {
     pub screens: Vec<Screen>,
 }
 
 impl Layout {
+    /// Every panel belonging to `host`, in layout order.
+    pub fn panels_of<'a>(&'a self, host: &'a str) -> impl Iterator<Item = &'a Screen> + 'a {
+        self.screens.iter().filter(move |s| s.host() == host)
+    }
+
+    /// Axis-aligned bounding box of one machine's panels. `None` when that machine has no panel
+    /// in the layout (e.g. a peer that has not connected yet).
+    pub fn host_bbox(&self, host: &str) -> Option<(f64, f64, f64, f64)> {
+        let mut it = self.panels_of(host);
+        let first = it.next()?;
+        let (mut l, mut t, mut r, mut b) = (
+            first.ox as f64,
+            first.oy as f64,
+            first.ox as f64 + first.w as f64,
+            first.oy as f64 + first.h as f64,
+        );
+        for s in it {
+            l = l.min(s.ox as f64);
+            t = t.min(s.oy as f64);
+            r = r.max(s.ox as f64 + s.w as f64);
+            b = b.max(s.oy as f64 + s.h as f64);
+        }
+        Some((l, t, r, b))
+    }
+
+    /// Top-left corner of a machine's panel group — the anchor that survives a refresh, so the
+    /// user's placement of the machine is preserved when it reconnects or changes resolution.
+    pub fn machine_origin(&self, host: &str) -> Option<(i32, i32)> {
+        let b = self.host_bbox(host)?;
+        Some((b.0 as i32, b.1 as i32))
+    }
+
     /// Index of the screen that contains the point, if any.
     pub fn screen_at(&self, x: f64, y: f64) -> Option<usize> {
         self.screens.iter().position(|s| s.contains(x, y))
@@ -149,6 +217,14 @@ impl Layout {
             .unwrap_or(1.0)
     }
 
+    /// UI scale of the machine `host`'s coordinate space. A machine may mix a Retina panel with a
+    /// 1x one; the reported `Hello` scale (and therefore the forwarded-delta conversion) is a
+    /// single number per machine, so this returns the first panel's scale — which is the same
+    /// value the peer advertises.
+    pub fn scale_of_host(&self, host: &str) -> f32 {
+        self.panels_of(host).next().map(|s| s.scale).unwrap_or(1.0)
+    }
+
     /// UI scale factor of the *local* screen under `loc`, falling back to the first local screen
     /// and then to 1.0. Used to normalise forwarded mouse deltas: the cursor may sit on a Retina
     /// panel (2.0) or on an external 1x monitor, and each needs a different conversion.
@@ -165,40 +241,100 @@ impl Layout {
         locals[0].scale
     }
 
-    /// Ensure a screen named `name` exists, adding it (placed *adjacent* to the right of the
-    /// current rightmost screen — no gap) only if absent. Returns true when a new screen was
-    /// created. Used to auto-register every secondary that connects, so the client count is
-    /// unbounded.
+    /// Register (or refresh) **every** panel of the machine `host` from the list it reported.
     ///
-    /// Placing the new screen flush against the existing extent (instead of leaving a 40px dead
-    /// band) is what makes cursor hand-off possible: the virtual cursor advances continuously and
-    /// steps straight from the last local pixel into the first remote pixel, so `screen_at` finds
-    /// the remote screen instead of a gap that `clamp` would snap back.
-    pub fn ensure_screen(&mut self, name: &str, w: u32, h: u32, is_local: bool, scale: f32) -> bool {
-        // Already known: refresh the metrics (a peer may reconnect at a different resolution or
-        // after the user changed its display scaling) rather than keeping stale numbers forever.
-        if let Some(s) = self.screens.iter_mut().find(|s| s.name == name) {
-            s.w = w;
-            s.h = h;
-            s.scale = scale;
+    /// Placement rules, and why they are what they are:
+    ///
+    /// * A machine that is new to the layout is placed *flush* against the current right edge, its
+    ///   panels keeping the relative offsets they have on their own machine (so an L-shaped or
+    ///   stacked arrangement is modelled faithfully — otherwise crossing could fire into a region
+    ///   with no panel).
+    /// * A machine that is already known keeps its **anchor** (the top-left of its panel group) and
+    ///   only its panel sizes / offsets are refreshed. That is what makes the user's drag stick
+    ///   across a peer reconnect — and it is why the anchor, not the individual tiles, is the unit
+    ///   of persistence.
+    ///
+    /// Returns `true` when the layout changed in a way worth broadcasting.
+    pub fn ensure_host(&mut self, host: &str, panels: &[PanelSpec]) -> bool {
+        if panels.is_empty() {
             return false;
         }
-        let max_x = self
-            .screens
-            .iter()
-            .map(|s| s.ox + s.w as i32)
-            .max()
-            .unwrap_or(0);
-        self.screens.push(Screen {
-            name: name.to_string(),
-            ox: if self.screens.is_empty() { 0 } else { max_x },
-            oy: 0,
-            w,
-            h,
-            is_local,
-            scale,
-        });
-        true
+        let known = self.screens.iter().any(|s| s.host() == host);
+        if !known {
+            // Flush against the right edge of everything already placed, top-aligned with the
+            // local screens when there are any (so a freshly connected peer is reachable from the
+            // edge the user is most likely sitting on).
+            let max_x = self
+                .screens
+                .iter()
+                .map(|s| s.ox + s.w as i32)
+                .max()
+                .unwrap_or(0);
+            let top = self
+                .local_bbox()
+                .map(|b| b.1 as i32)
+                .or_else(|| self.screens.iter().map(|s| s.oy).min())
+                .unwrap_or(0);
+            for p in panels {
+                self.screens.push(Screen {
+                    name: p.name.clone(),
+                    host: host.to_string(),
+                    ox: max_x + p.ox,
+                    oy: top + p.oy,
+                    w: p.w,
+                    h: p.h,
+                    is_local: false,
+                    scale: p.scale,
+                });
+            }
+            return true;
+        }
+
+        // Already known: re-anchor the group and refresh geometry.
+        let (ax, ay) = self.machine_origin(host).unwrap_or((0, 0));
+        let mut changed = false;
+        for p in panels {
+            match self
+                .screens
+                .iter_mut()
+                .find(|s| s.name == p.name && s.host() == host)
+            {
+                Some(s) => {
+                    if s.w != p.w || s.h != p.h || s.scale != p.scale {
+                        changed = true;
+                    }
+                    s.w = p.w;
+                    s.h = p.h;
+                    s.scale = p.scale;
+                    s.ox = ax + p.ox;
+                    s.oy = ay + p.oy;
+                }
+                None => {
+                    // A monitor that was not there last time (or a renamed one).
+                    let s = Screen {
+                        name: p.name.clone(),
+                        host: host.to_string(),
+                        ox: ax + p.ox,
+                        oy: ay + p.oy,
+                        w: p.w,
+                        h: p.h,
+                        is_local: false,
+                        scale: p.scale,
+                    };
+                    self.screens.push(s);
+                    changed = true;
+                }
+            }
+        }
+        // Drop panels this machine no longer reports (unplugged monitor).
+        let before = self.screens.len();
+        let mine: Vec<String> = panels.iter().map(|p| p.name.clone()).collect();
+        self.screens
+            .retain(|s| s.host() != host || mine.contains(&s.name));
+        if self.screens.len() != before {
+            changed = true;
+        }
+        changed
     }
 
     /// Clone the screen at `idx` with a unique name and an offset to the right, so it can be
@@ -216,6 +352,7 @@ impl Layout {
             };
             self.screens.push(Screen {
                 name: new_name,
+                host: src.host.clone(),
                 ox: src.ox + src.w as i32 + 40,
                 oy: src.oy,
                 w: src.w,
@@ -223,6 +360,16 @@ impl Layout {
                 is_local: src.is_local,
                 scale: src.scale,
             });
+        }
+    }
+
+    /// Move every panel of `host` by `(dx, dy)` — dragging one tile of a multi-monitor machine
+    /// moves the whole machine, because the arrangement *inside* a machine is a fact of its own
+    /// OS, not a choice the hub gets to make.
+    pub fn move_host(&mut self, host: &str, dx: i32, dy: i32) {
+        for s in self.screens.iter_mut().filter(|s| s.host() == host) {
+            s.ox += dx;
+            s.oy += dy;
         }
     }
 }

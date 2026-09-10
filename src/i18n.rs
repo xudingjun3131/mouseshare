@@ -36,6 +36,30 @@ pub fn tr_file_too_big() -> String {
     }
 }
 
+/// A copy was detected on the pasteboard but none of the paths could be read (usually a temp
+/// file the source app already deleted). Without this the copy appeared to do nothing at all.
+pub fn tr_file_nothing_to_send() -> String {
+    match current_lang() {
+        Lang::Zh => "检测到复制，但源文件已不存在（可能来自临时文件），未发送。".to_string(),
+        Lang::En => {
+            "Detected a copy, but the source file is gone (probably a temp file) — nothing sent."
+                .to_string()
+        }
+    }
+}
+
+/// Files arrived from another machine but could not be put on the local pasteboard, so pasting
+/// would silently yield the old clipboard contents.
+pub fn tr_file_apply_failed(n: usize) -> String {
+    match current_lang() {
+        Lang::Zh => format!("已接收 {} 个文件，但写入系统剪贴板失败，无法直接粘贴。", n),
+        Lang::En => format!(
+            "Received {} file(s) but could not write them to the clipboard — pasting will not work.",
+            n
+        ),
+    }
+}
+
 /// A file copy finished arriving from another machine.
 pub fn tr_file_received(n: usize) -> String {
     match current_lang() {
@@ -78,7 +102,11 @@ pub fn tr_event(lang: Lang, line: &str) -> Option<(String, Severity)> {
     let lower = line.to_ascii_lowercase();
     let has = |n: &str| lower.contains(n);
     let t = |z: &str, e: &str| -> String {
-        if zh { z.to_string() } else { e.to_string() }
+        if zh {
+            z.to_string()
+        } else {
+            e.to_string()
+        }
     };
 
     if has("capture failed") {
@@ -92,15 +120,15 @@ pub fn tr_event(lang: Lang, line: &str) -> Option<(String, Severity)> {
     }
     if has("app nap disabled") {
         return Some((
-            t("已关闭系统节能休眠，避免后台卡顿", "Disabled system power nap to prevent stalls"),
+            t(
+                "已关闭系统节能休眠，避免后台卡顿",
+                "Disabled system power nap to prevent stalls",
+            ),
             Severity::Ok,
         ));
     }
     if has("capture thread started") {
-        return Some((
-            t("输入捕获已启动", "Input capture started"),
-            Severity::Ok,
-        ));
+        return Some((t("输入捕获已启动", "Input capture started"), Severity::Ok));
     }
     if has("startup mode=") {
         let role = if zh { "主机" } else { "primary" };
@@ -110,20 +138,50 @@ pub fn tr_event(lang: Lang, line: &str) -> Option<(String, Severity)> {
         ));
     }
     if has("file-recv-first-chunk") || has("file-recv token=") {
-        return Some((
-            t("正在接收文件…", "Receiving files…"),
-            Severity::Info,
-        ));
+        return Some((t("正在接收文件…", "Receiving files…"), Severity::Info));
     }
     if has("file-send aborted") {
+        return Some((t("文件发送已中止", "File send aborted"), Severity::Warn));
+    }
+    if has("file-send skip") {
         return Some((
-            t("文件发送已中止", "File send aborted"),
+            t(
+                "有文件无法读取，已跳过",
+                "A file could not be read and was skipped",
+            ),
             Severity::Warn,
+        ));
+    }
+    if has("file-recv-refused") {
+        return Some((
+            t(
+                "对方发来的文件超过大小上限，已拒绝",
+                "Incoming files exceed the size limit — refused",
+            ),
+            Severity::Warn,
+        ));
+    }
+    if has("file-recv cannot create") {
+        return Some((
+            t(
+                "无法在磁盘上创建接收到的文件",
+                "Could not create a received file on disk",
+            ),
+            Severity::Error,
+        ));
+    }
+    if has("unsafe destination") {
+        return Some((
+            t("已拦截不安全的接收路径", "Blocked an unsafe incoming path"),
+            Severity::Error,
         ));
     }
     if has("file-apply-failed") {
         return Some((
-            t("写入系统剪贴板失败", "Could not write to the system clipboard"),
+            t(
+                "写入系统剪贴板失败",
+                "Could not write to the system clipboard",
+            ),
             Severity::Error,
         ));
     }
@@ -263,6 +321,7 @@ pub struct Tr {
     pub layout_title: &'static str,
     pub layout_hint: &'static str,
     pub layout_tip: &'static str,
+    pub layout_local_fixed: &'static str,
     pub legend_primary: &'static str,
     pub legend_me: &'static str,
     pub legend_client: &'static str,
@@ -392,6 +451,7 @@ pub const ZH: Tr = Tr {
     layout_title: "屏幕布局 — 拖动屏幕调整位置",
     layout_hint: "按桌面上的实际摆放排布各块屏幕。主机（高亮）是真实光标所在，光标越过边缘即把控制权交给相邻机器。",
     layout_tip: "提示：副机色块拖到主机屏幕边上（允许小误差）即可跨屏；把鼠标贴住该边缘保持不动约半秒、或向边缘一推即跨。橙色圆点 = 实时鼠标位置。",
+    layout_local_fixed: "本机屏幕的位置由系统决定，不能拖动；拖动副机色块，把它贴到这块屏幕的上 / 下 / 左 / 右任一边，即可实现对应方向的跨屏。",
     legend_primary: "主机",
     legend_me: "本机",
     legend_client: "客户端",
@@ -518,6 +578,7 @@ pub const EN: Tr = Tr {
     layout_title: "Screen layout — drag a screen to reposition it",
     layout_hint: "Place screens the way they sit on your desk. The primary (highlighted) is where your real cursor lives; cross an edge to hand control to a neighbour.",
     layout_tip: "Tip: drag a secondary roughly against the primary's edge (small offsets fine); rest or push the mouse into that edge to cross. Orange dot = live cursor.",
+    layout_local_fixed: "This machine's screens are positioned by the OS and cannot be dragged. Drag a secondary tile flush against any side (top / bottom / left / right) of one of these screens to make the cursor cross that way.",
     legend_primary: "Primary",
     legend_me: "This machine",
     legend_client: "Client",

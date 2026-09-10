@@ -21,6 +21,14 @@ pub type Incoming = Sender<(String, Message)>;
 /// what keeps the remote cursor smooth instead of stuttering on per-event write overhead.
 const WRITE_BATCH: usize = 64;
 
+/// Byte budget for one coalesced write.
+///
+/// `WRITE_BATCH` alone is not a bound: a file copy queues 256 KiB payload frames, so 64 of them is
+/// 16 MB handed to a single `write_all`. Every mouse delta queued behind that burst waits for the
+/// whole thing to drain — which is exactly the "sudden stutter while transferring a file" symptom.
+/// Capping the *bytes* per write keeps the worst-case delay bounded no matter what else is queued.
+const WRITE_BATCH_BYTES: usize = 128 * 1024;
+
 /// Compose one length-prefixed frame into `out` (reused across calls to avoid re-allocating).
 fn encode_into(out: &mut Vec<u8>, msg: &Message) {
     let start = out.len();
@@ -43,7 +51,8 @@ fn read_msg(stream: &mut impl Read) -> std::io::Result<Message> {
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf)?;
-    serde_json::from_slice(&buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(&buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Upper bound on a single frame. File chunks are 256 KB (≈350 KB base64), so this leaves
@@ -62,17 +71,36 @@ const MAX_FRAME: usize = 8 << 20;
 /// What *is* batched is only the syscall: everything already queued is encoded into one buffer and
 /// handed to a single `write`, so a busy trackpad does not cost one syscall per event. The wire
 /// still carries each frame separately.
+///
+/// Two rules keep input responsive while a file copy shares the same connection:
+///
+/// * the batch is bounded by **bytes** as well as by count, so a queue full of file payload frames
+///   cannot turn one `write` into a multi-megabyte stall; and
+/// * the payload chunks themselves are small (`FILE_CHUNK`) and the sender yields between them.
+///
+/// Deliberately **not** done: hoisting `Input` frames ahead of everything else. It looks tempting —
+/// input and file payload are independent streams — but the input stream is *not* independent of
+/// the control stream: `EnterScreen` has to reach the client before the first forwarded delta, or
+/// the client applies a delta it does not yet believe it is receiving (and, worse, may read it as a
+/// request to hand control straight back). Reordering across message kinds silently breaks that
+/// ordering guarantee; bounding the batch achieves the same latency goal without it.
 fn pump_writes(mut ws: TcpStream, rx: Receiver<Message>) {
+    // Every forwarded event leaves through this thread; keep it on the interactive path.
+    crate::capture::boost_current_thread();
     let mut pending: Vec<Message> = Vec::with_capacity(WRITE_BATCH);
     let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
     while let Ok(first) = rx.recv() {
         pending.clear();
         pending.push(first);
+        let mut bytes = estimate_frame_len(&pending[0]);
         // Take only what is *already* queued — never wait for more, or a single move would sit
         // in the buffer until the next one arrived.
-        while pending.len() < WRITE_BATCH {
+        while pending.len() < WRITE_BATCH && bytes < WRITE_BATCH_BYTES {
             match rx.try_recv() {
-                Ok(m) => pending.push(m),
+                Ok(m) => {
+                    bytes += estimate_frame_len(&m);
+                    pending.push(m);
+                }
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
@@ -83,6 +111,17 @@ fn pump_writes(mut ws: TcpStream, rx: Receiver<Message>) {
         if ws.write_all(&out).is_err() {
             break;
         }
+    }
+}
+
+/// Cheap upper bound on a frame's encoded size, used only for the batch byte budget. Guessing high
+/// is safe (a slightly smaller batch); the point is to never under-count a payload frame.
+fn estimate_frame_len(m: &Message) -> usize {
+    const HEADER: usize = 64;
+    match m {
+        Message::FileChunk { data, .. } => HEADER + data.len(),
+        Message::Clipboard { text } => HEADER + text.len(),
+        _ => HEADER,
     }
 }
 
@@ -199,7 +238,8 @@ impl Net {
         }
     }
 
-    pub fn peer_count(&self) -> usize {        match self {
+    pub fn peer_count(&self) -> usize {
+        match self {
             Net::Primary { peers } => peers.lock().unwrap().len(),
             Net::Secondary { .. } => 1,
             Net::Idle => 0,
@@ -213,6 +253,15 @@ impl Net {
         match self {
             Net::Primary { peers } => peers.lock().unwrap().contains_key(name),
             Net::Secondary { .. } | Net::Idle => false,
+        }
+    }
+
+    /// Names of every currently connected peer. Snapshot for the control plane, which must be able
+    /// to answer "is this machine reachable?" without taking a lock inside the event tap.
+    pub fn peer_names(&self) -> Vec<String> {
+        match self {
+            Net::Primary { peers } => peers.lock().unwrap().keys().cloned().collect(),
+            Net::Secondary { .. } | Net::Idle => Vec::new(),
         }
     }
 
@@ -240,7 +289,9 @@ pub fn start_hub(
     let listener = TcpListener::bind(("0.0.0.0", port))?;
     log::info!("primary hub listening on :{}", port);
     let peers: Arc<Mutex<HashMap<String, Sender<Message>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let net = Arc::new(Mutex::new(Net::Primary { peers: peers.clone() }));
+    let net = Arc::new(Mutex::new(Net::Primary {
+        peers: peers.clone(),
+    }));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
@@ -269,13 +320,14 @@ fn handle_primary_conn(
     // The first frame must be Hello so we learn the peer's name.
     let mut rs = BufReader::new(read_stream);
     let hello = read_msg(&mut rs).ok();
-    let (name, width, height, scale) = match hello {
+    let (name, width, height, scale, panels) = match hello {
         Some(Message::Hello {
             name,
             width,
             height,
             scale,
-        }) => (name, width, height, scale),
+            panels,
+        }) => (name, width, height, scale, panels),
         _ => {
             log::warn!("peer did not send Hello; dropping");
             return;
@@ -283,11 +335,21 @@ fn handle_primary_conn(
     };
     log::info!("secondary connected: {} (scale {})", name, scale);
 
-    // Register the peer's screen (idempotent) so the layout we push already includes it.
-    layout
-        .lock()
-        .unwrap()
-        .ensure_screen(&name, width, height, false, scale);
+    // Register the peer's panel(s) (idempotent) so the layout we push already includes them. A
+    // peer that reports no panel list only advertises a bounding box; treat that as one panel.
+    let specs: Vec<crate::layout::PanelSpec> = if panels.is_empty() {
+        vec![crate::layout::PanelSpec {
+            name: name.clone(),
+            ox: 0,
+            oy: 0,
+            w: width,
+            h: height,
+            scale,
+        }]
+    } else {
+        panels
+    };
+    layout.lock().unwrap().ensure_host(&name, &specs);
 
     let (tx, rx) = channel::<Message>();
     peers.lock().unwrap().insert(name.clone(), tx.clone());

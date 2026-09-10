@@ -28,10 +28,10 @@ mod app;
 mod capture;
 mod clipboard;
 mod clipfile;
-mod discovery;
 mod config;
 mod control;
 mod diag;
+mod discovery;
 mod i18n;
 mod input;
 mod layout;
@@ -49,13 +49,16 @@ pub use control::Ctrl;
 use log::info;
 
 use crate::config::{load_config, save_config, Config};
-use crate::control::{CaptureMode, GrabCtx, HotkeyState, on_enter_screen, on_leave_screen, on_secondary_input, cycle_control, return_control};
+use crate::control::{
+    cycle_control, on_enter_screen, on_leave_screen, on_secondary_input, return_control,
+    CaptureMode, GrabCtx, HotkeyState,
+};
 use crate::i18n::Lang;
-use crate::layout::Layout;
+use crate::layout::{Layout, PanelSpec, Screen};
 use crate::network::{connect_client, start_hub, Net};
 use crate::protocol::Message;
-use std::sync::mpsc::channel;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -122,8 +125,20 @@ fn main() -> anyhow::Result<()> {
     let mut startup_error: Option<String> = None;
 
     // Shared layout state (hub pushes screens to secondaries, capture reads bounds for crossing).
+    //
+    // On the **primary**, the local panels are always re-detected from the OS (they are a fact, not
+    // a preference), but the *remote* panels are restored from the saved config. That merge is what
+    // lets the user park a client on the left / above / below and have it stay there: rebuilding the
+    // layout from scratch every launch used to drop every remote tile back to the right edge, so
+    // left/up/down crossing silently stopped working after a restart.
     let layout: Arc<Mutex<Layout>> = Arc::new(Mutex::new(if mode == "primary" {
-        detect_primary_layout(&primary_name)
+        let mut l = detect_primary_layout(&primary_name);
+        for s in config.layout.screens.iter().filter(|s| !s.is_local) {
+            if !l.screens.iter().any(|x| x.name == s.name) {
+                l.screens.push(s.clone());
+            }
+        }
+        l
     } else {
         config.layout.clone()
     }));
@@ -141,7 +156,7 @@ fn main() -> anyhow::Result<()> {
     control::set_motion_scale(config.motion_scale);
     // What we advertise to the hub: our local screens' bounding box (logical units) plus the UI
     // scale of that coordinate space, so the primary can normalise forwarded mouse deltas.
-    let (my_w, my_h, my_scale) = hello_metrics(&own_layout);
+    let (my_w, my_h, my_scale, my_panels) = hello_panels(&own_layout);
 
     let net: Arc<Mutex<Net>> = if mode == "primary" {
         match start_hub(port, inc_tx.clone(), layout.clone()) {
@@ -162,6 +177,7 @@ fn main() -> anyhow::Result<()> {
                     width: my_w,
                     height: my_h,
                     scale: my_scale,
+                    panels: my_panels.clone(),
                 })
                 .ok();
                 net_inner
@@ -178,7 +194,12 @@ fn main() -> anyhow::Result<()> {
     // Control plane.
     let ctrl: Arc<Mutex<Ctrl>> = Arc::new(Mutex::new(Ctrl {
         local_bbox: own_layout.local_bbox(),
-        local_screens: own_layout.screens.iter().filter(|s| s.is_local).cloned().collect(),
+        local_screens: own_layout
+            .screens
+            .iter()
+            .filter(|s| s.is_local)
+            .cloned()
+            .collect(),
         layout_snap: Arc::new(layout.lock().unwrap().clone()),
         ..Default::default()
     }));
@@ -215,19 +236,24 @@ fn main() -> anyhow::Result<()> {
         Arc::new(Mutex::new(clipboard::ClipState::default()));
 
     // Reassembly state for incoming file transfers (one per machine).
-    let file_rx: Arc<Mutex<transfer::Receiver>> = Arc::new(Mutex::new(transfer::Receiver::default()));
+    let file_rx: Arc<Mutex<transfer::Receiver>> =
+        Arc::new(Mutex::new(transfer::Receiver::default()));
 
     // The event-tap callback runs inside macOS's input pipeline and must never block on a mutex
     // the GUI thread might be holding — a stalled tap is silently disabled, and a disabled tap
     // stops dropping events (both cursors move at once). So the control plane reads a snapshot
-    // of the layout that this thread refreshes a few times a second.
+    // of the layout (and of who is reachable) that this thread refreshes a few times a second.
     {
         let layout = layout.clone();
         let ctrl = ctrl.clone();
+        let net_snap = net.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(400));
             let snap = Arc::new(layout.lock().unwrap().clone());
-            ctrl.lock().unwrap().layout_snap = snap;
+            let live = Arc::new(net_snap.lock().unwrap().peer_names());
+            let mut c = ctrl.lock().unwrap();
+            c.layout_snap = snap;
+            c.live = live;
         });
     }
 
@@ -245,7 +271,10 @@ fn main() -> anyhow::Result<()> {
                         s.name, s.w, s.h, s.ox, s.oy, phys.0, phys.1, s.is_local
                     )
                 } else {
-                    format!("{}({}x{}@{},{} local={})", s.name, s.w, s.h, s.ox, s.oy, s.is_local)
+                    format!(
+                        "{}({}x{}@{},{} local={})",
+                        s.name, s.w, s.h, s.ox, s.oy, s.is_local
+                    )
                 }
             })
             .collect::<Vec<_>>()
@@ -288,9 +317,7 @@ fn main() -> anyhow::Result<()> {
                     | Message::FileChunk { .. }
                     | Message::FileEnd { .. } => {
                         if mode2 == "primary" {
-                            net.lock()
-                                .unwrap()
-                                .broadcast_all_except(msg.clone(), &from);
+                            net.lock().unwrap().broadcast_all_except(msg.clone(), &from);
                         }
                         let finished = file_rx.lock().unwrap().handle(msg);
                         if let Some(paths) = finished {
@@ -312,6 +339,7 @@ fn main() -> anyhow::Result<()> {
                                     "FILE-APPLY-FAILED n={} (pasteboard write rejected the paths)",
                                     n
                                 ));
+                                crate::app::notify(crate::i18n::tr_file_apply_failed(n));
                             }
                         }
                     }
@@ -321,14 +349,30 @@ fn main() -> anyhow::Result<()> {
                             on_secondary_input(&grab_ctx, ev);
                         }
                     }
-                    Message::Hello { name, width, height, scale } => {
+                    Message::Hello {
+                        name,
+                        width,
+                        height,
+                        scale,
+                        panels,
+                    } => {
                         if mode2 == "primary" {
-                            if layout
-                                .lock()
-                                .unwrap()
-                                .ensure_screen(&name, width, height, false, scale)
-                            {
-                                info!("auto-registered screen for peer {}", name);
+                            // A peer that predates the panel list only reports a bounding box;
+                            // model that as the single panel it is.
+                            let specs: Vec<PanelSpec> = if panels.is_empty() {
+                                vec![PanelSpec {
+                                    name: name.clone(),
+                                    ox: 0,
+                                    oy: 0,
+                                    w: width,
+                                    h: height,
+                                    scale,
+                                }]
+                            } else {
+                                panels
+                            };
+                            if layout.lock().unwrap().ensure_host(&name, &specs) {
+                                info!("registered {} panel(s) for peer {}", specs.len(), name);
                             }
                         }
                     }
@@ -337,9 +381,14 @@ fn main() -> anyhow::Result<()> {
                             *layout.lock().unwrap() = new_layout;
                         }
                     }
-                    Message::EnterScreen { side, fx, fy } => {
+                    Message::EnterScreen {
+                        side,
+                        fx,
+                        fy,
+                        panel,
+                    } => {
                         if mode2 == "secondary" {
-                            on_enter_screen(&grab_ctx, side, fx, fy);
+                            on_enter_screen(&grab_ctx, side, fx, fy, panel);
                         }
                     }
                     Message::LeaveScreen => {
@@ -373,12 +422,16 @@ fn main() -> anyhow::Result<()> {
     let discovered: discovery::DiscoveredList = discovery::new_list();
     if mode == "primary" {
         discovery::start_beacon(port, my_name.clone());
-        info!("discovery beacon broadcasting on udp/{}", discovery::DISCOVERY_PORT);
+        info!(
+            "discovery beacon broadcasting on udp/{}",
+            discovery::DISCOVERY_PORT
+        );
     } else {
         let net_d = net.clone();
         let inc_tx_d = inc_tx.clone();
         let discovered_d = discovered.clone();
         let my_name_d = my_name.clone();
+        let my_panels_d = my_panels.clone();
         let auto_guard = Arc::new(Mutex::new(false));
         discovery::start_listener(move |d: discovery::Discovered| {
             // Record for the UI's "discovered devices" card.
@@ -404,6 +457,7 @@ fn main() -> anyhow::Result<()> {
                         width: my_w,
                         height: my_h,
                         scale: my_scale,
+                        panels: my_panels_d.clone(),
                     });
                     info!("auto-connected to primary {}", addr);
                     *auto_guard.lock().unwrap() = false;
@@ -432,7 +486,10 @@ fn main() -> anyhow::Result<()> {
         // Native grab: CGEventTap on macOS; rdev observer (legacy) elsewhere.
         capture::start_capture(grab_ctx.clone(), capture_failed.clone());
     } else {
-        info!("running as secondary; waiting for input from {}", server_addr);
+        info!(
+            "running as secondary; waiting for input from {}",
+            server_addr
+        );
         // Lightweight hotkey listener so the user can hand control back from the Windows/Mac side.
         let net_hk = net.clone();
         let hk = Arc::new(Mutex::new(HotkeyState::default()));
@@ -520,22 +577,37 @@ fn hotkey_fired(k: rdev::Key, down: bool, st: &mut HotkeyState) -> bool {
     control::hotkey_fired(k, down, st)
 }
 
-/// The metrics this machine advertises in `Message::Hello`: its own local screens' bounding box
-/// (in **logical** units — points on a Retina Mac, physical pixels once a Windows process is DPI
-/// aware) and the UI scale of that coordinate space. The scale is what lets the primary convert
-/// its own mouse deltas into this machine's units so the cursor tracks at the same speed.
-fn hello_metrics(own: &Layout) -> (u32, u32, f32) {
-    let (w, h) = match own.local_bbox() {
+/// The payload this machine advertises in `Message::Hello`: its own screens' bounding box (in
+/// **logical** units — points on a Retina Mac, physical pixels once a Windows process is DPI
+/// aware), the UI scale of that coordinate space, and the full panel list.
+///
+/// The scale is what lets the primary convert its own mouse deltas into this machine's units so the
+/// cursor tracks at the same speed. The panel list is what lets the primary model a multi-monitor
+/// machine faithfully instead of approximating it with a bounding box full of dead space. Panel
+/// offsets are rebased onto the group's own top-left so the hub can anchor the machine anywhere.
+pub fn hello_panels(own: &Layout) -> (u32, u32, f32, Vec<PanelSpec>) {
+    let locals: Vec<&Screen> = own.screens.iter().filter(|s| s.is_local).collect();
+    let bbox = own.local_bbox();
+    let (w, h) = match bbox {
         Some((l, t, r, b)) => ((r - l).max(1.0) as u32, (b - t).max(1.0) as u32),
         None => (1920, 1080),
     };
-    let scale = own
-        .screens
+    let scale = locals.first().map(|s| s.scale).unwrap_or(1.0);
+    let (ox, oy) = bbox
+        .map(|b| (b.0.round() as i32, b.1.round() as i32))
+        .unwrap_or((0, 0));
+    let panels = locals
         .iter()
-        .find(|s| s.is_local)
-        .map(|s| s.scale)
-        .unwrap_or(1.0);
-    (w, h, scale)
+        .map(|s| PanelSpec {
+            name: s.name.clone(),
+            ox: s.ox - ox,
+            oy: s.oy - oy,
+            w: s.w,
+            h: s.h,
+            scale: s.scale,
+        })
+        .collect();
+    (w, h, scale, panels)
 }
 
 /// Build the primary's initial layout from the machine's real displays.
@@ -558,8 +630,9 @@ fn detect_primary_layout(primary_name: &str) -> Layout {
                     } else {
                         format!("{} #{}", primary_name, i + 1)
                     };
-                    screens.push(crate::layout::Screen {
+                    screens.push(Screen {
                         name,
+                        host: primary_name.to_string(),
                         ox: disp.x,
                         oy: disp.y,
                         w: disp.width,
@@ -591,8 +664,9 @@ fn detect_primary_layout(primary_name: &str) -> Layout {
         let _ = primary_name;
         if let Ok((w, h)) = rdev::display_size() {
             return Layout {
-                screens: vec![crate::layout::Screen {
+                screens: vec![Screen {
                     name: primary_name.to_string(),
+                    host: primary_name.to_string(),
                     ox: 0,
                     oy: 0,
                     w: w as u32,
@@ -604,8 +678,9 @@ fn detect_primary_layout(primary_name: &str) -> Layout {
         }
     }
     Layout {
-        screens: vec![crate::layout::Screen {
+        screens: vec![Screen {
             name: primary_name.to_string(),
+            host: primary_name.to_string(),
             ox: 0,
             oy: 0,
             w: 1920,

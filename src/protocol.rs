@@ -43,14 +43,28 @@ pub enum InputEvent {
     /// physical cursor speed instead of half of it. `dx`/`dy` are signed pixel deltas (macOS
     /// `kCGMouseEventDeltaX/Y`, which may be fractional); the receiver adds them to its current
     /// cursor position and clamps to its own screen.
-    MouseMotion { dx: f64, dy: f64 },
-    MouseDown { button: MsButton },
-    MouseUp { button: MsButton },
+    MouseMotion {
+        dx: f64,
+        dy: f64,
+    },
+    MouseDown {
+        button: MsButton,
+    },
+    MouseUp {
+        button: MsButton,
+    },
     /// Wheel deltas (sign conventions follow rdev: dy > 0 scrolls down).
-    Wheel { dx: i64, dy: i64 },
+    Wheel {
+        dx: i64,
+        dy: i64,
+    },
     /// Physical key (QWERTY layout) so it maps consistently across machines.
-    KeyDown { key: Key },
-    KeyUp { key: Key },
+    KeyDown {
+        key: Key,
+    },
+    KeyUp {
+        key: Key,
+    },
 }
 
 /// One file inside a cross-machine clipboard copy.
@@ -64,10 +78,14 @@ pub struct FileEntry {
     pub size: u64,
 }
 
-/// Payload chunk size for file transfer: 256 KiB of raw bytes (≈350 KB once base64-encoded).
-/// Large enough that a 10 MB copy is only 40 frames, small enough that a chunk never blocks
-/// the input stream for a noticeable time.
-pub const FILE_CHUNK: usize = 256 * 1024;
+/// Payload chunk size for file transfer: 64 KiB of raw bytes (≈87 KB once base64-encoded).
+///
+/// Deliberately small. File payload and forwarded mouse motion share one TCP connection, and the
+/// writer emits whatever is queued as one `write`: a 256 KiB chunk (what this used to be) meant a
+/// single 350 KB write every time, so a cursor delta arriving mid-copy could wait for the whole
+/// chunk. 64 KiB keeps a copy's throughput the same on any modern link while cutting the worst-case
+/// delay for an input frame by 4×.
+pub const FILE_CHUNK: usize = 64 * 1024;
 
 /// Hard cap on one file copy (files + total bytes). Anything larger is skipped with a
 /// warning rather than buffering hundreds of megabytes in memory on both machines.
@@ -87,6 +105,17 @@ pub enum Message {
         /// secondary at half speed. `#[serde(default)]` keeps peers that predate the field working.
         #[serde(default = "default_hello_scale")]
         scale: f32,
+        /// Every display this machine owns, in its own coordinate space.
+        ///
+        /// `width`/`height` above are only the *bounding box* of these, which is not enough to
+        /// model a machine whose monitors are stacked or L-shaped: the bbox of an L contains dead
+        /// space, and handing the cursor off into dead space is how a multi-monitor client ends up
+        /// with the cursor stuck (or bounced straight back). Sending the real panel list lets the
+        /// hub place every panel as its own tile and know where the holes are.
+        ///
+        /// Empty from a peer that predates the field; the hub then falls back to the bbox.
+        #[serde(default)]
+        panels: Vec<crate::layout::PanelSpec>,
     },
     /// An input event destined for the machine that currently has control (routed by the hub
     /// / applied by the client).
@@ -101,8 +130,16 @@ pub enum Message {
     /// Hint: the cursor just entered a secondary screen. `side` is the edge of the *controlling*
     /// machine that the secondary sits beyond (so the secondary seeds its own cursor at the
     /// opposite edge); `fx`/`fy` are the fractional position along that edge where the cursor
-    /// crossed (0..1), used to align entry vertically/horizontally.
-    EnterScreen { side: Side, fx: f64, fy: f64 },
+    /// crossed (0..1), used to align entry vertically/horizontally. `panel` names the specific
+    /// display of the receiving machine the cursor landed on, so a multi-monitor client seeds on
+    /// the panel the hub actually attached the cursor to rather than on its bounding box.
+    EnterScreen {
+        side: Side,
+        fx: f64,
+        fy: f64,
+        #[serde(default)]
+        panel: Option<String>,
+    },
     /// Hint: the cursor just left a secondary screen and control returned to the primary.
     LeaveScreen,
     /// Keep-alive.
@@ -119,10 +156,7 @@ pub enum Message {
     /// size); the bytes follow as a stream of `FileChunk` frames and the copy is closed by
     /// `FileEnd`. `token` ties the three together so two machines copying at the same time
     /// cannot interleave into one corrupted transfer.
-    ClipboardFiles {
-        token: u64,
-        entries: Vec<FileEntry>,
-    },
+    ClipboardFiles { token: u64, entries: Vec<FileEntry> },
     /// A base64 chunk of file data for `token`.
     FileChunk { token: u64, seq: u64, data: String },
     /// End of the file transfer for `token`.

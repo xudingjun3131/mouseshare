@@ -50,6 +50,7 @@ impl Default for Config {
             layout: Layout {
                 screens: vec![Screen {
                     name: host.clone(),
+                    host: host.clone(),
                     ox: 0,
                     oy: 0,
                     w: 1920,

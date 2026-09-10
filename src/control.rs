@@ -29,15 +29,24 @@ use std::sync::{Arc, Mutex};
 /// macOS, or `current − previous` derived from the rdev stream elsewhere).
 #[derive(Debug, Clone)]
 pub enum RawInput {
-    Motion { dx: f64, dy: f64 },
+    Motion {
+        dx: f64,
+        dy: f64,
+    },
     ButtonDown(MsButton),
     ButtonUp(MsButton),
-    Wheel { dx: i64, dy: i64 },
+    Wheel {
+        dx: i64,
+        dy: i64,
+    },
     KeyDown(Key),
     KeyUp(Key),
     /// Current modifier state (macOS reports these via FlagsChanged, never KeyDown/KeyUp).
     /// Feeds the switch-hotkey's Ctrl+Alt tracker; never itself consumed or dropped.
-    Mods { ctrl: bool, alt: bool },
+    Mods {
+        ctrl: bool,
+        alt: bool,
+    },
 }
 
 /// Capture state of the *primary*: local control, or forwarding to a named secondary.
@@ -51,7 +60,16 @@ pub enum CaptureMode {
 /// (secondary side). `vx`/`vy` is the virtual cursor position in the **receiver's own** coordinates.
 #[derive(Debug, Clone)]
 pub struct RemoteCtrl {
+    /// The *machine* being driven (or driving us) — the name input is routed to. One machine may
+    /// own several panels; the unit of routing is always the machine.
     pub name: String,
+    /// The specific panel of `name` the cursor entered, when the hub knows it. On the secondary
+    /// side this is what decides *where* the cursor is seeded and, more importantly, *which* edge
+    /// hands control back: with several local monitors only the panel the hub actually attached
+    /// the cursor to can return it. `None` for peers that predate the field, or for a hand-off
+    /// started by the hotkey rather than by crossing — the code then falls back to the group
+    /// bounding box.
+    pub panel: Option<String>,
     pub side: Side,
     pub vx: f64,
     pub vy: f64,
@@ -76,6 +94,9 @@ pub struct Ctrl {
     pub remote: Option<RemoteCtrl>,
     /// macOS primary: the local edge point the (hidden) cursor is parked at while forwarding.
     pub parked: Option<(f64, f64)>,
+    /// The rect of the local panel that was being left when the hand-off happened. Returning the
+    /// cursor relative to *it* keeps it on the display the user left, on a multi-monitor machine.
+    pub parked_rect: Option<(f64, f64, f64, f64)>,
     /// Suppress automatic re-crossing until this instant (set right after control returns).
     pub cooldown_until: Option<std::time::Instant>,
     pub drops: u32,
@@ -94,6 +115,14 @@ pub struct Ctrl {
     /// This machine's own displays. A secondary may have more than one, and the virtual cursor
     /// has to roam between them (and only hand control back at the outermost one).
     pub local_screens: Vec<Screen>,
+    /// Names of the currently reachable peers, refreshed alongside [`Ctrl::layout_snap`].
+    ///
+    /// The crossing decision needs to know whether the machine on the far side of an edge is
+    /// actually connected. The layout is *persisted*, so a saved tile can easily outlive the peer it
+    /// describes — and handing off to a machine that is not there would hide the local cursor and
+    /// forward into nothing until the next event noticed. Reading this from the same lock-free
+    /// snapshot the tap already clones keeps that check off the mutex.
+    pub live: Arc<Vec<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -159,11 +188,16 @@ const MAX_EFFECTIVE_RATIO: f64 = 8.0;
 
 /// User override multiplied on top of the auto-derived ratio (`Config::motion_scale`, default
 /// 1.0). Stored as raw `f32` bits so it can be updated from the GUI without a lock.
-static MOTION_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1.0f32.to_bits());
+static MOTION_SCALE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1.0f32.to_bits());
 
 /// Set the user's manual speed multiplier (1.0 = leave the automatic ratio untouched).
 pub fn set_motion_scale(v: f32) {
-    let v = if v.is_finite() { v.clamp(0.1, 8.0) } else { 1.0 };
+    let v = if v.is_finite() {
+        v.clamp(0.1, 8.0)
+    } else {
+        1.0
+    };
     MOTION_SCALE.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -211,14 +245,18 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
                         return false;
                     }
                     match predict_cross(l, loc, (dx, dy)) {
-                        Some((side, name)) => {
-                            enter_forwarding(ctx, &mut c, l, side, &name, loc);
+                        // Never hand off to a machine we are not connected to: see `Ctrl::live`.
+                        // The window before this check was added was the one way to strand the
+                        // pointer with no way back short of moving the mouse again.
+                        Some(cross) if c.live.iter().any(|n| n == &cross.host) => {
+                            let host = cross.host.clone();
+                            enter_forwarding(ctx, &mut c, l, &cross, loc);
                             // Read the ratio *after* the hand-off: that is where it is computed.
                             let ratio = c.remote.as_ref().map_or(1.0, |r| r.scale_ratio);
-                            forward_motion(ctx, &name, dx * ratio, dy * ratio);
+                            forward_motion(ctx, &host, dx * ratio, dy * ratio);
                             true
                         }
-                        None => false,
+                        _ => false,
                     }
                 }
                 CaptureMode::Forwarding(name) => {
@@ -275,21 +313,25 @@ pub fn on_capture(ctx: &GrabCtx, raw: RawInput, location: Option<(f64, f64)>) ->
                     return false;
                 }
             }
-            let dropped = forward_if_forwarding(ctx, &mode, InputEvent::MouseDown { button: b.clone() });
+            let dropped =
+                forward_if_forwarding(ctx, &mode, InputEvent::MouseDown { button: b.clone() });
             if dropped {
                 ctx.ctrl.lock().unwrap().held_buttons.push(b);
             }
             dropped
         }
         RawInput::ButtonUp(b) => {
-            let dropped = forward_if_forwarding(ctx, &mode, InputEvent::MouseUp { button: b.clone() });
+            let dropped =
+                forward_if_forwarding(ctx, &mode, InputEvent::MouseUp { button: b.clone() });
             if dropped {
                 let mut c = ctx.ctrl.lock().unwrap();
                 c.held_buttons.retain(|x| *x != b);
             }
             dropped
         }
-        RawInput::Wheel { dx, dy } => forward_if_forwarding(ctx, &mode, InputEvent::Wheel { dx, dy }),
+        RawInput::Wheel { dx, dy } => {
+            forward_if_forwarding(ctx, &mode, InputEvent::Wheel { dx, dy })
+        }
         RawInput::KeyDown(k) => {
             if let CaptureMode::Local = mode {
                 let fired = {
@@ -354,7 +396,10 @@ fn forward_to(ctx: &GrabCtx, name: &str, ev: InputEvent) {
         Some(tx) => {
             // Unbounded channel: this cannot block. A dropped receiver means we are shutting
             // down, and losing a forwarded event then is harmless.
-            let _ = tx.send(OutboundInput { target: name.to_string(), ev });
+            let _ = tx.send(OutboundInput {
+                target: name.to_string(),
+                ev,
+            });
         }
         None => ctx.net.lock().unwrap().send_input(name, ev),
     }
@@ -380,7 +425,10 @@ pub fn local_screen_at<'a>(l: &'a Layout, x: f64, y: f64) -> Option<&'a Screen> 
         .filter(|s| s.is_local)
         .find(|s| {
             let (a, b, c, d) = screen_rect(s);
-            x >= a - ON_SCREEN_TOL && x <= c + ON_SCREEN_TOL && y >= b - ON_SCREEN_TOL && y <= d + ON_SCREEN_TOL
+            x >= a - ON_SCREEN_TOL
+                && x <= c + ON_SCREEN_TOL
+                && y >= b - ON_SCREEN_TOL
+                && y <= d + ON_SCREEN_TOL
         })
         .or_else(|| {
             let mut best: Option<&Screen> = None;
@@ -400,6 +448,18 @@ pub fn local_screen_at<'a>(l: &'a Layout, x: f64, y: f64) -> Option<&'a Screen> 
         })
 }
 
+/// Where a predicted crossing lands: which machine to forward to, which of its panels the cursor
+/// appears on, and which side of the *local* panel it left from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Crossing {
+    pub side: Side,
+    /// The machine to route input to (`Screen::host`).
+    pub host: String,
+    /// The remote panel the cursor lands on (told to the receiver so a multi-monitor client seeds
+    /// on the right display and knows which edge returns control).
+    pub panel: String,
+}
+
 /// Predict a crossing: is `location + delta` leaving **the display the cursor is actually on**,
 /// toward a neighbour that sits immediately beyond that display's edge?
 ///
@@ -408,7 +468,10 @@ pub fn local_screen_at<'a>(l: &'a Layout, x: f64, y: f64) -> Option<&'a Screen> 
 /// from the far display to a remote machine that is only attached to the near one — both show
 /// up as the hand-off firing while the cursor is still in the middle of the desktop, which is
 /// exactly what makes two cursors move at once.
-fn predict_cross(l: &Layout, loc: (f64, f64), delta: (f64, f64)) -> Option<(Side, String)> {
+///
+/// The *result* is per-machine (`host`) plus the exact remote panel, so a machine with several
+/// monitors routes to one socket while still telling that machine which panel it landed on.
+fn predict_cross(l: &Layout, loc: (f64, f64), delta: (f64, f64)) -> Option<Crossing> {
     // The cursor must be on one of *our* displays for it to leave that display.
     let ls = local_screen_at(l, loc.0, loc.1)?;
     let (ll, lt, lr, lb) = screen_rect(ls);
@@ -427,17 +490,24 @@ fn predict_cross(l: &Layout, loc: (f64, f64), delta: (f64, f64)) -> Option<(Side
         // overlap it along the crossing axis — otherwise it is not the screen we'd land on.
         let overlaps_v = sb > lt && st < lb;
         let overlaps_h = sr > ll && sl < lr;
+        let hit = |side: Side| {
+            Some(Crossing {
+                side,
+                host: rs.host().to_string(),
+                panel: rs.name.clone(),
+            })
+        };
         if px >= lr && sl >= lr - EDGE_ATTACH && sl < lr + EDGE_ATTACH && overlaps_v {
-            return Some((Side::Right, rs.name.clone()));
+            return hit(Side::Right);
         }
         if px <= ll && sr <= ll + EDGE_ATTACH && sr > ll - EDGE_ATTACH && overlaps_v {
-            return Some((Side::Left, rs.name.clone()));
+            return hit(Side::Left);
         }
         if py >= lb && st >= lb - EDGE_ATTACH && st < lb + EDGE_ATTACH && overlaps_h {
-            return Some((Side::Bottom, rs.name.clone()));
+            return hit(Side::Bottom);
         }
         if py <= lt && sb <= lt + EDGE_ATTACH && sb > lt - EDGE_ATTACH && overlaps_h {
-            return Some((Side::Top, rs.name.clone()));
+            return hit(Side::Top);
         }
     }
     None
@@ -447,14 +517,78 @@ fn predict_cross(l: &Layout, loc: (f64, f64), delta: (f64, f64)) -> Option<(Side
 /// edge that faces the primary. `r.side` is that edge (the primary crossed its own side, so the
 /// secondary is entered on the opposite edge). Returns true when the cursor, after applying
 /// `(dx, dy)`, would pass that edge while still moving toward the primary.
-fn crossing_back(r: &RemoteCtrl, bbox: (f64, f64, f64, f64), dx: f64, dy: f64) -> bool {
-    let (bl, bt, br, bb) = bbox;
-    match r.side {
-        Side::Left => r.vx + dx <= bl + CROSS_EPS && dx < 0.0,
-        Side::Right => r.vx + dx >= br - 1.0 - CROSS_EPS && dx > 0.0,
-        Side::Top => r.vy + dy <= bt + CROSS_EPS && dy < 0.0,
-        Side::Bottom => r.vy + dy >= bb - 1.0 - CROSS_EPS && dy > 0.0,
+///
+/// The test is **per panel**, not against the machine's bounding box. On a client with two
+/// monitors the bbox spans dead space: pressing "toward the primary" while on the monitor that
+/// does *not* touch the primary would otherwise be misread as a return, which snaps control away
+/// mid-movement. Only `r.panel` — the display the hub actually attached the cursor to — has an
+/// edge that faces the primary, so only it can hand control back.
+fn crossing_back(r: &RemoteCtrl, screens: &[Screen], dx: f64, dy: f64) -> bool {
+    let panel = r
+        .panel
+        .as_ref()
+        .and_then(|name| screens.iter().find(|s| &s.name == name))
+        .or_else(|| {
+            // No panel hint (older peer, or a hotkey hand-off): use the panel under the cursor.
+            screens
+                .iter()
+                .find(|s| s.contains(r.vx, r.vy))
+                .or_else(|| nearest_screen(screens, r.vx, r.vy))
+        });
+    match panel {
+        Some(p) => {
+            let (pl, pt, pr, pb) = screen_rect(p);
+            match r.side {
+                Side::Left => r.vx + dx <= pl + CROSS_EPS && dx < 0.0,
+                Side::Right => r.vx + dx >= pr - 1.0 - CROSS_EPS && dx > 0.0,
+                Side::Top => r.vy + dy <= pt + CROSS_EPS && dy < 0.0,
+                Side::Bottom => r.vy + dy >= pb - 1.0 - CROSS_EPS && dy > 0.0,
+            }
+        }
+        // We know of no panel at all (layout not yet pushed): fall back to the machine bbox, which
+        // is what a single-monitor client has anyway.
+        None => match r.side {
+            Side::Left => r.vx + dx <= CROSS_EPS && dx < 0.0,
+            Side::Right => r.vx + dx >= f64::MAX - CROSS_EPS && dx > 0.0,
+            Side::Top => r.vy + dy <= CROSS_EPS && dy < 0.0,
+            Side::Bottom => r.vy + dy >= f64::MAX - CROSS_EPS && dy > 0.0,
+        },
     }
+}
+
+/// The panel of a machine that a cursor entering from `side` (a side of *our* bounding box) lands
+/// on: always the machine's outermost panel on that axis, i.e. the one closest to us.
+fn entry_panel(l: &Layout, host: &str, side: Side) -> Option<String> {
+    let mut best: Option<(&Screen, i64)> = None;
+    for s in l.panels_of(host) {
+        let key = match side {
+            Side::Right => s.ox as i64,
+            Side::Left => -(s.ox as i64 + s.w as i64),
+            Side::Bottom => s.oy as i64,
+            Side::Top => -(s.oy as i64 + s.h as i64),
+        };
+        if best.map_or(true, |(_, bk)| key < bk) {
+            best = Some((s, key));
+        }
+    }
+    best.map(|(s, _)| s.name.clone())
+}
+
+/// Nearest panel to a point (used only as a last resort when the cursor sits in dead space).
+fn nearest_screen(screens: &[Screen], x: f64, y: f64) -> Option<&Screen> {
+    let mut best: Option<&Screen> = None;
+    let mut best_d = f64::MAX;
+    for s in screens {
+        let (a, b, c, d) = screen_rect(s);
+        let dx = (a - x).max(0.0).max(x - c);
+        let dy = (b - y).max(0.0).max(y - d);
+        let dist = dx * dx + dy * dy;
+        if dist < best_d {
+            best_d = dist;
+            best = Some(s);
+        }
+    }
+    best
 }
 
 /// Convert a local mouse delta into the receiving machine's coordinate units.
@@ -468,7 +602,7 @@ fn crossing_back(r: &RemoteCtrl, bbox: (f64, f64, f64, f64), dx: f64, dy: f64) -
 /// the cursor teleport or freeze.
 pub fn motion_scale_ratio(l: &Layout, remote: &str, loc: Option<(f64, f64)>) -> f64 {
     let own = l.local_scale_at(loc).max(0.01) as f64;
-    let theirs = l.scale_of(remote).max(0.01) as f64;
+    let theirs = l.scale_of_host(remote).max(0.01) as f64;
     let auto = (own / theirs).clamp(MIN_SCALE_RATIO, MAX_SCALE_RATIO);
     effective_ratio(auto, motion_scale())
 }
@@ -479,20 +613,18 @@ fn effective_ratio(auto: f64, manual: f32) -> f64 {
     // The manual multiplier is a trim on top of the automatic value, not a replacement: the
     // machines' densities can change (new monitor, different Windows scaling) and the auto
     // part keeps tracking that, while the user only corrects the residual "feel".
-    let m = if manual.is_finite() { manual as f64 } else { 1.0 };
+    let m = if manual.is_finite() {
+        manual as f64
+    } else {
+        1.0
+    };
     (auto * m).clamp(MIN_EFFECTIVE_RATIO, MAX_EFFECTIVE_RATIO)
 }
 
-/// Begin forwarding control to `name` (attached on `side`). Hides the local cursor, parks it at the
-/// shared edge, and tells the secondary the cursor is entering (so it can seed its own virtual cursor).
-fn enter_forwarding(
-    ctx: &GrabCtx,
-    c: &mut Ctrl,
-    l: &Layout,
-    side: Side,
-    name: &str,
-    loc: (f64, f64),
-) {
+/// Begin forwarding control to the machine `cross.host` (landing on `cross.panel`). Hides the
+/// local cursor, parks it at the shared edge, and tells the secondary the cursor is entering (so it
+/// can seed its own virtual cursor).
+fn enter_forwarding(ctx: &GrabCtx, c: &mut Ctrl, l: &Layout, cross: &Crossing, loc: (f64, f64)) {
     // Park on the *display the cursor is leaving*, not on the union bounding box: on a
     // multi-monitor Mac the bbox can be much taller than the screen you crossed from, and
     // parking by bbox fraction drops the cursor into dead space (or onto another display)
@@ -506,51 +638,50 @@ fn enter_forwarding(
     };
     let fx = ((loc.0 - bl) / (br - bl)).clamp(0.0, 1.0);
     let fy = ((loc.1 - bt) / (bb - bt)).clamp(0.0, 1.0);
-    let park = match side {
+    let park = match cross.side {
         Side::Right => (br - 1.0, bt + fy * (bb - bt)),
         Side::Left => (bl + 1.0, bt + fy * (bb - bt)),
         Side::Bottom => (bl + fx * (br - bl), bb - 1.0),
         Side::Top => (bl + fx * (br - bl), bt + 1.0),
     };
     c.remote = Some(RemoteCtrl {
-        name: name.to_string(),
-        side,
+        name: cross.host.clone(),
+        panel: Some(cross.panel.clone()),
+        side: cross.side,
         vx: park.0,
         vy: park.1,
-        scale_ratio: motion_scale_ratio(l, name, Some(loc)),
+        scale_ratio: motion_scale_ratio(l, &cross.host, Some(loc)),
     });
     c.parked = Some(park);
+    c.parked_rect = Some((bl, bt, br, bb));
     c.held_keys.clear();
     c.held_buttons.clear();
     c.cooldown_until = None;
-    *ctx.mode.lock().unwrap() = CaptureMode::Forwarding(name.to_string());
-    crate::capture::hide_cursor();
+    *ctx.mode.lock().unwrap() = CaptureMode::Forwarding(cross.host.clone());
+    // Detach the hardware mouse and hide the cursor *before* announcing the hand-off, so there is
+    // no window in which the local pointer can still be dragged off the park point.
+    crate::capture::enter_forwarding_grab();
     ctx.net.lock().unwrap().send_to(
-        name,
+        &cross.host,
         Message::EnterScreen {
-            side,
+            side: cross.side,
             fx,
             fy,
+            panel: Some(cross.panel.clone()),
         },
     );
-    log::info!("control handed to {} ({:?})", name, side);
+    log::info!("control handed to {} ({:?})", cross.host, cross.side);
     if let Some(r) = c.remote.as_ref() {
         crate::diag::log(&format!(
-            "HAND-OFF -> {} side={:?} park=({:.0},{:.0}) scale_ratio={:.2}",
-            name, side, r.vx, r.vy, r.scale_ratio
+            "HAND-OFF -> {} panel={} side={:?} park=({:.0},{:.0}) scale_ratio={:.2}",
+            r.name, cross.panel, cross.side, r.vx, r.vy, r.scale_ratio
         ));
     }
 }
 
 /// Return control to the local machine: release any held keys/buttons on the remote, show the local
-/// cursor, park it just inside the shared edge, and tell the secondary control left.
-fn leave_forwarding(
-    ctx: &GrabCtx,
-    c: &mut Ctrl,
-    l: &Layout,
-    name: &str,
-    loc: Option<(f64, f64)>,
-) {
+/// cursor again, put it back exactly where it left, and tell the secondary control left.
+fn leave_forwarding(ctx: &GrabCtx, c: &mut Ctrl, l: &Layout, name: &str, loc: Option<(f64, f64)>) {
     // Release held keys/buttons on the remote so it never keeps a "ghost" modifier down.
     // Queued rather than sent under the `net` lock: this runs on the event-tap thread whenever
     // the tap is disabled mid-forward, which is exactly when we must not stall on a lock.
@@ -561,12 +692,20 @@ fn leave_forwarding(
         forward_to(ctx, name, InputEvent::MouseUp { button: b });
     }
     let side = c.remote.as_ref().map(|r| r.side);
+    // The rect of the panel we left. Returning relative to *it* (rather than to the machine's
+    // bounding box) is what keeps the cursor on the display the user actually left from when the
+    // Mac has several monitors of different heights.
+    let rect = c.parked_rect;
     c.remote = None;
     c.parked = None;
+    c.parked_rect = None;
     *ctx.mode.lock().unwrap() = CaptureMode::Local;
-    c.cooldown_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(RETURN_COOLDOWN_MS));
-    crate::capture::show_cursor();
-    if let (Some(side), Some((bl, bt, br, bb))) = (side, l.local_bbox()) {
+    c.cooldown_until =
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(RETURN_COOLDOWN_MS));
+    if let Some(side) = side {
+        let (bl, bt, br, bb) = rect
+            .or_else(|| l.local_bbox())
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
         let (fx, fy) = match loc {
             Some(p) => (
                 ((p.0 - bl) / (br - bl)).clamp(0.0, 1.0),
@@ -580,13 +719,16 @@ fn leave_forwarding(
             Side::Bottom => (bl + fx * (br - bl), bb - 12.0),
             Side::Top => (bl + fx * (br - bl), bt + 12.0),
         };
-        // Only teleport the *real* cursor when we are not grabbing. With a grab tap the local
-        // cursor never moved (events were dropped), so it is already sitting on the shared edge
-        // — and injecting a synthetic move here would come straight back through the tap as a
-        // huge delta, which can re-trigger a hand-off or shove the remote cursor.
-        if !crate::capture::grab_active() {
-            crate::input::warp_cursor(target.0, target.1);
-        }
+        // Re-attach the hardware mouse first, then put the cursor back on the shared edge.
+        //
+        // The old code skipped the warp entirely while the grab tap was active, on the theory that
+        // the cursor "cannot have moved". That theory only holds while every synthetic event is
+        // dropped — and it is false exactly when it matters: after an App Nap stall or a
+        // `TapDisabledByTimeout` the OS has been moving the real cursor again, so control came back
+        // with the arrow somewhere unrelated (the "the cursor slides around on both screens"
+        // report). Warping is safe now: our own synthetic moves are tagged and ignored by the tap,
+        // and the 700 ms cooldown covers any residue.
+        crate::capture::leave_forwarding_grab(target);
         c.last_real = target;
     }
     ctx.net.lock().unwrap().send_to(name, Message::LeaveScreen);
@@ -594,13 +736,10 @@ fn leave_forwarding(
     crate::diag::log(&format!("RETURN <- {}", name));
 }
 
-/// Which outer edge of the local bbox is `s` attached just beyond?
-fn attached_side(s: &Screen, bbox: (f64, f64, f64, f64)) -> Option<Side> {
+/// Which outer edge of the local bbox a machine's panel group is attached just beyond?
+fn attached_side(l: &Layout, host: &str, bbox: (f64, f64, f64, f64)) -> Option<Side> {
     let (bl, bt, br, bb) = bbox;
-    let sl = s.ox as f64;
-    let st = s.oy as f64;
-    let sr = sl + s.w as f64;
-    let sb = st + s.h as f64;
+    let (sl, st, sr, sb) = l.host_bbox(host)?;
     if sl >= br - EDGE_ATTACH {
         Some(Side::Right)
     } else if sr <= bl + EDGE_ATTACH {
@@ -660,10 +799,12 @@ pub fn cycle_control(ctx: &GrabCtx) {
         return;
     }
     let Some(bbox) = l.local_bbox() else { return };
-    let mut remotes: Vec<&Screen> = Vec::new();
-    for s in l.screens.iter() {
-        if !s.is_local && !remotes.iter().any(|r| r.name == s.name) {
-            remotes.push(s);
+    // Rotate over *machines*, not panels: a two-monitor client is still one stop on the ring.
+    let mut remotes: Vec<String> = Vec::new();
+    for s in l.screens.iter().filter(|s| !s.is_local) {
+        let h = s.host().to_string();
+        if !remotes.contains(&h) {
+            remotes.push(h);
         }
     }
     if remotes.is_empty() {
@@ -672,7 +813,7 @@ pub fn cycle_control(ctx: &GrabCtx) {
     let idx = match &c.remote {
         Some(r) => remotes
             .iter()
-            .position(|s| s.name == r.name)
+            .position(|h| h == &r.name)
             .map(|i| i + 1)
             .unwrap_or(0),
         None => 0,
@@ -690,10 +831,12 @@ pub fn cycle_control(ctx: &GrabCtx) {
         let loc = c.parked;
         leave_forwarding(ctx, &mut c, &l, &r.name, loc);
     }
-    let s = remotes[idx];
-    let side = attached_side(s, bbox).unwrap_or(Side::Right);
+    let host = remotes[idx].clone();
+    let side = attached_side(&l, &host, bbox).unwrap_or(Side::Right);
+    let panel = entry_panel(&l, &host, side).unwrap_or_else(|| host.clone());
+    let cross = Crossing { side, host, panel };
     let loc = crate::input::cursor_position().unwrap_or((0.0, 0.0));
-    enter_forwarding(ctx, &mut c, &l, side, &s.name, loc);
+    enter_forwarding(ctx, &mut c, &l, &cross, loc);
 }
 
 // ---- Secondary side: receiving control ----
@@ -701,17 +844,31 @@ pub fn cycle_control(ctx: &GrabCtx) {
 /// Where a secondary seeds its virtual cursor when control arrives: on the display that faces
 /// the primary, at the same fraction along the shared edge.
 ///
-/// With several local displays the entry edge belongs to the *outermost* one on that side, so
-/// seeding from the union bounding box alone could drop the cursor into dead space between two
-/// panels, or onto the wrong one.
+/// When the hub named the panel it attached the cursor to (it knows, having decided the crossing),
+/// seed on exactly that display. Falling back to the bounding box is only correct for a
+/// single-monitor client: with several panels the bbox fraction can land in dead space between
+/// them, or on the wrong panel entirely, and the cursor then appears to "jump" on entry.
 fn seed_position(
     screens: &[Screen],
     bbox: Option<(f64, f64, f64, f64)>,
     side: Side,
     fx: f64,
     fy: f64,
+    panel: Option<&str>,
 ) -> (f64, f64) {
-    let Some((bl, bt, br, bb)) = bbox else { return (0.0, 0.0) };
+    if let Some(p) = panel.and_then(|n| screens.iter().find(|s| s.name == n)) {
+        let (pl, pt, pr, pb) = screen_rect(p);
+        let (tx, ty) = match side {
+            Side::Right => (pr - 2.0, pt + fy * (pb - pt)),
+            Side::Left => (pl + 2.0, pt + fy * (pb - pt)),
+            Side::Bottom => (pl + fx * (pr - pl), pb - 2.0),
+            Side::Top => (pl + fx * (pr - pl), pt + 2.0),
+        };
+        return clamp_to_screens(screens, tx, ty);
+    }
+    let Some((bl, bt, br, bb)) = bbox else {
+        return (0.0, 0.0);
+    };
     let (tx, ty) = match side {
         Side::Right => (br - 2.0, bt + fy * (bb - bt)),
         Side::Left => (bl + 2.0, bt + fy * (bb - bt)),
@@ -778,13 +935,21 @@ fn step_local(
 
 /// The primary says the cursor is entering our screen. Seed our virtual cursor at the edge facing
 /// the primary and hide our real cursor.
-pub fn on_enter_screen(ctx: &GrabCtx, side: Side, fx: f64, fy: f64) {
+pub fn on_enter_screen(ctx: &GrabCtx, side: Side, fx: f64, fy: f64, panel: Option<String>) {
     let mut c = ctx.ctrl.lock().unwrap();
     let Some(bbox) = c.local_bbox else { return };
     let eside = side.opposite();
-    let (vx, vy) = seed_position(&c.local_screens, Some(bbox), eside, fx, fy);
+    let (vx, vy) = seed_position(
+        &c.local_screens,
+        Some(bbox),
+        eside,
+        fx,
+        fy,
+        panel.as_deref(),
+    );
     c.remote = Some(RemoteCtrl {
         name: ctx.primary_name.clone(),
+        panel: panel.clone(),
         side: eside,
         vx,
         vy,
@@ -794,8 +959,8 @@ pub fn on_enter_screen(ctx: &GrabCtx, side: Side, fx: f64, fy: f64) {
     drop(c);
     crate::capture::hide_cursor();
     crate::diag::log(&format!(
-        "ENTER <- primary side={:?} seed=({:.0},{:.0})",
-        eside, vx, vy
+        "ENTER <- primary side={:?} seed=({:.0},{:.0}) panel={:?}",
+        eside, vx, vy, panel
     ));
 }
 
@@ -823,20 +988,18 @@ pub fn on_secondary_input(ctx: &GrabCtx, ev: InputEvent) {
     };
     match ev {
         InputEvent::MouseMotion { dx, dy } => {
-            if let Some(bbox) = bbox {
-                if crossing_back(r, bbox, dx, dy) {
-                    // Hand control back. Capture what we need, then drop the ctrl lock before
-                    // the network send so we don't hold it across the socket.
-                    let side = r.side;
-                    let (vx, vy) = (r.vx, r.vy);
-                    drop(c);
-                    ctx.net.lock().unwrap().send_message(Message::ReturnControl);
-                    crate::diag::log(&format!(
-                        "EDGE-RETURN side={:?} v=({:.0},{:.0}) d=({:.0},{:.0})",
-                        side, vx, vy, dx, dy
-                    ));
-                    return;
-                }
+            if crossing_back(r, &screens, dx, dy) {
+                // Hand control back. Capture what we need, then drop the ctrl lock before
+                // the network send so we don't hold it across the socket.
+                let side = r.side;
+                let (vx, vy) = (r.vx, r.vy);
+                drop(c);
+                ctx.net.lock().unwrap().send_message(Message::ReturnControl);
+                crate::diag::log(&format!(
+                    "EDGE-RETURN side={:?} v=({:.0},{:.0}) d=({:.0},{:.0})",
+                    side, vx, vy, dx, dy
+                ));
+                return;
             }
             let (nx, ny) = step_local(&screens, bbox, r.vx, r.vy, dx, dy);
             r.vx = nx;
@@ -854,6 +1017,7 @@ mod tests {
     fn local() -> Screen {
         Screen {
             name: "A".into(),
+            host: "A".into(),
             ox: 0,
             oy: 0,
             w: 1920,
@@ -866,6 +1030,7 @@ mod tests {
     fn remote(name: &str, ox: i32, oy: i32, w: u32, h: u32) -> Screen {
         Screen {
             name: name.into(),
+            host: name.into(),
             ox,
             oy,
             w,
@@ -877,6 +1042,20 @@ mod tests {
 
     const BBOX: (f64, f64, f64, f64) = (0.0, 0.0, 1920.0, 1080.0);
 
+    /// A single-display machine reporting itself as one panel.
+    fn one_screen() -> Vec<Screen> {
+        vec![local()]
+    }
+
+    /// Shorthand for the expected `Crossing`: a single-panel machine named `name`.
+    fn crossing(side: Side, name: &str) -> Crossing {
+        Crossing {
+            side,
+            host: name.to_string(),
+            panel: name.to_string(),
+        }
+    }
+
     #[test]
     fn predict_cross_right() {
         let l = Layout {
@@ -885,7 +1064,7 @@ mod tests {
         // Cursor at the right edge moving right -> cross into B.
         assert_eq!(
             predict_cross(&l, (1918.0, 540.0), (10.0, 0.0)),
-            Some((Side::Right, "B".to_string()))
+            Some(crossing(Side::Right, "B"))
         );
         // Not reaching the edge -> no cross.
         assert_eq!(predict_cross(&l, (1000.0, 540.0), (10.0, 0.0)), None);
@@ -900,7 +1079,7 @@ mod tests {
         };
         assert_eq!(
             predict_cross(&l, (5.0, 540.0), (-10.0, 0.0)),
-            Some((Side::Left, "L".to_string()))
+            Some(crossing(Side::Left, "L"))
         );
     }
 
@@ -911,7 +1090,7 @@ mod tests {
         };
         assert_eq!(
             predict_cross(&l, (960.0, 1075.0), (0.0, 10.0)),
-            Some((Side::Bottom, "D".to_string()))
+            Some(crossing(Side::Bottom, "D"))
         );
     }
 
@@ -922,14 +1101,16 @@ mod tests {
         };
         assert_eq!(
             predict_cross(&l, (960.0, 5.0), (0.0, -10.0)),
-            Some((Side::Top, "U".to_string()))
+            Some(crossing(Side::Top, "U"))
         );
     }
 
     #[test]
     fn predict_cross_only_remote_neighbours() {
         // No remote screen attached -> never cross, even at the edge.
-        let l = Layout { screens: vec![local()] };
+        let l = Layout {
+            screens: vec![local()],
+        };
         assert_eq!(predict_cross(&l, (1918.0, 540.0), (10.0, 0.0)), None);
     }
 
@@ -950,14 +1131,32 @@ mod tests {
         // to the LEFT side of the left screen (L). Cursor on the LEFT screen near its left edge.
         let l = Layout {
             screens: vec![
-                Screen { name: "L".into(), ox: -1920, oy: 0, w: 1920, h: 1080, is_local: true, scale: 1.0 },
-                Screen { name: "R".into(), ox: 0,     oy: 0, w: 1920, h: 1080, is_local: true, scale: 1.0 },
+                Screen {
+                    name: "L".into(),
+                    host: "L".into(),
+                    ox: -1920,
+                    oy: 0,
+                    w: 1920,
+                    h: 1080,
+                    is_local: true,
+                    scale: 1.0,
+                },
+                Screen {
+                    name: "R".into(),
+                    host: "R".into(),
+                    ox: 0,
+                    oy: 0,
+                    w: 1920,
+                    h: 1080,
+                    is_local: true,
+                    scale: 1.0,
+                },
                 remote("L-remote", -3840, 0, 1920, 1080),
             ],
         };
         assert_eq!(
             predict_cross(&l, (-1918.0, 540.0), (-10.0, 0.0)),
-            Some((Side::Left, "L-remote".to_string())),
+            Some(crossing(Side::Left, "L-remote")),
             "must cross from the left screen, not from the right one"
         );
     }
@@ -966,14 +1165,32 @@ mod tests {
     fn predict_cross_multidisplay_right_screen_to_right_remote() {
         let l = Layout {
             screens: vec![
-                Screen { name: "L".into(), ox: -1920, oy: 0, w: 1920, h: 1080, is_local: true, scale: 1.0 },
-                Screen { name: "R".into(), ox: 0,     oy: 0, w: 1920, h: 1080, is_local: true, scale: 1.0 },
+                Screen {
+                    name: "L".into(),
+                    host: "L".into(),
+                    ox: -1920,
+                    oy: 0,
+                    w: 1920,
+                    h: 1080,
+                    is_local: true,
+                    scale: 1.0,
+                },
+                Screen {
+                    name: "R".into(),
+                    host: "R".into(),
+                    ox: 0,
+                    oy: 0,
+                    w: 1920,
+                    h: 1080,
+                    is_local: true,
+                    scale: 1.0,
+                },
                 remote("R-remote", 1920, 0, 1920, 1080),
             ],
         };
         assert_eq!(
             predict_cross(&l, (1918.0, 540.0), (10.0, 0.0)),
-            Some((Side::Right, "R-remote".to_string())),
+            Some(crossing(Side::Right, "R-remote")),
             "must cross from the right screen to the right-attached remote"
         );
     }
@@ -984,33 +1201,89 @@ mod tests {
     fn crossing_back_left_edge_returns() {
         // Secondary entered on its LEFT edge (primary to its left). Cursor mid-screen moving left
         // must NOT return; only when it reaches the left edge and keeps pushing left.
-        let r = RemoteCtrl { name: "B".into(), side: Side::Left, vx: 500.0, vy: 540.0, scale_ratio: 1.0 };
-        assert!(!crossing_back(&r, BBOX, -50.0, 0.0), "mid-screen left move must not return");
-        assert!(!crossing_back(&r, BBOX, 50.0, 0.0), "right move must not return");
+        let r = RemoteCtrl {
+            name: "B".into(),
+            panel: Some("A".into()),
+            side: Side::Left,
+            vx: 500.0,
+            vy: 540.0,
+            scale_ratio: 1.0,
+        };
+        assert!(
+            !crossing_back(&r, &one_screen(), -50.0, 0.0),
+            "mid-screen left move must not return"
+        );
+        assert!(
+            !crossing_back(&r, &one_screen(), 50.0, 0.0),
+            "right move must not return"
+        );
 
-        let at_edge = RemoteCtrl { name: "B".into(), side: Side::Left, vx: 5.0, vy: 540.0, scale_ratio: 1.0 };
-        assert!(crossing_back(&at_edge, BBOX, -10.0, 0.0), "at left edge pushing left must return");
+        let at_edge = RemoteCtrl {
+            name: "B".into(),
+            panel: Some("A".into()),
+            side: Side::Left,
+            vx: 5.0,
+            vy: 540.0,
+            scale_ratio: 1.0,
+        };
+        assert!(
+            crossing_back(&at_edge, &one_screen(), -10.0, 0.0),
+            "at left edge pushing left must return"
+        );
         // At the edge but moving right (into the screen) must NOT return.
-        assert!(!crossing_back(&at_edge, BBOX, 10.0, 0.0));
+        assert!(!crossing_back(&at_edge, &one_screen(), 10.0, 0.0));
     }
 
     #[test]
     fn crossing_back_right_edge_returns() {
         // Secondary entered on its RIGHT edge (primary to its right).
-        let r = RemoteCtrl { name: "B".into(), side: Side::Right, vx: 1915.0, vy: 540.0, scale_ratio: 1.0 };
-        assert!(crossing_back(&r, BBOX, 20.0, 0.0), "at right edge pushing right must return");
-        assert!(!crossing_back(&r, BBOX, -20.0, 0.0), "moving left (into screen) must not return");
+        let r = RemoteCtrl {
+            name: "B".into(),
+            panel: Some("A".into()),
+            side: Side::Right,
+            vx: 1915.0,
+            vy: 540.0,
+            scale_ratio: 1.0,
+        };
+        assert!(
+            crossing_back(&r, &one_screen(), 20.0, 0.0),
+            "at right edge pushing right must return"
+        );
+        assert!(
+            !crossing_back(&r, &one_screen(), -20.0, 0.0),
+            "moving left (into screen) must not return"
+        );
     }
 
     #[test]
     fn crossing_back_vertical_edges() {
-        let top = RemoteCtrl { name: "U".into(), side: Side::Top, vx: 960.0, vy: 5.0, scale_ratio: 1.0 };
-        assert!(crossing_back(&top, BBOX, 0.0, -10.0), "at top edge pushing up must return");
-        assert!(!crossing_back(&top, BBOX, 0.0, 10.0));
+        let top = RemoteCtrl {
+            name: "U".into(),
+            panel: Some("A".into()),
+            side: Side::Top,
+            vx: 960.0,
+            vy: 5.0,
+            scale_ratio: 1.0,
+        };
+        assert!(
+            crossing_back(&top, &one_screen(), 0.0, -10.0),
+            "at top edge pushing up must return"
+        );
+        assert!(!crossing_back(&top, &one_screen(), 0.0, 10.0));
 
-        let bottom = RemoteCtrl { name: "D".into(), side: Side::Bottom, vx: 960.0, vy: 1075.0, scale_ratio: 1.0 };
-        assert!(crossing_back(&bottom, BBOX, 0.0, 10.0), "at bottom edge pushing down must return");
-        assert!(!crossing_back(&bottom, BBOX, 0.0, -10.0));
+        let bottom = RemoteCtrl {
+            name: "D".into(),
+            panel: Some("A".into()),
+            side: Side::Bottom,
+            vx: 960.0,
+            vy: 1075.0,
+            scale_ratio: 1.0,
+        };
+        assert!(
+            crossing_back(&bottom, &one_screen(), 0.0, 10.0),
+            "at bottom edge pushing down must return"
+        );
+        assert!(!crossing_back(&bottom, &one_screen(), 0.0, -10.0));
     }
 
     #[test]
@@ -1048,11 +1321,19 @@ mod integration {
     /// Connect a primary hub (local screen A + remote B to its right) and a secondary client
     /// (local screen B) over loopback, and return the two `GrabCtx` plus the two incoming channels
     /// (secondary's first, primary's second) so the test can observe messages in both directions.
-    fn setup_pair(port: u16) -> (GrabCtx, GrabCtx, Receiver<(String, Message)>, Receiver<(String, Message)>) {
+    fn setup_pair(
+        port: u16,
+    ) -> (
+        GrabCtx,
+        GrabCtx,
+        Receiver<(String, Message)>,
+        Receiver<(String, Message)>,
+    ) {
         let primary_layout = Layout {
             screens: vec![
                 Screen {
                     name: "A".into(),
+                    host: "A".into(),
                     ox: 0,
                     oy: 0,
                     w: 1920,
@@ -1062,6 +1343,7 @@ mod integration {
                 },
                 Screen {
                     name: "B".into(),
+                    host: "B".into(),
                     ox: 1920,
                     oy: 0,
                     w: 1920,
@@ -1074,6 +1356,7 @@ mod integration {
         let secondary_layout = Layout {
             screens: vec![Screen {
                 name: "B".into(),
+                host: "B".into(),
                 ox: 0,
                 oy: 0,
                 w: 1920,
@@ -1090,12 +1373,9 @@ mod integration {
 
         let net_primary = network::start_hub(port, ptx, pla.clone()).expect("hub starts");
         let net_secondary = Net::idle();
-        let (_net_sec, sec_tx) = network::connect_client(
-            &format!("127.0.0.1:{port}"),
-            stx,
-            net_secondary.clone(),
-        )
-        .expect("client connects");
+        let (_net_sec, sec_tx) =
+            network::connect_client(&format!("127.0.0.1:{port}"), stx, net_secondary.clone())
+                .expect("client connects");
         // The real secondary app sends Hello immediately after connecting; replicate that so the
         // hub learns our name and registers the peer (otherwise no messages can be routed).
         sec_tx
@@ -1104,6 +1384,7 @@ mod integration {
                 width: 1920,
                 height: 1080,
                 scale: 1.0,
+                panels: Vec::new(),
             })
             .expect("send Hello");
         std::fs::write("/tmp/mstep.txt", "after send Hello").ok();
@@ -1142,6 +1423,7 @@ mod integration {
                     g.local_bbox()
                 },
                 layout_snap: Arc::new(pla.lock().unwrap().clone()),
+                live: Arc::new(vec!["B".to_string()]),
                 ..Default::default()
             })),
             mode: Mutex::new(CaptureMode::Local),
@@ -1184,9 +1466,19 @@ mod integration {
             match rx.recv_timeout(remain) {
                 Ok((_, msg)) => match msg {
                     Message::Layout { .. } => continue,
-                    Message::EnterScreen { side, fx, fy } => {
-                        on_enter_screen(sec, side, fx, fy);
-                        got.push(Message::EnterScreen { side, fx, fy });
+                    Message::EnterScreen {
+                        side,
+                        fx,
+                        fy,
+                        panel,
+                    } => {
+                        on_enter_screen(sec, side, fx, fy, panel.clone());
+                        got.push(Message::EnterScreen {
+                            side,
+                            fx,
+                            fy,
+                            panel,
+                        });
                     }
                     Message::LeaveScreen => {
                         on_leave_screen(sec);
@@ -1211,14 +1503,24 @@ mod integration {
     /// snapshot after setup so they don't race with the hub reader's own layout locks.
     fn seed_layout_snap(primary: &GrabCtx, secondary: &GrabCtx) {
         let snap = primary.layout.lock().unwrap().clone();
-        let screens: Vec<_> = snap.screens.iter().filter(|s| s.is_local).cloned().collect();
+        let screens: Vec<_> = snap
+            .screens
+            .iter()
+            .filter(|s| s.is_local)
+            .cloned()
+            .collect();
         {
             let mut c = primary.ctrl.lock().unwrap();
             c.layout_snap = Arc::new(snap.clone());
             c.local_screens = screens;
         }
         let snap2 = secondary.layout.lock().unwrap().clone();
-        let screens: Vec<_> = snap2.screens.iter().filter(|s| s.is_local).cloned().collect();
+        let screens: Vec<_> = snap2
+            .screens
+            .iter()
+            .filter(|s| s.is_local)
+            .cloned()
+            .collect();
         {
             let mut c = secondary.ctrl.lock().unwrap();
             c.layout_snap = Arc::new(snap2);
@@ -1241,7 +1543,8 @@ mod integration {
 
         let msgs = pump(&s, &srx, Duration::from_millis(500));
         assert!(
-            msgs.iter().any(|m| matches!(m, Message::EnterScreen { .. })),
+            msgs.iter()
+                .any(|m| matches!(m, Message::EnterScreen { .. })),
             "secondary must receive EnterScreen"
         );
         assert!(
@@ -1269,7 +1572,10 @@ mod integration {
             RawInput::Motion { dx: -50.0, dy: 0.0 },
             Some((1919.0, 540.0)),
         );
-        assert!(dropped2, "leftward motion mid-screen must STILL be forwarded/dropped");
+        assert!(
+            dropped2,
+            "leftward motion mid-screen must STILL be forwarded/dropped"
+        );
         assert!(
             matches!(&*p.mode.lock().unwrap(), CaptureMode::Forwarding(n) if n == "B"),
             "primary must remain forwarding after a mid-screen left move"
@@ -1293,8 +1599,14 @@ mod integration {
             msgs3.iter().any(|m| matches!(m, Message::LeaveScreen)),
             "secondary must receive LeaveScreen"
         );
-        assert!(p.ctrl.lock().unwrap().remote.is_none(), "primary remote cleared");
-        assert!(s.ctrl.lock().unwrap().remote.is_none(), "secondary remote cleared");
+        assert!(
+            p.ctrl.lock().unwrap().remote.is_none(),
+            "primary remote cleared"
+        );
+        assert!(
+            s.ctrl.lock().unwrap().remote.is_none(),
+            "secondary remote cleared"
+        );
         assert!(
             p.ctrl.lock().unwrap().cooldown_until.is_some(),
             "primary cooldown must be armed on return"
@@ -1331,7 +1643,10 @@ mod integration {
         // ReturnControl over the real TCP loopback to the primary.
         on_capture(
             &p,
-            RawInput::Motion { dx: -100.0, dy: 0.0 },
+            RawInput::Motion {
+                dx: -100.0,
+                dy: 0.0,
+            },
             Some((1919.0, 540.0)),
         );
         pump(&s, &srx, Duration::from_millis(300)); // vx 52 -> -48 -> crosses left edge
@@ -1348,7 +1663,10 @@ mod integration {
                 Err(_) => continue,
             }
         }
-        assert!(got_return, "secondary must send ReturnControl to the primary");
+        assert!(
+            got_return,
+            "secondary must send ReturnControl to the primary"
+        );
 
         // The primary's message handler calls return_control -> control returns.
         return_control(&p);
@@ -1357,7 +1675,10 @@ mod integration {
             msgs.iter().any(|m| matches!(m, Message::LeaveScreen)),
             "secondary receives LeaveScreen after ReturnControl"
         );
-        assert!(p.ctrl.lock().unwrap().remote.is_none(), "primary back to local");
+        assert!(
+            p.ctrl.lock().unwrap().remote.is_none(),
+            "primary back to local"
+        );
     }
 
     /// While forwarding, a click that lands inside MouseShare's own window must return control
@@ -1382,13 +1703,23 @@ mod integration {
         );
 
         // Click inside the published UI window rect: returns control, click delivered locally.
-        let dropped = on_capture(&p, RawInput::ButtonDown(MsButton::Left), Some((1850.0, 100.0)));
-        assert!(!dropped, "UI-window click must be delivered locally, not forwarded");
+        let dropped = on_capture(
+            &p,
+            RawInput::ButtonDown(MsButton::Left),
+            Some((1850.0, 100.0)),
+        );
+        assert!(
+            !dropped,
+            "UI-window click must be delivered locally, not forwarded"
+        );
         assert!(
             matches!(*p.mode.lock().unwrap(), CaptureMode::Local),
             "control must be back to local after the UI click"
         );
-        assert!(p.ctrl.lock().unwrap().cooldown_until.is_some(), "return arms the re-cross cooldown");
+        assert!(
+            p.ctrl.lock().unwrap().cooldown_until.is_some(),
+            "return arms the re-cross cooldown"
+        );
 
         // A click outside the window while forwarding is still forwarded (dropped locally).
         // Wait out the re-cross cooldown first — it exists precisely to block an instant
@@ -1403,8 +1734,15 @@ mod integration {
             matches!(*p.mode.lock().unwrap(), CaptureMode::Forwarding(ref n) if n == "B"),
             "hand-off re-engaged away from the UI window"
         );
-        let dropped = on_capture(&p, RawInput::ButtonDown(MsButton::Left), Some((500.0, 500.0)));
-        assert!(dropped, "ordinary clicks stay forwarded while a secondary has control");
+        let dropped = on_capture(
+            &p,
+            RawInput::ButtonDown(MsButton::Left),
+            Some((500.0, 500.0)),
+        );
+        assert!(
+            dropped,
+            "ordinary clicks stay forwarded while a secondary has control"
+        );
     }
 
     #[test]
@@ -1438,7 +1776,9 @@ mod integration {
         );
         let msgs = pump(&s, &srx, Duration::from_millis(300));
         assert!(
-            !msgs.iter().any(|m| matches!(m, Message::EnterScreen { .. })),
+            !msgs
+                .iter()
+                .any(|m| matches!(m, Message::EnterScreen { .. })),
             "no re-enter during cooldown"
         );
     }
@@ -1486,7 +1826,13 @@ mod integration {
             "first hotkey must hand control to B"
         );
         assert!(
-            p.ctrl.lock().unwrap().remote.as_ref().map(|r| r.name == "B").unwrap_or(false),
+            p.ctrl
+                .lock()
+                .unwrap()
+                .remote
+                .as_ref()
+                .map(|r| r.name == "B")
+                .unwrap_or(false),
             "primary remote should be B"
         );
     }
@@ -1499,6 +1845,7 @@ mod integration {
             screens: vec![
                 Screen {
                     name: "A".into(),
+                    host: "A".into(),
                     ox: 0,
                     oy: 0,
                     w: 1470,
@@ -1508,6 +1855,7 @@ mod integration {
                 },
                 Screen {
                     name: "B".into(),
+                    host: "B".into(),
                     ox: 1470,
                     oy: 0,
                     w: 3072,
@@ -1532,6 +1880,7 @@ mod integration {
         let bogus = Layout {
             screens: vec![Screen {
                 name: "Z".into(),
+                host: "Z".into(),
                 ox: 0,
                 oy: 0,
                 w: 100,
@@ -1541,7 +1890,10 @@ mod integration {
             }],
         };
         let r = motion_scale_ratio(&bogus, "Z", None);
-        assert!(r.is_finite() && r <= MAX_SCALE_RATIO, "ratio must stay bounded, got {r}");
+        assert!(
+            r.is_finite() && r <= MAX_SCALE_RATIO,
+            "ratio must stay bounded, got {r}"
+        );
     }
 
     #[test]
@@ -1554,7 +1906,11 @@ mod integration {
         // Absurd input must be clamped instead of teleporting the cursor.
         assert_eq!(effective_ratio(2.0, 100.0), MAX_EFFECTIVE_RATIO);
         assert_eq!(effective_ratio(2.0, 0.0), MIN_EFFECTIVE_RATIO);
-        assert_eq!(effective_ratio(2.0, f32::NAN), 2.0, "NaN must fall back to 1.0");
+        assert_eq!(
+            effective_ratio(2.0, f32::NAN),
+            2.0,
+            "NaN must fall back to 1.0"
+        );
     }
 
     #[test]
@@ -1577,7 +1933,10 @@ mod integration {
         });
         let (dx, dy) = fwd.expect("secondary must receive the forwarded MouseMotion");
         // 100 logical points on a @2x primary = 200 physical pixels = 200 units on a 1x peer.
-        assert!((dx - 200.0).abs() < 0.5, "dx must be scaled by 2.0, got {dx}");
+        assert!(
+            (dx - 200.0).abs() < 0.5,
+            "dx must be scaled by 2.0, got {dx}"
+        );
         assert!((dy - 0.0).abs() < 0.5, "dy={dy}");
         assert!(
             (p.ctrl.lock().unwrap().remote.as_ref().unwrap().scale_ratio - 2.0).abs() < 1e-6,
@@ -1587,11 +1946,19 @@ mod integration {
 
     /// Like `setup_pair`, but the primary's local screen is Retina (scale 2.0) while the
     /// secondary reports scale 1.0 — the Mac -> Windows case that used to halve cursor speed.
-    fn setup_hidpi_pair(port: u16) -> (GrabCtx, GrabCtx, Receiver<(String, Message)>, Receiver<(String, Message)>) {
+    fn setup_hidpi_pair(
+        port: u16,
+    ) -> (
+        GrabCtx,
+        GrabCtx,
+        Receiver<(String, Message)>,
+        Receiver<(String, Message)>,
+    ) {
         let primary_layout = Layout {
             screens: vec![
                 Screen {
                     name: "A".into(),
+                    host: "A".into(),
                     ox: 0,
                     oy: 0,
                     w: 1470,
@@ -1601,6 +1968,7 @@ mod integration {
                 },
                 Screen {
                     name: "B".into(),
+                    host: "B".into(),
                     ox: 1470,
                     oy: 0,
                     w: 3072,
@@ -1613,6 +1981,7 @@ mod integration {
         let secondary_layout = Layout {
             screens: vec![Screen {
                 name: "B".into(),
+                host: "B".into(),
                 ox: 0,
                 oy: 0,
                 w: 3072,
@@ -1629,18 +1998,16 @@ mod integration {
 
         let net_primary = network::start_hub(port, ptx, pla.clone()).expect("hub starts");
         let net_secondary = Net::idle();
-        let (_net_sec, sec_tx) = network::connect_client(
-            &format!("127.0.0.1:{port}"),
-            stx,
-            net_secondary.clone(),
-        )
-        .expect("client connects");
+        let (_net_sec, sec_tx) =
+            network::connect_client(&format!("127.0.0.1:{port}"), stx, net_secondary.clone())
+                .expect("client connects");
         sec_tx
             .send(Message::Hello {
                 name: "B".to_string(),
                 width: 3072,
                 height: 1920,
                 scale: 1.0,
+                panels: Vec::new(),
             })
             .expect("send Hello");
 
@@ -1669,6 +2036,11 @@ mod integration {
                 // layout_snap and local_screens are seeded lazily by `seed_layout_snap` after
                 // setup, so creating the control plane never contends on the layout lock with
                 // the hub reader (which is briefly locking it during handle_primary_conn).
+                //
+                // `live` must list the peer up front: `on_capture` refuses to hand control to a
+                // host it has not seen in a live/reachable snapshot, so without this the
+                // hidpi hand-off never happens and the forwarding assertions fail.
+                live: Arc::new(vec!["B".to_string()]),
                 ..Default::default()
             })),
             mode: Mutex::new(CaptureMode::Local),

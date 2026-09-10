@@ -27,7 +27,7 @@ static CAPTURE_RUNNING: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
 #[cfg(target_os = "macos")]
-use core_foundation::runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes};
+use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop, CFRunLoopSource};
 #[cfg(target_os = "macos")]
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -35,6 +35,15 @@ use core_graphics::event::{
 };
 
 // ---- cursor visibility / parking (capture-layer concern) ----
+
+/// Magic value stamped into `kCGEventSourceUserData` on every event MouseShare synthesises.
+///
+/// The event tap ignores anything carrying it. That is what makes it safe to move the real cursor
+/// while we are grabbing: without a tag, our own warp would come straight back through the tap and
+/// look like a violent user swipe (which is exactly why the old code refused to re-centre the
+/// cursor at all, and why control came back with the pointer wherever the OS had parked it).
+#[cfg(target_os = "macos")]
+pub const SYNTHETIC_MARK: i64 = 0x4D53_4841_5245; // "MSHARE"
 
 // In tests we never touch the real display server (which may be absent in a headless agent or
 // CI), so cursor show/hide/park are no-ops. This lets the control-plane integration tests run
@@ -44,38 +53,141 @@ mod cursor {
     pub fn hide_cursor() {}
     pub fn show_cursor() {}
     pub fn park_cursor(_p: (f64, f64)) {}
+    pub fn enter_forwarding_grab() {}
+    pub fn leave_forwarding_grab(target: (f64, f64)) {
+        crate::input::warp_cursor(target.0, target.1);
+    }
+    pub fn associate_mouse(_connected: bool) {}
 }
 
 #[cfg(all(not(test), target_os = "macos"))]
 mod cursor {
+    use super::SYNTHETIC_MARK;
     use core_graphics::display::CGDisplay;
+    use core_graphics::event::{
+        CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
+    };
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use core_graphics::geometry::CGPoint;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Whether we currently hold the cursor hidden. Tracked because `CGDisplayHideCursor` is a
+    /// *counter*, not a flag: an unbalanced hide would leave the user with no pointer at all.
+    static HIDDEN: AtomicBool = AtomicBool::new(false);
+
+    fn displays() -> Vec<CGDisplay> {
+        match CGDisplay::active_displays() {
+            Ok(ids) if !ids.is_empty() => ids.into_iter().map(CGDisplay::new).collect(),
+            _ => vec![CGDisplay::main()],
+        }
+    }
+
+    /// Hide the pointer on **every** display.
+    ///
+    /// Hiding only `CGDisplay::main()` — the obvious implementation, and what this used to do —
+    /// leaves the pointer fully visible whenever the cursor sits on a secondary monitor. The shared
+    /// edge is usually on the *external* display, so that is exactly where a hand-off begins: the
+    /// pointer stayed on screen and, in any moment the tap was busy, it moved as well. That is the
+    /// "after minimising, the mouse slides on both screens" report.
     pub fn hide_cursor() {
-        let _ = CGDisplay::hide_cursor(&CGDisplay::main());
+        if HIDDEN.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        for d in displays() {
+            let _ = d.hide_cursor();
+        }
     }
+
     pub fn show_cursor() {
-        let _ = CGDisplay::show_cursor(&CGDisplay::main());
+        if !HIDDEN.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        for d in displays() {
+            let _ = d.show_cursor();
+        }
     }
-    /// With a grab tap the cursor is frozen by dropping events, so nothing needs to be warped.
-    pub fn park_cursor(_p: (f64, f64)) {}
+
+    /// Detach the hardware mouse from the cursor (or reattach it).
+    ///
+    /// `CGAssociateMouseAndMouseCursorPosition(false)` tells the window server to stop letting the
+    /// physical mouse drive the pointer. Combined with dropping the events, this is what guarantees
+    /// the local pointer cannot creep even if our tap is momentarily disabled — App Nap, a
+    /// `TapDisabledByTimeout`, the user revoking Input Monitoring, or the window being minimised so
+    /// the app is no longer frontmost (which is also when `CGDisplayHideCursor` silently stops
+    /// working). Without it, every one of those windows let the local cursor and the remote cursor
+    /// track the same hand movement.
+    pub fn associate_mouse(connected: bool) {
+        let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(connected);
+    }
+
+    /// Warp the real cursor with a **tagged** event, so the tap ignores what it generates.
+    pub fn park_cursor(p: (f64, f64)) {
+        let Ok(src) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+            return;
+        };
+        let Ok(ev) = CGEvent::new_mouse_event(
+            src,
+            CGEventType::MouseMoved,
+            CGPoint::new(p.0, p.1),
+            CGMouseButton::Left,
+        ) else {
+            return;
+        };
+        ev.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, SYNTHETIC_MARK);
+        ev.post(CGEventTapLocation::HID);
+    }
+
+    pub fn enter_forwarding_grab() {
+        associate_mouse(false);
+        hide_cursor();
+    }
+
+    pub fn leave_forwarding_grab(target: (f64, f64)) {
+        associate_mouse(true);
+        show_cursor();
+        park_cursor(target);
+    }
 }
+
+/// Raise the current thread to `QOS_CLASS_USER_INTERACTIVE`.
+///
+/// The capture callback, the input pump and the socket writer all sit on the latency path of every
+/// mouse event. Left at the default class they get scheduled behind whatever else the machine is
+/// doing, which shows up as an uneven, "stuttering" remote cursor — worst right after the window is
+/// hidden and the process is treated as less interesting. macOS lets a thread declare that it is on
+/// a user-interactive path; doing so costs nothing and removes a whole class of jitter.
+#[cfg(all(not(test), target_os = "macos"))]
+pub fn boost_current_thread() {
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+#[cfg(not(all(not(test), target_os = "macos")))]
+pub fn boost_current_thread() {}
 
 #[cfg(all(not(test), not(target_os = "macos")))]
 mod cursor {
     pub fn hide_cursor() {}
     pub fn show_cursor() {}
     pub fn park_cursor(_p: (f64, f64)) {}
+    /// Windows / X11 have no equivalent of detaching the hardware mouse from the pointer, and the
+    /// primary there is still an observer rather than a grab, so this is a no-op.
+    pub fn associate_mouse(_connected: bool) {}
+    pub fn enter_forwarding_grab() {}
+    pub fn leave_forwarding_grab(target: (f64, f64)) {
+        crate::input::warp_cursor(target.0, target.1);
+    }
 }
 
-pub use cursor::{hide_cursor, park_cursor, show_cursor};
-
-/// Whether this machine grabs input (macOS event tap) rather than merely observing it.
-///
-/// The control plane uses this to decide whether it may teleport the real cursor: while a grab
-/// tap is active the local cursor is frozen by dropping events, and any synthetic move we
-/// inject would loop straight back through the tap as a large delta.
-pub fn grab_active() -> bool {
-    cfg!(all(not(test), target_os = "macos"))
-}
+pub use cursor::{
+    associate_mouse, enter_forwarding_grab, hide_cursor, leave_forwarding_grab, park_cursor,
+    show_cursor,
+};
 
 // ---- macOS: keep App Nap from throttling us while the window is hidden ----
 
@@ -118,8 +230,9 @@ pub fn disable_app_nap() {
     const NS_ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED: u64 = 1 << 20;
     const NS_ACTIVITY_LATENCY_CRITICAL: u64 = 0xFF00_0000_00;
 
-    let options =
-        NS_ACTIVITY_USER_INITIATED | NS_ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED | NS_ACTIVITY_LATENCY_CRITICAL;
+    let options = NS_ACTIVITY_USER_INITIATED
+        | NS_ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED
+        | NS_ACTIVITY_LATENCY_CRITICAL;
 
     // NOTE: deliberately **not** wrapped in an `autoreleasepool`. `beginActivity...` returns an
     // *autoreleased* token (it is not an alloc/new/copy selector), so draining a pool around this
@@ -136,8 +249,7 @@ pub fn disable_app_nap() {
             Ok(c) => c,
             Err(_) => return,
         };
-        let reason: *mut Object =
-            msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()];
+        let reason: *mut Object = msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()];
         if reason.is_null() {
             return;
         }
@@ -234,6 +346,9 @@ pub fn trigger_permission_prompts() {}
 #[cfg(target_os = "macos")]
 fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
     std::thread::spawn(move || {
+        // The callback runs inside the OS input pipeline: keep this thread at user-interactive
+        // QoS so a busy machine cannot schedule it late (an uneven remote cursor).
+        boost_current_thread();
         // Raw mach port pointer, used by the callback to re-enable the tap after a timeout.
         let tap_port: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
         let tap_port_cb = Arc::clone(&tap_port);
@@ -267,6 +382,12 @@ fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
         let callback = move |_proxy: core_graphics::event::CGEventTapProxy,
                              event_type: CGEventType,
                              cg_ev: &CGEvent| {
+            // Anything we synthesised ourselves (warping the cursor back to the shared edge on a
+            // return) is not user input: pass it straight through without feeding it to the control
+            // plane, where a warp would look like an enormous swipe.
+            if cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == SYNTHETIC_MARK {
+                return CallbackResult::Keep;
+            }
             // Re-enable a tap the OS disabled (the callback ran too long, or App Nap kicked in).
             if event_type as u32 == CGEventType::TapDisabledByTimeout as u32 {
                 // `try_lock`, never `lock`: this callback is already being told it took too long,
@@ -301,6 +422,9 @@ fn start_capture_macos(ctx: Arc<GrabCtx>, failed: Arc<AtomicBool>) {
                     crate::diag::log("TAP DISABLED BY USER INPUT mid-forward — control returned");
                     crate::control::try_return_control(&ctx_cb);
                 }
+                // Whether or not we were forwarding, the grab is over: reattach the hardware mouse
+                // and give the user their pointer back.
+                crate::capture::associate_mouse(true);
                 crate::capture::show_cursor();
                 return CallbackResult::Keep;
             }
@@ -523,6 +647,7 @@ fn start_capture_observer(ctx: Arc<GrabCtx>) {
     use std::sync::Mutex;
     static LAST: OnceLock<Mutex<(f64, f64)>> = OnceLock::new();
     std::thread::spawn(move || {
+        boost_current_thread();
         if let Err(e) = rdev::listen(move |event: rdev::Event| {
             let raw_and_loc = match event.event_type {
                 rdev::EventType::MouseMove { x, y } => {
@@ -537,9 +662,13 @@ fn start_capture_observer(ctx: Arc<GrabCtx>) {
                 rdev::EventType::ButtonRelease(b) => {
                     Some((RawInput::ButtonUp(crate::input::button_to_ms(b)), None))
                 }
-                rdev::EventType::Wheel { delta_x, delta_y } => {
-                    Some((RawInput::Wheel { dx: delta_x, dy: delta_y }, None))
-                }
+                rdev::EventType::Wheel { delta_x, delta_y } => Some((
+                    RawInput::Wheel {
+                        dx: delta_x,
+                        dy: delta_y,
+                    },
+                    None,
+                )),
                 rdev::EventType::KeyPress(k) => Some((RawInput::KeyDown(k), None)),
                 rdev::EventType::KeyRelease(k) => Some((RawInput::KeyUp(k), None)),
                 _ => None,

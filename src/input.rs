@@ -77,12 +77,36 @@ fn inject_relative(dx: f64, dy: f64) -> Result<(), rdev::SimulateError> {
             ny = ny.clamp(bt, bb - 1.0);
         }
     }
-    simulate(&EventType::MouseMove { x: nx, y: ny })
+    warp_cursor(nx, ny);
+    Ok(())
 }
 
-/// Warp the local cursor to an absolute position — used by the capture layer to keep the (hidden)
-/// cursor parked against the shared edge while a secondary has control, so the OS never clamps it.
-#[cfg(not(test))]
+/// Warp the local cursor to an absolute position.
+///
+/// This is the hot path of a driven machine: it runs for **every** forwarded mouse delta, at the
+/// trackpad's event rate. It is therefore implemented with the platform's own absolute setter
+/// rather than through `rdev::simulate`, which re-reads the cursor and the screen metrics on every
+/// call and normalises into a 16-bit space — several extra syscalls per event, and rounding error
+/// on a 4K panel that reads as an uneven, slightly "swimming" remote cursor.
+#[cfg(all(not(test), target_os = "macos"))]
+pub fn warp_cursor(x: f64, y: f64) {
+    // Reuse the capture layer's tagged warp: posting an untagged move would come straight back
+    // through our own event tap as if the user had swiped the mouse.
+    crate::capture::park_cursor((x, y));
+}
+
+#[cfg(all(not(test), target_os = "windows"))]
+pub fn warp_cursor(x: f64, y: f64) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetCursorPos(x: i32, y: i32) -> i32;
+    }
+    unsafe {
+        SetCursorPos(x.round() as i32, y.round() as i32);
+    }
+}
+
+#[cfg(all(not(test), not(any(target_os = "macos", target_os = "windows"))))]
 pub fn warp_cursor(x: f64, y: f64) {
     let _ = simulate(&EventType::MouseMove { x, y });
 }
@@ -166,7 +190,14 @@ pub fn cursor_position() -> Option<(f64, f64)> {
         let mut wy = 0i32;
         let mut mask = 0u32;
         let ok = (xlib.XQueryPointer)(
-            display, root, &mut root_ret, &mut child_ret, &mut rx, &mut ry, &mut wx, &mut wy,
+            display,
+            root,
+            &mut root_ret,
+            &mut child_ret,
+            &mut rx,
+            &mut ry,
+            &mut wx,
+            &mut wy,
             &mut mask,
         );
         if ok != 0 {

@@ -14,7 +14,7 @@ use crate::config::{save_config, Config};
 use crate::control::GrabCtx;
 use crate::discovery::DiscoveredList;
 use crate::i18n::{tr, Lang, Severity, Tr};
-use crate::layout::Layout;
+use crate::layout::{Layout, Screen};
 use crate::network::{connect_client, Net};
 use crate::protocol::Message;
 use crate::ui::{self, Btn, Icon, Theme};
@@ -172,6 +172,7 @@ impl MouseShareApp {
                     width: w,
                     height: h,
                     scale: crate::input::local_scale(),
+                    panels: self.my_panels(),
                 })
                 .ok();
                 self.net = net_inner;
@@ -196,11 +197,16 @@ impl MouseShareApp {
     /// This machine's real screen size, taken from its own layout entry (falls back to 1080p).
     fn screen_size(&self) -> (u32, u32) {
         let l = self.shared_layout.lock().unwrap();
-        l.screens
-            .iter()
-            .find(|s| s.name == self.my_name)
-            .map(|s| (s.w, s.h))
-            .unwrap_or((1920, 1080))
+        match l.local_bbox() {
+            Some((a, b, c, d)) => ((c - a).max(1.0) as u32, (d - b).max(1.0) as u32),
+            None => (1920, 1080),
+        }
+    }
+
+    /// This machine's own display list, in the shape `Message::Hello` wants.
+    fn my_panels(&self) -> Vec<crate::layout::PanelSpec> {
+        let l = self.shared_layout.lock().unwrap();
+        crate::hello_panels(&l).3
     }
 
     /// Render the "missing input permission" guidance dialog. Shown when the capture thread flags
@@ -242,7 +248,8 @@ impl MouseShareApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = ui::SP_2;
                     let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
-                    ui.painter().circle_filled(r.center(), 10.0, theme.orange_soft);
+                    ui.painter()
+                        .circle_filled(r.center(), 10.0, theme.orange_soft);
                     ui.painter().text(
                         r.center(),
                         Align2::CENTER_CENTER,
@@ -309,7 +316,10 @@ impl MouseShareApp {
 fn open_permission_pane(pane: &str) {
     #[cfg(target_os = "macos")]
     {
-        let url = format!("x-apple.systempreferences:com.apple.preference.security?{}", pane);
+        let url = format!(
+            "x-apple.systempreferences:com.apple.preference.security?{}",
+            pane
+        );
         let _ = std::process::Command::new("open").arg(url).spawn();
     }
     #[cfg(not(target_os = "macos"))]
@@ -346,7 +356,9 @@ impl eframe::App for MouseShareApp {
 
         // Auto-discovery may have linked us in the background (the listener thread flips `net`
         // to `Secondary`). Clear any stale startup-error banner so the UI reflects the live state.
-        if matches!(&*self.net.lock().unwrap(), Net::Secondary { .. }) && self.startup_error.is_some() {
+        if matches!(&*self.net.lock().unwrap(), Net::Secondary { .. })
+            && self.startup_error.is_some()
+        {
             self.startup_error = None;
         }
 
@@ -357,7 +369,12 @@ impl eframe::App for MouseShareApp {
         // `GrabCtx::ui_window_rect`).
         if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
             if let Ok(mut g) = self.grab_ctx.ui_window_rect.lock() {
-                *g = Some((r.min.x as f64, r.min.y as f64, r.max.x as f64, r.max.y as f64));
+                *g = Some((
+                    r.min.x as f64,
+                    r.min.y as f64,
+                    r.max.x as f64,
+                    r.max.y as f64,
+                ));
             }
         }
 
@@ -366,12 +383,16 @@ impl eframe::App for MouseShareApp {
         if let Some(err) = self.startup_error.clone() {
             let is_secondary = self.config.mode == "secondary";
             egui::TopBottomPanel::top("startup_error")
-                .frame(egui::Frame::NONE.fill(theme.banner_error).inner_margin(egui::Margin {
-                    left: ui::CONTENT_MIN_PAD as i8,
-                    right: ui::CONTENT_MIN_PAD as i8,
-                    top: ui::TITLEBAR_CLEARANCE,
-                    bottom: ui::SP_3 as i8,
-                }))
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme.banner_error)
+                        .inner_margin(egui::Margin {
+                            left: ui::CONTENT_MIN_PAD as i8,
+                            right: ui::CONTENT_MIN_PAD as i8,
+                            top: ui::TITLEBAR_CLEARANCE,
+                            bottom: ui::SP_3 as i8,
+                        }),
+                )
                 .show(ctx, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = ui::SP_2;
@@ -416,12 +437,16 @@ impl eframe::App for MouseShareApp {
         egui::SidePanel::left("nav")
             .exact_width(ui::SIDEBAR_W)
             .resizable(false)
-            .frame(egui::Frame::NONE.fill(theme.sidebar).inner_margin(egui::Margin {
-                left: ui::SP_3 as i8,
-                right: ui::SP_3 as i8,
-                top: ui::TITLEBAR_CLEARANCE,
-                bottom: ui::SP_3 as i8,
-            }))
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme.sidebar)
+                    .inner_margin(egui::Margin {
+                        left: ui::SP_3 as i8,
+                        right: ui::SP_3 as i8,
+                        top: ui::TITLEBAR_CLEARANCE,
+                        bottom: ui::SP_3 as i8,
+                    }),
+            )
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui::brand(ui, &theme);
@@ -556,8 +581,7 @@ impl eframe::App for MouseShareApp {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = ui::SP_2;
-                                let (r, _) =
-                                    ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                let (r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
                                 ui.painter().circle_filled(r.center(), 4.0, theme.green);
                                 ui.label(
                                     egui::RichText::new(&msg)
@@ -778,7 +802,11 @@ impl MouseShareApp {
                         ui,
                         &theme,
                         Icon::Monitor,
-                        if s.is_local { theme.accent } else { theme.muted },
+                        if s.is_local {
+                            theme.accent
+                        } else {
+                            theme.muted
+                        },
                         &s.name,
                         &meta,
                         |ui| {
@@ -801,10 +829,16 @@ impl MouseShareApp {
         }
         if add {
             let mut layout = self.shared_layout.lock().unwrap();
-            let max_x = layout.screens.iter().map(|s| s.ox + s.w as i32).max().unwrap_or(0);
+            let max_x = layout
+                .screens
+                .iter()
+                .map(|s| s.ox + s.w as i32)
+                .max()
+                .unwrap_or(0);
             let n = layout.screens.len() + 1;
             layout.screens.push(crate::layout::Screen {
                 name: format!("machine-{n}"),
+                host: format!("machine-{n}"),
                 ox: max_x + 40,
                 oy: 0,
                 w: 1920,
@@ -823,34 +857,38 @@ impl MouseShareApp {
             // Scoped: `set_clip_rect` below must not clip the caption that follows the canvas.
             let mut changed = false;
             ui.scope(|ui| {
-            let (rect, _) =
-                ui.allocate_exact_size(vec2(ui.available_width(), 380.0), Sense::hover());
-            ui.painter()
-                .rect_filled(rect, egui::CornerRadius::same(ui::R_CARD), theme.recessed);
-            ui::dot_grid(ui.painter(), rect, theme.grid);
-            ui.painter().rect_stroke(
-                rect,
-                egui::CornerRadius::same(ui::R_CARD),
-                (1.0_f32, theme.border_soft),
-                egui::StrokeKind::Inside,
-            );
-            ui.set_clip_rect(rect);
+                let (rect, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 380.0), Sense::hover());
+                ui.painter().rect_filled(
+                    rect,
+                    egui::CornerRadius::same(ui::R_CARD),
+                    theme.recessed,
+                );
+                ui::dot_grid(ui.painter(), rect, theme.grid);
+                ui.painter().rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(ui::R_CARD),
+                    (1.0_f32, theme.border_soft),
+                    egui::StrokeKind::Inside,
+                );
+                ui.set_clip_rect(rect);
 
-            let cur = self.ctrl.lock().unwrap().last_real;
-            let mut layout = self.shared_layout.lock().unwrap();
-            if layout.screens.is_empty() {
-                layout.screens.push(crate::layout::Screen {
-                    name: self.config.name.clone(),
-                    ox: 0,
-                    oy: 0,
-                    w: 1920,
-                    h: 1080,
-                    is_local: true,
-                    scale: 1.0,
-                });
-            }
-            changed = draw_layout(ui, &mut layout, &self.config.name, t, theme, rect, cur);
-            drop(layout);
+                let cur = self.ctrl.lock().unwrap().last_real;
+                let mut layout = self.shared_layout.lock().unwrap();
+                if layout.screens.is_empty() {
+                    layout.screens.push(crate::layout::Screen {
+                        name: self.config.name.clone(),
+                        host: self.config.name.clone(),
+                        ox: 0,
+                        oy: 0,
+                        w: 1920,
+                        h: 1080,
+                        is_local: true,
+                        scale: 1.0,
+                    });
+                }
+                changed = draw_layout(ui, &mut layout, &self.config.name, t, theme, rect, cur);
+                drop(layout);
             });
             // Persist drag repositioning immediately (primary only — it owns the layout and
             // broadcasts it to every secondary within 2 s).
@@ -1006,19 +1044,11 @@ impl MouseShareApp {
             }
             for d in &list {
                 let addr = d.addr();
-                ui::list_row(
-                    ui,
-                    &theme,
-                    Icon::Link,
-                    theme.green,
-                    &d.name,
-                    &addr,
-                    |ui| {
-                        if ui::button(ui, &theme, t.discovered_connect, Btn::Secondary) {
-                            pick = Some(addr.clone());
-                        }
-                    },
-                );
+                ui::list_row(ui, &theme, Icon::Link, theme.green, &d.name, &addr, |ui| {
+                    if ui::button(ui, &theme, t.discovered_connect, Btn::Secondary) {
+                        pick = Some(addr.clone());
+                    }
+                });
             }
         });
         if let Some(addr) = pick {
@@ -1121,9 +1151,23 @@ fn draw_layout(
     let offx = canvas_rect.min.x + (avail.x - vw * scale) / 2.0 - minx as f32 * scale;
     let offy = canvas_rect.min.y + (avail.y - vh * scale) / 2.0 - miny as f32 * scale;
 
-    // Bounding box of the primary's own displays, for magnet-snapping remote tiles flush
-    // while they are dragged (the cursor can only cross when a remote sits at the edge).
-    let lbb = layout.local_bbox();
+    // Bounding boxes of the primary's own displays, as `(left, top, right, bottom)`. Captured
+    // before the mutable loop below so the snap can read them while it moves the dragged tile.
+    // These are the magnet targets: the cursor can only cross where a remote sits flush against
+    // one of them.
+    let locals: Vec<(f64, f64, f64, f64)> = layout
+        .screens
+        .iter()
+        .filter(|s| s.is_local)
+        .map(|s| {
+            (
+                s.ox as f64,
+                s.oy as f64,
+                (s.ox + s.w as i32) as f64,
+                (s.oy + s.h as i32) as f64,
+            )
+        })
+        .collect();
 
     // Canvas texture: a faint dot grid so the empty area reads as a surface, not a void.
     ui::dot_grid(ui.painter(), canvas_rect, theme.grid);
@@ -1141,38 +1185,36 @@ fn draw_layout(
 
         let is_primary = s.is_local;
         let is_me = s.name == my_name;
-        let resp = ui.interact(rect, Id::new(("screen", &s.name)), Sense::drag());
+        // Only remote tiles are draggable. A local display's position belongs to the OS — the
+        // primary re-detects it on every start — so letting the user drag it would desynchronise
+        // the canvas from reality, and with it the edge geometry the cursor actually crosses on.
+        // Making it inert is also clearer: the tile you cannot move is the one that is really
+        // yours.
+        let sense = if s.is_local {
+            Sense::hover()
+        } else {
+            Sense::drag()
+        };
+        let resp = ui.interact(rect, Id::new(("screen", &s.name)), sense);
         if resp.dragged() {
             let d = resp.drag_delta();
             s.ox += (d.x / scale) as i32;
             s.oy += (d.y / scale) as i32;
             changed = true;
-            // Magnetic snap: pull a remote tile flush against the local bounding box when it
-            // comes close, so the shared edge lines up and the cursor can cross. Without this,
-            // a tile dragged "almost" flush could silently disable crossing.
-            if !s.is_local {
-                if let Some((bl, bt, br, bb)) = lbb {
-                    const SNAP: f64 = 24.0;
-                    let sl = s.ox as f64;
-                    let st = s.oy as f64;
-                    let sr = sl + s.w as f64;
-                    let sb = st + s.h as f64;
-                    if (sl - br).abs() <= SNAP {
-                        s.ox = br as i32; // flush against the bbox's right edge
-                    }
-                    if (sr - bl).abs() <= SNAP {
-                        s.ox = (bl - s.w as f64) as i32; // flush against the left edge
-                    }
-                    if (st - bt).abs() <= SNAP {
-                        s.oy = bt as i32; // top-aligned with the bbox
-                    }
-                    if (sb - bb).abs() <= SNAP {
-                        s.oy = (bb - s.h as f64) as i32; // bottom-aligned
-                    }
-                }
-            }
         }
-        let resp = if resp.hovered() {
+        // Magnetic snap. Two things must line up for the cursor to cross, and getting only the
+        // first is the usual reason "it won't cross": the tiles must be *flush* on the crossing
+        // axis **and** must actually *overlap* on the other one — a tile sitting beside the
+        // display but above it is a neighbour `predict_cross` never finds. So snap flush on one
+        // axis and pull into alignment on the other, for all four directions.
+        if !s.is_local && resp.dragged() {
+            snap_remote_to_locals(s, &locals);
+        }
+        let resp = if s.is_local {
+            // Explain why this tile will not move, instead of leaving the user tugging at it.
+            resp.on_hover_cursor(CursorIcon::Default)
+                .on_hover_text(t.layout_local_fixed)
+        } else if resp.hovered() {
             resp.on_hover_cursor(CursorIcon::Grab)
         } else {
             resp
@@ -1183,14 +1225,7 @@ fn draw_layout(
         // A dragged tile is deferred to the end of the loop so it floats above the others
         // instead of sliding underneath them.
         if resp.dragged() {
-            dragged = Some((
-                rect,
-                is_primary,
-                is_me,
-                s.name.clone(),
-                (s.w, s.h),
-                s.scale,
-            ));
+            dragged = Some((rect, is_primary, is_me, s.name.clone(), (s.w, s.h), s.scale));
             continue;
         }
         ui::soft_shadow(
@@ -1257,7 +1292,8 @@ fn draw_layout(
         let p = pos2(cx, cy);
         ui.painter()
             .circle_filled(p, 7.0, Color32::from_rgba_unmultiplied(255, 170, 0, 90));
-        ui.painter().circle_filled(p, 3.5, Color32::from_rgb(255, 170, 0));
+        ui.painter()
+            .circle_filled(p, 3.5, Color32::from_rgb(255, 170, 0));
     }
 
     let _ = t;
@@ -1368,7 +1404,11 @@ fn paint_tile(
         let font = FontId::proportional(10.0);
         let w = ui::measure(ui, me_label, &font) + 16.0;
         let pill = Rect::from_min_size(pos2(rect.min.x + 9.0, rect.min.y + 9.0), vec2(w, 18.0));
-        painter.rect_filled(pill, egui::CornerRadius::same(9), Color32::from_white_alpha(238));
+        painter.rect_filled(
+            pill,
+            egui::CornerRadius::same(9),
+            Color32::from_white_alpha(238),
+        );
         painter.text(
             pill.center(),
             Align2::CENTER_CENTER,
@@ -1379,7 +1419,13 @@ fn paint_tile(
     }
 }
 
+/// Draw every place this machine's displays meet a secondary's, on **all four** sides — these
 /// are the only places the cursor can cross.
+///
+/// Making them visible turns "why can't I cross?" into something you can see at a glance: a
+/// missing or misaligned shared edge is the usual answer. The horizontal (above/below) case is
+/// drawn as well as the vertical one, because up/down crossing is otherwise invisible even when
+/// the geometry is correct — so the user has no way to tell a misaligned tile from a broken app.
 fn paint_shared_edges(
     painter: &egui::Painter,
     layout: &Layout,
@@ -1389,39 +1435,156 @@ fn paint_shared_edges(
     theme: Theme,
 ) {
     let (ar, ag, ab) = (theme.accent.r(), theme.accent.g(), theme.accent.b());
-    for a in layout.screens.iter() {
-        if !a.is_local {
-            continue;
-        }
-        let al = a.ox as f64;
-        let at = a.oy as f64;
-        let ar_ = al + a.w as f64;
-        let ab_ = at + a.h as f64;
-        for b in layout.screens.iter() {
-            if b.is_local {
-                continue;
-            }
-            let bl = b.ox as f64;
-            let bt = b.oy as f64;
-            let br = bl + b.w as f64;
-            let bb = bt + b.h as f64;
-            // Vertical shared edge: a's right side flush with b's left (or mirrored).
-            let (ex, y0, y1) = if (ar_ - bl).abs() <= 1.0 {
-                (ar_, at.max(bt), ab_.min(bb))
+    let glow = Color32::from_rgba_unmultiplied(ar, ag, ab, 55);
+    let solid = Color32::from_rgb(ar, ag, ab);
+    let paint = |p0: egui::Pos2, p1: egui::Pos2| {
+        painter.line_segment([p0, p1], (7.0, glow));
+        painter.line_segment([p0, p1], (2.5, solid));
+    };
+
+    for a in layout.screens.iter().filter(|s| s.is_local) {
+        let (al, at) = (a.ox as f64, a.oy as f64);
+        let (ar_, ab_) = (al + a.w as f64, at + a.h as f64);
+        for b in layout.screens.iter().filter(|s| !s.is_local) {
+            let (bl, bt) = (b.ox as f64, b.oy as f64);
+            let (br, bb) = (bl + b.w as f64, bt + b.h as f64);
+
+            // Vertical contact — one display directly left/right of the other: a vertical line
+            // spanning the vertical overlap.
+            let x = if (ar_ - bl).abs() <= 1.0 {
+                Some(ar_)
             } else if (br - al).abs() <= 1.0 {
-                (al, at.max(bt), ab_.min(bb))
+                Some(al)
             } else {
-                continue;
+                None
             };
-            if y1 <= y0 + 1.0 {
-                continue;
+            if let Some(x) = x {
+                let (y0, y1) = (at.max(bt), ab_.min(bb));
+                if y1 > y0 + 1.0 {
+                    let px = offx + x as f32 * scale;
+                    paint(
+                        pos2(px, offy + y0 as f32 * scale),
+                        pos2(px, offy + y1 as f32 * scale),
+                    );
+                }
             }
-            let x = offx + ex as f32 * scale;
-            let p0 = pos2(x, offy + y0 as f32 * scale);
-            let p1 = pos2(x, offy + y1 as f32 * scale);
-            painter.line_segment([p0, p1], (7.0, Color32::from_rgba_unmultiplied(ar, ag, ab, 55)));
-            painter.line_segment([p0, p1], (2.5, Color32::from_rgb(ar, ag, ab)));
+
+            // Horizontal contact — one display directly above/below the other: a horizontal line
+            // spanning the horizontal overlap.
+            let y = if (ab_ - bt).abs() <= 1.0 {
+                Some(ab_)
+            } else if (bb - at).abs() <= 1.0 {
+                Some(at)
+            } else {
+                None
+            };
+            if let Some(y) = y {
+                let (x0, x1) = (al.max(bl), ar_.min(br));
+                if x1 > x0 + 1.0 {
+                    let py = offy + y as f32 * scale;
+                    paint(
+                        pos2(offx + x0 as f32 * scale, py),
+                        pos2(offx + x1 as f32 * scale, py),
+                    );
+                }
+            }
         }
+    }
+}
+
+/// Snap a dragged remote tile against the local displays.
+///
+/// The dominant axis (whichever gap is larger) decides which side of the display the tile was
+/// heading for; that axis is pulled flush, and the perpendicular axis is then aligned to the same
+/// panel — but only when the two would otherwise not overlap at all. If they already overlap
+/// there, crossing already works and extra snapping would just fight the user.
+///
+/// Doing the perpendicular step is what makes up/down crossing as reliable as left/right. Without
+/// it a tile dragged below the display but offset sideways is flush on the vertical axis yet
+/// never overlaps horizontally, so `predict_cross` finds no neighbour and nothing happens.
+fn snap_remote_to_locals(s: &mut Screen, locals: &[(f64, f64, f64, f64)]) {
+    const SNAP: f64 = 28.0;
+    let l = s.ox as f64;
+    let t = s.oy as f64;
+    let r = l + s.w as f64;
+    let b = t + s.h as f64;
+
+    // Nearest local panel, by the sum of the gaps on each axis (0 when overlapping on that axis).
+    let nearest = locals.iter().copied().min_by(|p, q| {
+        let gap = |(pl, pt, pr, pb): (f64, f64, f64, f64)| {
+            (pl - r).max(l - pr).min(0.0).abs() + (pt - b).max(t - pb).min(0.0).abs()
+        };
+        gap(*p)
+            .partial_cmp(&gap(*q))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let Some((pl, pt, pr, pb)) = nearest else {
+        return;
+    };
+
+    // Which axis does the cursor actually cross on? Contact on an axis means the two spans meet
+    // or overlap there, and contact on exactly one axis identifies the side the tile was placed
+    // on. A diagonal placement (contact on neither) falls back to the larger gap, so the tile
+    // snaps to the side it was clearly heading for.
+    let contact_h = l <= pr && r >= pl;
+    let contact_v = t <= pb && b >= pt;
+    let vertical_crossing = if contact_h && !contact_v {
+        true
+    } else if contact_v && !contact_h {
+        false
+    } else {
+        (pt - b).max(t - pb).abs() > (pl - r).max(l - pr).abs()
+    };
+
+    if vertical_crossing {
+        // Above or below the display: pull the tile's *near* edge onto the display's edge — a
+        // tile below gets its top edge onto the display's bottom, not the other way round.
+        if t < pt && (b - pt).abs() <= SNAP {
+            s.oy = (pt - s.h as f64) as i32;
+        } else if t >= pb && (t - pb).abs() <= SNAP {
+            s.oy = pb as i32;
+        }
+        // Flush alone is not enough: the spans must also overlap on the other axis, or
+        // `predict_cross` finds no neighbour. Step in only when they genuinely do not overlap,
+        // so an already-working placement is never disturbed.
+        if !(l < pr && r > pl) {
+            snap_axis(&mut s.ox, s.w as f64, pl, pr);
+        }
+    } else {
+        // Left or right of the display: the same idea, mirrored.
+        if l < pl && (r - pl).abs() <= SNAP {
+            s.ox = (pl - s.w as f64) as i32;
+        } else if l >= pr && (l - pr).abs() <= SNAP {
+            s.ox = pr as i32;
+        }
+        if !(t < pb && b > pt) {
+            snap_axis(&mut s.oy, s.h as f64, pt, pb);
+        }
+    }
+}
+
+/// Pull a tile's span on one axis into its nearest alignment with a panel's span: tops flush,
+/// bottoms flush, or centres. Whichever is closest and within the snap distance wins; otherwise
+/// the tile keeps the position the user chose.
+fn snap_axis(start: &mut i32, size: f64, p_lo: f64, p_hi: f64) {
+    const SNAP: f64 = 28.0;
+    let lo = *start as f64;
+    let candidates = [
+        p_lo,                       // tops flush
+        p_hi - size,                // bottoms flush
+        (p_lo + p_hi - size) / 2.0, // centres aligned
+    ];
+    let mut best = lo;
+    let mut bestd = f64::MAX;
+    for cand in candidates {
+        let d = (lo - cand).abs();
+        if d < bestd {
+            bestd = d;
+            best = cand;
+        }
+    }
+    if bestd <= SNAP {
+        *start = best as i32;
     }
 }
 
@@ -1440,5 +1603,108 @@ fn bounds(layout: &Layout) -> (i32, i32, i32, i32) {
         (0, 0, 1920, 1080)
     } else {
         (minx, miny, maxx, maxy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen(name: &str, ox: i32, oy: i32, w: u32, h: u32) -> Screen {
+        Screen {
+            name: name.into(),
+            host: name.into(),
+            ox,
+            oy,
+            w,
+            h,
+            is_local: false,
+            scale: 1.0,
+        }
+    }
+
+    fn rect(s: &Screen) -> (f64, f64, f64, f64) {
+        (
+            s.ox as f64,
+            s.oy as f64,
+            (s.ox + s.w as i32) as f64,
+            (s.oy + s.h as i32) as f64,
+        )
+    }
+
+    /// The whole point of the snap: the cursor can only cross where a remote is *flush* against
+    /// a local display on the crossing axis **and** overlaps it on the other axis. Flush alone
+    /// leaves `predict_cross` with no neighbour, which is the "I put it on the right and it still
+    /// won't cross" report.
+    #[test]
+    fn snap_produces_a_shared_edge_on_every_side() {
+        let locals = vec![(0.0, 0.0, 1920.0, 1080.0)];
+        let (pl, pt, pr, pb) = (0.0, 0.0, 1920.0, 1080.0);
+
+        // Right: a few pixels shy of the edge, and offset vertically for good measure.
+        let mut s = screen("R", 1940, 40, 1920, 1080);
+        snap_remote_to_locals(&mut s, &locals);
+        let (l, t, r, b) = rect(&s);
+        assert_eq!(l, pr, "left edge should be flush with the display's right");
+        assert!(t < pb && b > pt, "must overlap vertically, got {t}..{b}");
+
+        // Left.
+        let mut s = screen("L", -1935, -30, 1920, 1080);
+        snap_remote_to_locals(&mut s, &locals);
+        let (l, t, r, b) = rect(&s);
+        assert_eq!(r, pl, "right edge should be flush with the display's left");
+        assert!(t < pb && b > pt, "must overlap vertically, got {t}..{b}");
+
+        // Below.
+        let mut s = screen("B", 25, 1095, 1920, 1080);
+        snap_remote_to_locals(&mut s, &locals);
+        let (l, t, r, b) = rect(&s);
+        assert_eq!(t, pb, "top edge should be flush with the display's bottom");
+        assert!(l < pr && r > pl, "must overlap horizontally, got {l}..{r}");
+
+        // Above.
+        let mut s = screen("T", -25, -1090, 1920, 1080);
+        snap_remote_to_locals(&mut s, &locals);
+        let (l, t, r, b) = rect(&s);
+        assert_eq!(b, pt, "bottom edge should be flush with the display's top");
+        assert!(l < pr && r > pl, "must overlap horizontally, got {l}..{r}");
+    }
+
+    /// A tile that already sits flush *and* overlaps is a working crossing — the snap must not
+    /// move it, or dragging would fight the user for no reason.
+    #[test]
+    fn snap_leaves_a_working_placement_alone() {
+        let locals = vec![(0.0, 0.0, 1920.0, 1080.0)];
+        let mut s = screen("B", 1940, 300, 1920, 1080);
+        snap_remote_to_locals(&mut s, &locals);
+        assert_eq!(s.ox, 1920, "flush edge is pulled in");
+        assert_eq!(s.oy, 300, "an already-overlapping axis must be left alone");
+    }
+
+    #[test]
+    fn snap_axis_picks_the_nearest_alignment() {
+        // Near the panel's top.
+        let mut v = 18;
+        snap_axis(&mut v, 100.0, 0.0, 400.0);
+        assert_eq!(v, 0);
+        // Near the panel's bottom.
+        let mut v = 295;
+        snap_axis(&mut v, 100.0, 0.0, 400.0);
+        assert_eq!(v, 300);
+        // Equidistant from every alignment: unchanged, so the user keeps control.
+        let mut v = 150;
+        snap_axis(&mut v, 100.0, 0.0, 400.0);
+        assert_eq!(v, 150);
+    }
+
+    /// `bounds` drives the canvas scale; an empty layout must not divide by zero or produce an
+    /// inverted rectangle.
+    #[test]
+    fn bounds_of_an_empty_layout_is_a_default() {
+        let l = Layout {
+            screens: Vec::new(),
+        };
+        let (minx, miny, maxx, maxy) = bounds(&l);
+        assert!(maxx > minx && maxy > miny, "{minx},{miny},{maxx},{maxy}");
     }
 }

@@ -28,6 +28,15 @@ pub fn write_files(paths: &[PathBuf]) -> bool {
     imp::write_files(paths)
 }
 
+/// Whether this platform implements file clipboard contents at all.
+///
+/// Callers use this to avoid retrying: on Linux `write_files` is a no-op that always fails, and
+/// retrying a write that can never succeed would stall the network reader thread — and with it
+/// the forwarded input sharing that thread — for a feature that does not exist there.
+pub fn supports_files() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+}
+
 /// A counter that the OS increments on **every** change to the clipboard, however small.
 ///
 /// Needed because "did the clipboard change?" cannot be answered by comparing *contents*: copy
@@ -275,12 +284,29 @@ mod imp {
 mod imp {
     use std::os::raw::c_void;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     const CF_HDROP: u32 = 15;
     const GMEM_MOVEABLE: u32 = 0x0002;
     /// DROPFILES is 20 bytes on both 32- and 64-bit Windows (four DWORDs + two LONGs).
     const DROPFILES_WORDS: usize = 5;
     const DROPFILES_BYTES: usize = DROPFILES_WORDS * 4;
+
+    /// Windows refuses `OpenClipboard` while *any* other process holds the clipboard open, and
+    /// plenty of background apps (input methods, Office, clipboard managers, screen readers)
+    /// grab it for a few milliseconds at a time. A single attempt therefore fails often enough
+    /// to matter: on the receiving side a lost write means the pasted file never appears, and on
+    /// the sending side a lost read means we never notice the copy at all. Both look to the user
+    /// like "file copy just doesn't work", so retry with a short back-off.
+    fn open_clipboard_retrying() -> bool {
+        for attempt in 0..10u64 {
+            if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(15 * (attempt + 1)));
+        }
+        false
+    }
 
     #[repr(C)]
     struct DropFiles {
@@ -308,12 +334,7 @@ mod imp {
     }
     #[link(name = "shell32")]
     extern "system" {
-        fn DragQueryFileW(
-            drop: *mut c_void,
-            file: u32,
-            buffer: *mut u16,
-            buf_len: u32,
-        ) -> u32;
+        fn DragQueryFileW(drop: *mut c_void, file: u32, buffer: *mut u16, buf_len: u32) -> u32;
     }
     #[link(name = "user32")]
     extern "system" {
@@ -325,7 +346,8 @@ mod imp {
             if IsClipboardFormatAvailable(CF_HDROP) == 0 {
                 return Vec::new();
             }
-            if OpenClipboard(std::ptr::null_mut()) == 0 {
+            if !open_clipboard_retrying() {
+                crate::diag::log("CLIP-FILES-READ-FAILED (OpenClipboard busy after retries)");
                 return Vec::new();
             }
             let mut out = Vec::new();
@@ -352,7 +374,8 @@ mod imp {
 
     pub fn write_files(paths: &[PathBuf]) -> bool {
         unsafe {
-            if OpenClipboard(std::ptr::null_mut()) == 0 {
+            if !open_clipboard_retrying() {
+                crate::diag::log("FILE-APPLY-FAILED (OpenClipboard busy after retries)");
                 return false;
             }
             let mut ok = false;
